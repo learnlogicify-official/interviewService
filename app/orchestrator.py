@@ -70,7 +70,8 @@ def _save_state(row: SessionRow, state: dict[str, Any]) -> None:
 
 
 def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
-    show_editor = row.stage in {"code", "explain"} and (
+    # Show NexPractice IDE once coding round begins (idea outline + code + explain).
+    show_editor = row.stage in {"idea", "code", "explain"} and (
         bool(state.get("moodle_problem_id")) or bool(state.get("current_problem_id"))
     )
     return {
