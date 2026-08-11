@@ -13,11 +13,13 @@ class Settings(BaseSettings):
     shared_secret: str = "dev-change-me-interview-secret"
     token_ttl_seconds: int = 60 * 60 * 4
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"
+    openai_model: str = "gpt-4o"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_tts_base_url: str = ""  # default: same as openai_base_url (use api.openai.com for TTS)
     openai_tts_model: str = "tts-1"
     openai_tts_voice: str = "alloy"
+    openai_stt_base_url: str = ""
+    openai_stt_model: str = "whisper-1"
     default_duration_minutes: int = 30
     cors_origins: str = "*"
     # How many Q&A exchanges before coding (LLM may move earlier/later).

@@ -93,3 +93,12 @@ class TtsRequest(BaseModel):
     text: str
     timestamp: int
     signature: str
+
+
+class SttRequest(BaseModel):
+    session_id: str = ""
+    audio_base64: str
+    filename: str = "audio.webm"
+    language: str = ""
+    timestamp: int
+    signature: str

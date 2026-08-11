@@ -17,6 +17,7 @@ from app.schemas import (
     SessionViewRequest,
     SnapshotRequest,
     StartSessionRequest,
+    SttRequest,
     TtsRequest,
 )
 
@@ -33,12 +34,13 @@ def health() -> dict:
     return {
         "ok": True,
         "service": "interview-service",
-        "version": "0.3.0",
+        "version": "0.3.1",
         "llm_configured": llm_configured(),
         "llm_model": settings.openai_model if llm_configured() else None,
         "llm_base_url": base if llm_configured() else None,
         "llm_last_error": last_error() or None,
         "tts_model": settings.openai_tts_model if llm_configured() else None,
+        "stt_model": settings.openai_stt_model if llm_configured() else None,
     }
 
 
@@ -58,6 +60,23 @@ def tts(body: TtsRequest) -> dict:
     verify_signature(["tts", body.session_id or "-", body.text[:80]], body.signature, body.timestamp)
     result = tts_mod.synthesize(body.text)
     return result
+
+
+@router.post("/stt")
+def stt(body: SttRequest) -> dict:
+    """Transcribe candidate audio via OpenAI Whisper."""
+    from app import stt as stt_mod
+
+    verify_signature(
+        ["stt", body.session_id or "-", len(body.audio_base64 or "")],
+        body.signature,
+        body.timestamp,
+    )
+    return stt_mod.transcribe(
+        body.audio_base64,
+        filename=body.filename or "audio.webm",
+        language=body.language or "",
+    )
 
 
 @router.post("/sessions/start", response_model=SessionStateOut)
