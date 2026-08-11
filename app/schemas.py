@@ -83,3 +83,10 @@ class RunResultOut(BaseModel):
     total: int
     details: list[dict[str, Any]]
     message: str = ""
+
+
+class TtsRequest(BaseModel):
+    session_id: str = ""
+    text: str
+    timestamp: int
+    signature: str

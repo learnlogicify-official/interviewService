@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str = "https://api.openai.com/v1"
+    openai_tts_base_url: str = ""  # default: same as openai_base_url (use api.openai.com for TTS)
+    openai_tts_model: str = "tts-1"
+    openai_tts_voice: str = "alloy"
     default_duration_minutes: int = 30
     cors_origins: str = "*"
     # How many Q&A exchanges before coding (LLM may move earlier/later).

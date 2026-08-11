@@ -17,6 +17,7 @@ from app.schemas import (
     SessionViewRequest,
     SnapshotRequest,
     StartSessionRequest,
+    TtsRequest,
 )
 
 router = APIRouter(prefix="/v1", tags=["sessions"])
@@ -32,11 +33,12 @@ def health() -> dict:
     return {
         "ok": True,
         "service": "interview-service",
-        "version": "0.2.0",
+        "version": "0.2.1",
         "llm_configured": llm_configured(),
         "llm_model": settings.openai_model if llm_configured() else None,
         "llm_base_url": base if llm_configured() else None,
         "llm_last_error": last_error() or None,
+        "tts_model": settings.openai_tts_model if llm_configured() else None,
     }
 
 
@@ -46,6 +48,16 @@ def llm_ping() -> dict:
     from app.llm import ping
 
     return ping()
+
+
+@router.post("/tts")
+def tts(body: TtsRequest) -> dict:
+    """Return base64 MP3 for interviewer speech (OpenAI TTS)."""
+    from app import tts as tts_mod
+
+    verify_signature(["tts", body.session_id or "-", body.text[:80]], body.signature, body.timestamp)
+    result = tts_mod.synthesize(body.text)
+    return result
 
 
 @router.post("/sessions/start", response_model=SessionStateOut)
