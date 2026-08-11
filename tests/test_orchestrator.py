@@ -42,6 +42,21 @@ def test_flow_idea_and_code():
             row,
             "Big-O describes growth. Linear scan of an array is O(n) time and can be O(1) extra space if done in place.",
         )
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(
+            db,
+            row,
+            "A stack is LIFO. Valid parentheses and DFS traversal are classic stack problems because order of nesting matters.",
+        )
+        assert view["stage"] in {"idea", "code", "qa"}
+        # After enough Q&A we should be in coding path (or still probing if LLM online).
+        if view["stage"] == "qa":
+            row = orch.get_session(db, sid)
+            view = orch.handle_message(
+                db,
+                row,
+                "Recursion uses the call stack for frames; convert to iteration when depth is large or tail recursion applies.",
+            )
         assert view["stage"] in {"idea", "code"}
         row = orch.get_session(db, sid)
         view = orch.handle_message(

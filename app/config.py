@@ -14,8 +14,11 @@ class Settings(BaseSettings):
     token_ttl_seconds: int = 60 * 60 * 4
     openai_api_key: str = ""
     openai_model: str = "gpt-4o-mini"
+    openai_base_url: str = "https://api.openai.com/v1"
     default_duration_minutes: int = 30
     cors_origins: str = "*"
+    # How many Q&A exchanges before coding (LLM may move earlier/later).
+    qa_target_exchanges: int = 3
 
 
 @lru_cache

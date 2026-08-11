@@ -11,6 +11,8 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app import evaluator
+from app import llm as llm_client
+from app.config import get_settings
 from app.models import CodingSnapshotRow, SessionRow, TurnRow
 from app.problems import get_problem, pick_problem, public_problem
 from app.report import build_report
@@ -173,11 +175,12 @@ def start_session(
     db.flush()
 
     greeting = (
-        f"Hi {student_name.split()[0] if student_name else 'there'} — I'm your AI technical interviewer "
-        f"for a campus SDE-style screen ({duration_minutes} minutes).\n\n"
-        "We'll do a short conceptual round, then a coding problem where I'll ask for your approach "
-        "before you code. While you code I may pause you to explain a piece of logic.\n\n"
-        "Ready? Reply **yes** to begin."
+        f"Hi {student_name.split()[0] if student_name else 'there'}. "
+        f"This is a live voice technical screen for about {duration_minutes} minutes. "
+        "I will speak questions and listen while you answer naturally — you do not need to press a mic button. "
+        "Later you will code on screen; I can see your editor and may ask you to explain your logic. "
+        "I will not solve the problem for you. "
+        "When you are ready, just say yes."
     )
     _add_turn(db, session_id, "intro", "assistant", greeting)
     db.commit()
@@ -232,45 +235,115 @@ def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> d
     return session_view(db, row)
 
 
-def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
-    row.stage = "qa"
-    state["qa_index"] = 0
-    q = evaluator.TECH_BANK[0]
-    state["current_qa_id"] = q["id"]
-    state["awaiting"] = "message"
-    _save_state(row, state)
-    return (
-        "Great. First conceptual question:\n\n"
-        f"**{q['question']}**\n\n"
-        "Take a clear structured answer (4–8 sentences is ideal)."
+def _recent_transcript(db: Session, session_id: str, limit: int = 20) -> list[dict[str, str]]:
+    turns = (
+        db.query(TurnRow)
+        .filter(TurnRow.session_id == session_id, TurnRow.role.in_(["assistant", "student"]))
+        .order_by(TurnRow.seq.desc())
+        .limit(limit)
+        .all()
     )
+    turns = list(reversed(turns))
+    return [{"role": t.role, "content": t.content} for t in turns]
 
 
-def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
-    qid = state.get("current_qa_id")
-    bank = {q["id"]: q for q in evaluator.TECH_BANK}
-    q = bank.get(qid, evaluator.TECH_BANK[0])
-    score = evaluator.score_keywords(answer, q["keywords"])
-    state.setdefault("qa_scores", []).append(score)
-    state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
+def _apply_score_communication(state: dict[str, Any], answer: str, score: float) -> None:
     words = len(answer.split())
     state["score_communication"] = min(
         100.0,
         45 + min(35, words / 2) + (10 if score >= 60 else 0),
     )
 
-    idx = int(state.get("qa_index", 0)) + 1
-    state["qa_index"] = idx
-    feedback = f"Thanks — I've noted that ({score:.0f}/100 for concept coverage)."
 
-    # 2 conceptual questions then coding, or advance early if time low.
-    if idx >= 2 or _seconds_remaining(row) < 18 * 60:
+def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
+    row.stage = "qa"
+    state["qa_index"] = 0
+    state["awaiting"] = "message"
+    state["asked_topics"] = []
+
+    dynamic = llm_client.first_question(
+        role_track=row.role_track,
+        topics=state.get("topics") or _loads(row.topics_json, []),
+    )
+    if dynamic:
+        state["current_qa_id"] = dynamic.get("topic_tag") or "llm_opening"
+        state.setdefault("asked_topics", []).append(state["current_qa_id"])
+        _save_state(row, state)
+        return dynamic["reply"]
+
+    # Fallback static bank (only if OPENAI_API_KEY missing).
+    q = evaluator.TECH_BANK[0]
+    state["current_qa_id"] = q["id"]
+    _save_state(row, state)
+    return (
+        "Great. First conceptual question:\n\n"
+        f"**{q['question']}**\n\n"
+        "Take a clear structured answer."
+    )
+
+
+def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
+    settings = get_settings()
+    topics = state.get("topics") or _loads(row.topics_json, [])
+    idx = int(state.get("qa_index", 0))
+    target = int(settings.qa_target_exchanges or 3)
+
+    llm_result = llm_client.interviewer_turn(
+        stage="qa",
+        role_track=row.role_track,
+        topics=topics,
+        transcript=_recent_transcript(db, row.id),
+        student_message=answer,
+        context={
+            "seconds_remaining": _seconds_remaining(row),
+            "qa_index": idx,
+            "asked_topics": state.get("asked_topics", []),
+        },
+    )
+
+    if llm_result:
+        score = float(llm_result["score"])
+        state.setdefault("qa_scores", []).append(score)
+        state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
+        _apply_score_communication(state, answer, score)
+        state["qa_index"] = idx + 1
+        tag = llm_result.get("topic_tag") or ""
+        if tag:
+            state.setdefault("asked_topics", []).append(tag)
+            state["current_qa_id"] = tag
+
+        action = llm_result["next_action"]
+        force_coding = state["qa_index"] >= target or _seconds_remaining(row) < 16 * 60
+        if action == "move_to_coding" or force_coding:
+            _save_state(row, state)
+            return llm_result["reply"] + "\n\n" + _start_coding_round(db, row, state)
+
+        _save_state(row, state)
+        return llm_result["reply"]
+
+    # Heuristic fallback.
+    qid = state.get("current_qa_id")
+    bank = {q["id"]: q for q in evaluator.TECH_BANK}
+    q = bank.get(qid, evaluator.TECH_BANK[0])
+    score = evaluator.score_keywords(answer, q["keywords"])
+    state.setdefault("qa_scores", []).append(score)
+    state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
+    _apply_score_communication(state, answer, score)
+    state["qa_index"] = idx + 1
+    feedback = f"Thanks — noted ({score:.0f}/100)."
+
+    if state["qa_index"] >= target or _seconds_remaining(row) < 18 * 60:
+        _save_state(row, state)
         return feedback + "\n\n" + _start_coding_round(db, row, state)
 
-    nq = evaluator.TECH_BANK[idx % len(evaluator.TECH_BANK)]
-    state["current_qa_id"] = nq["id"]
+    used = set(state.get("asked_topics", []))
+    nxt = next((item for item in evaluator.TECH_BANK if item["id"] not in used), None)
+    if not nxt:
+        nxt = evaluator.TECH_BANK[state["qa_index"] % len(evaluator.TECH_BANK)]
+    state["current_qa_id"] = nxt["id"]
+    state.setdefault("asked_topics", []).append(nxt["id"])
     _save_state(row, state)
-    return feedback + f"\n\nNext question:\n\n**{nq['question']}**"
+    return feedback + f"\n\nNext question:\n\n**{nxt['question']}**"
 
 
 def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
@@ -291,7 +364,7 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
         f"**Problem: {problem['title']}** ({problem['difficulty']})\n\n"
         f"{problem['prompt']}\n\n"
         "Before you write code: outline your approach, data structures, complexity, and edge cases. "
-        "I will unlock the editor once the idea looks solid."
+        "I will unlock the editor once the idea looks solid. I will not solve it for you."
     )
 
 
@@ -299,6 +372,35 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
     problem = get_problem(state["current_problem_id"])
     assert problem
     state["idea_attempts"] = int(state.get("idea_attempts", 0)) + 1
+
+    llm_result = llm_client.interviewer_turn(
+        stage="idea",
+        role_track=row.role_track,
+        topics=state.get("topics", []),
+        transcript=_recent_transcript(db, row.id),
+        student_message=answer,
+        context={
+            "problem": {"title": problem["title"], "prompt": problem["prompt"]},
+            "idea_attempts": state["idea_attempts"],
+            "seconds_remaining": _seconds_remaining(row),
+        },
+    )
+    if llm_result:
+        state["score_idea"] = max(float(state.get("score_idea", 0)), float(llm_result["score"]))
+        action = llm_result["next_action"]
+        unlock = action == "unlock_editor" or state["idea_attempts"] >= 2
+        if unlock:
+            row.stage = "code"
+            state["awaiting"] = "code"
+            _save_state(row, state)
+            return (
+                llm_result["reply"]
+                + "\n\nEditor unlocked. Implement in Python and run tests when ready. "
+                "I can see your editor and may ask about your logic — I will not give the solution."
+            )
+        _save_state(row, state)
+        return llm_result["reply"]
+
     result = evaluator.score_idea(answer, problem)
     state["score_idea"] = max(float(state.get("score_idea", 0)), result["score"])
     if result["accepted"] or state["idea_attempts"] >= 2:
@@ -308,11 +410,11 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
         unlock = (
             result["feedback"]
             if result["accepted"]
-            else "We'll proceed so you can show skill in code — keep refining the approach as you go."
+            else "We'll proceed so you can show skill in code — keep refining as you go."
         )
         return (
             f"{unlock}\n\n"
-            "Editor unlocked. Implement the solution in Python, use **Run tests** when ready. "
+            "Editor unlocked. Implement the solution in Python, use Run tests when ready. "
             "I may interrupt you to explain a piece of logic."
         )
     _save_state(row, state)
@@ -326,14 +428,11 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
         return None
     if _seconds_remaining(row) < 5 * 60:
         return None
-    # Interrupt after some code and at least one autosave/run.
     nontrivial = sum(1 for ln in code.splitlines() if ln.strip() and "pass" not in ln)
     if nontrivial < 6:
         return None
-    # Pseudo-random based on session id + explain count.
     seed = sum(ord(c) for c in row.id) + int(state.get("explain_count", 0)) * 7
     if seed % 3 != 0 and state.get("explain_count", 0) == 0:
-        # First interrupt a bit later unless forced by high run count.
         if int(state.get("run_count", 0)) < 1:
             return None
     excerpt = evaluator.pick_code_excerpt(code)
@@ -344,16 +443,55 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
     state["awaiting"] = "explain"
     row.stage = "explain"
     _save_state(row, state)
+
+    llm_result = llm_client.interviewer_turn(
+        stage="explain",
+        role_track=row.role_track,
+        topics=state.get("topics", []),
+        transcript=_recent_transcript(db, row.id),
+        student_message="(candidate is coding; interrupt now)",
+        context={
+            "code_excerpt": excerpt,
+            "problem": _current_problem(state),
+            "seconds_remaining": _seconds_remaining(row),
+        },
+    )
+    if llm_result and llm_result.get("reply"):
+        return llm_result["reply"]
+
     return (
-        "Quick interrupt — pause coding for a moment.\n\n"
-        "Look at this part of your code:\n"
+        "Quick interrupt — I can see this part of your editor:\n"
         f"```python\n{excerpt}\n```\n"
-        "Explain what it does and why you wrote it this way."
+        "Explain what this block is doing and why you chose this approach. "
+        "Do not rewrite it for me — just walk me through your reasoning."
     )
 
 
 def _handle_explain(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
     excerpt = state.get("explain_excerpt", "")
+    llm_result = llm_client.interviewer_turn(
+        stage="explain",
+        role_track=row.role_track,
+        topics=state.get("topics", []),
+        transcript=_recent_transcript(db, row.id),
+        student_message=answer,
+        context={
+            "code_excerpt": excerpt,
+            "problem": _current_problem(state),
+            "seconds_remaining": _seconds_remaining(row),
+        },
+    )
+    if llm_result:
+        score = float(llm_result["score"])
+        prev = float(state.get("score_explain", 0))
+        state["score_explain"] = score if prev == 0 else (prev + score) / 2
+        if score < 50:
+            state.setdefault("flags", []).append("weak_code_explanation")
+        row.stage = "code"
+        state["awaiting"] = "code"
+        _save_state(row, state)
+        return llm_result["reply"]
+
     score = evaluator.score_explanation(answer, excerpt)
     prev = float(state.get("score_explain", 0))
     state["score_explain"] = score if prev == 0 else (prev + score) / 2
@@ -365,7 +503,7 @@ def _handle_explain(db: Session, row: SessionRow, state: dict[str, Any], answer:
     return (
         f"Got it ({score:.0f}/100 for explanation clarity). "
         "Continue coding — run tests when you think you're ready. "
-        "Say **done** if you want to finish the interview."
+        "Say done if you want to finish the interview."
     )
 
 
@@ -400,16 +538,38 @@ def handle_message(db: Session, row: SessionRow, message: str) -> dict[str, Any]
     elif row.stage == "explain":
         reply = _handle_explain(db, row, state, text)
     elif row.stage == "code":
-        # Free-form during coding: treat as clarification / progress note.
-        if "stuck" in text.lower() or "hint" in text.lower():
+        llm_result = llm_client.interviewer_turn(
+            stage="code",
+            role_track=row.role_track,
+            topics=state.get("topics", []),
+            transcript=_recent_transcript(db, row.id),
+            student_message=text,
+            context={
+                "problem": _current_problem(state),
+                "code_excerpt": evaluator.pick_code_excerpt(state.get("current_code", "")),
+                "seconds_remaining": _seconds_remaining(row),
+            },
+        )
+        if llm_result:
+            if llm_result["next_action"] == "wrap_up":
+                _add_turn(db, row.id, row.stage, "assistant", llm_result["reply"])
+                _save_state(row, state)
+                db.commit()
+                return finish_session(db, row, reason="student_ended")
+            if any(w in text.lower() for w in ("hint", "give me the answer", "solution")):
+                state.setdefault("flags", []).append("asked_for_help")
+            reply = llm_result["reply"]
+        elif any(w in text.lower() for w in ("hint", "stuck", "help me", "give me the answer", "solution")):
             reply = (
-                "Hint: name the invariant you need, pick the simplest correct structure first, "
-                "then optimize. Try a sample case on paper, then code."
+                "I can't give you the solution or walk you through the fix — this is an interview. "
+                "Tell me what you are trying next, or keep coding and run your tests. "
+                "Say done when you want to wrap up."
             )
+            state.setdefault("flags", []).append("asked_for_help")
         else:
             reply = (
-                "Keep going in the editor. Use **Run tests** to check samples. "
-                "Say **done** to wrap up the interview."
+                "Understood. Keep working in the editor — I can see your code. "
+                "Run tests when ready, and say done when you want to finish."
             )
     else:
         reply = "Session is complete. Open your feedback report for details."
@@ -517,9 +677,9 @@ def run_code(db: Session, row: SessionRow, code: str, mode: str = "sample") -> t
             row.id,
             row.stage,
             "assistant",
-            "Nice — tests look good. You can refine edge cases or say **done** to finish."
+            "Your sample tests passed. Keep refining if you want, or say done to finish."
             if result["ok"]
-            else "Some tests failed. Read the failing case, fix, and run again. Ask for a **hint** if stuck.",
+            else "Some tests failed. Inspect the failing case and continue — I won't provide the fix.",
         )
     db.commit()
     db.refresh(row)

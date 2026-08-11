@@ -24,7 +24,13 @@ router = APIRouter(prefix="/v1", tags=["sessions"])
 
 @router.get("/health")
 def health() -> dict:
-    return {"ok": True, "service": "interview-service"}
+    from app.llm import llm_configured
+
+    return {
+        "ok": True,
+        "service": "interview-service",
+        "llm_configured": llm_configured(),
+    }
 
 
 @router.post("/sessions/start", response_model=SessionStateOut)
