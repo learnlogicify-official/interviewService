@@ -12,7 +12,7 @@
 #     uvicorn app.main:app --host 0.0.0.0 --port $PORT
 #   Set env vars on the host:
 #     SHARED_SECRET=...   (must match Moodle plugin setting)
-#     DATABASE_URL=...    (optional; defaults to sqlite ./interview.db)
+#     DATABASE_URL=...    (Railway Postgres is fine; sqlite used if unset)
 #     OPENAI_API_KEY=...  (optional)
 #
 # Moodle `mod_aiinterview` talks to this API with HMAC signatures.
