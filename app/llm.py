@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any
 
@@ -10,13 +11,19 @@ import httpx
 
 from app.config import get_settings
 
+logger = logging.getLogger("interview.llm")
+
+# Last failure detail for /v1/health diagnostics (no secrets).
+_LAST_ERROR: str = ""
+
 INTERVIEWER_SYSTEM = """You are a strict but fair technical interviewer for campus / early-career software roles.
 Speak in short, natural spoken sentences (this is a voice interview).
 Rules:
 - NEVER give the solution, code, or step-by-step hints that solve the problem.
 - NEVER repeat a question already asked in the transcript.
+- NEVER reuse the same wording as a previous interviewer line.
 - Ask follow-ups based on what the candidate just said.
-- If the answer is shallow, probe once; if still weak, move on.
+- If the answer is shallow, probe once; if still weak, move on to a different topic.
 - You may see the candidate's current editor code — ask about THEIR code only; do not rewrite it.
 - Be professional and concise (2–5 sentences typically).
 
@@ -30,15 +37,34 @@ Always respond with a single JSON object only (no markdown fences):
 """
 
 
-def llm_configured() -> bool:
+def _api_key() -> str:
     settings = get_settings()
-    return bool(settings.openai_api_key and settings.openai_api_key.strip())
+    return (settings.openai_api_key or "").strip().strip('"').strip("'")
+
+
+def llm_configured() -> bool:
+    return bool(_api_key())
+
+
+def last_error() -> str:
+    return _LAST_ERROR
+
+
+def _set_error(msg: str) -> None:
+    global _LAST_ERROR
+    _LAST_ERROR = (msg or "")[:500]
+    if msg:
+        logger.warning("LLM error: %s", _LAST_ERROR)
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
     text = (text or "").strip()
     if not text:
         return None
+    # Strip accidental markdown fences.
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
     try:
         data = json.loads(text)
         return data if isinstance(data, dict) else None
@@ -57,46 +83,66 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_tokens: int = 500) -> str | None:
     """Call chat completions; return assistant text or None on failure."""
     settings = get_settings()
-    if not settings.openai_api_key:
+    key = _api_key()
+    if not key:
+        _set_error("OPENAI_API_KEY is empty")
         return None
+
     base = (settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
     url = f"{base}/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+    }
+    payload_base = {
+        "model": settings.openai_model or "gpt-4o-mini",
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+
     try:
-        with httpx.Client(timeout=35.0) as client:
-            resp = client.post(
-                url,
-                headers={
-                    "Authorization": f"Bearer {settings.openai_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": settings.openai_model,
-                    "temperature": temperature,
-                    "max_tokens": max_tokens,
-                    "messages": messages,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            # Some OpenAI-compatible providers reject response_format — retry without.
+        with httpx.Client(timeout=45.0) as client:
+            resp = client.post(url, headers=headers, json={**payload_base, "response_format": {"type": "json_object"}})
             if resp.status_code >= 400:
-                resp = client.post(
-                    url,
-                    headers={
-                        "Authorization": f"Bearer {settings.openai_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": settings.openai_model,
-                        "temperature": temperature,
-                        "max_tokens": max_tokens,
-                        "messages": messages,
-                    },
-                )
-            resp.raise_for_status()
+                # Retry without response_format (some proxies / older models).
+                body1 = resp.text[:300]
+                resp = client.post(url, headers=headers, json=payload_base)
+                if resp.status_code >= 400:
+                    _set_error(f"HTTP {resp.status_code} from {url}: {resp.text[:300] or body1}")
+                    return None
             data = resp.json()
-            return data["choices"][0]["message"]["content"].strip()
-    except Exception:
+            content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            content = str(content).strip()
+            if not content:
+                _set_error("LLM returned empty content")
+                return None
+            _set_error("")  # clear on success
+            return content
+    except Exception as exc:
+        _set_error(f"{type(exc).__name__}: {exc}")
         return None
+
+
+def ping() -> dict[str, Any]:
+    """Tiny live call to verify Railway → OpenAI connectivity."""
+    raw = chat(
+        [
+            {"role": "system", "content": 'Reply with JSON only: {"reply":"pong","score":100,"next_action":"followup","topic_tag":"ping"}'},
+            {"role": "user", "content": "ping"},
+        ],
+        temperature=0,
+        max_tokens=80,
+    )
+    data = _extract_json(raw or "")
+    ok = bool(data and data.get("reply"))
+    return {
+        "ok": ok,
+        "model": get_settings().openai_model,
+        "base_url": (get_settings().openai_base_url or "").rstrip("/"),
+        "raw_preview": (raw or "")[:160],
+        "error": last_error() if not ok else "",
+    }
 
 
 def interviewer_turn(
@@ -108,11 +154,9 @@ def interviewer_turn(
     student_message: str,
     context: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    """
-    Ask the LLM for the next interviewer utterance + control signal.
-    Returns None if LLM unavailable.
-    """
+    """Ask the LLM for the next interviewer utterance + control signal."""
     if not llm_configured():
+        _set_error("OPENAI_API_KEY not configured")
         return None
 
     ctx = context or {}
@@ -122,10 +166,12 @@ def interviewer_turn(
         history_lines.append(f"{role}: {t.get('content', '')}")
     history = "\n".join(history_lines) if history_lines else "(interview just started)"
 
+    asked = ctx.get("asked_topics") or []
     user_payload = {
         "stage": stage,
         "role_track": role_track,
         "topics": topics,
+        "already_covered_topics": asked,
         "seconds_hint": ctx.get("seconds_remaining"),
         "qa_count": ctx.get("qa_index", 0),
         "problem": ctx.get("problem"),
@@ -135,7 +181,10 @@ def interviewer_turn(
         "candidate_just_said": student_message,
         "stage_instructions": {
             "intro": "If they are ready, greet briefly and ask the first conceptual question. next_action=next_topic",
-            "qa": "Evaluate their answer. Prefer a sharp follow-up (followup) OR a new related topic (next_topic). After about 3 solid exchanges or if time is low, next_action=move_to_coding.",
+            "qa": (
+                "Evaluate their answer. Prefer a sharp follow-up (followup) OR a NEW related topic (next_topic). "
+                "Do not repeat prior questions. After about 3 solid exchanges or if time is low, next_action=move_to_coding."
+            ),
             "idea": "They must outline approach before coding. If solid, next_action=unlock_editor. If weak, next_action=probe_idea. Never reveal the optimal solution.",
             "code": "They are coding. Acknowledge briefly. Do not help. next_action=continue_coding unless they clearly want to finish (wrap_up).",
             "explain": "They explained a code excerpt. Score honesty/clarity. Then next_action=continue_coding.",
@@ -147,11 +196,13 @@ def interviewer_turn(
             {"role": "system", "content": INTERVIEWER_SYSTEM},
             {"role": "user", "content": json.dumps(user_payload)},
         ],
-        temperature=0.65,
+        temperature=0.7,
         max_tokens=450,
     )
     data = _extract_json(raw or "")
-    if not data or not data.get("reply"):
+    if not data or not str(data.get("reply") or "").strip():
+        if raw and not data:
+            _set_error(f"Could not parse LLM JSON: {(raw or '')[:200]}")
         return None
 
     action = str(data.get("next_action") or "followup").strip().lower()
@@ -198,17 +249,21 @@ def first_question(*, role_track: str, topics: list[str]) -> dict[str, Any] | No
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
                             "Ask ONE strong opening conceptual interview question tailored to the role/topics. "
-                            "next_action must be next_topic. Do not ask about coding problems yet."
+                            "Vary the topic (not always hash maps). next_action must be next_topic. "
+                            "Do not ask about coding problems yet."
                         ),
                         "transcript": "(start)",
                     }
                 ),
             },
         ],
-        temperature=0.7,
+        temperature=0.85,
+        max_tokens=350,
     )
     data = _extract_json(raw or "")
-    if not data or not data.get("reply"):
+    if not data or not str(data.get("reply") or "").strip():
+        if raw and not data:
+            _set_error(f"Could not parse opening JSON: {(raw or '')[:200]}")
         return None
     return {
         "reply": str(data["reply"]).strip(),

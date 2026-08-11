@@ -24,13 +24,28 @@ router = APIRouter(prefix="/v1", tags=["sessions"])
 
 @router.get("/health")
 def health() -> dict:
-    from app.llm import llm_configured
+    from app.config import get_settings
+    from app.llm import last_error, llm_configured
 
+    settings = get_settings()
+    base = (settings.openai_base_url or "").rstrip("/")
     return {
         "ok": True,
         "service": "interview-service",
+        "version": "0.2.0",
         "llm_configured": llm_configured(),
+        "llm_model": settings.openai_model if llm_configured() else None,
+        "llm_base_url": base if llm_configured() else None,
+        "llm_last_error": last_error() or None,
     }
+
+
+@router.get("/llm-ping")
+def llm_ping() -> dict:
+    """Live OpenAI connectivity check (no Moodle auth — use only while debugging)."""
+    from app.llm import ping
+
+    return ping()
 
 
 @router.post("/sessions/start", response_model=SessionStateOut)

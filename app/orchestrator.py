@@ -268,12 +268,25 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     if dynamic:
         state["current_qa_id"] = dynamic.get("topic_tag") or "llm_opening"
         state.setdefault("asked_topics", []).append(state["current_qa_id"])
+        state["llm_mode"] = True
         _save_state(row, state)
         return dynamic["reply"]
 
-    # Fallback static bank (only if OPENAI_API_KEY missing).
+    if llm_client.llm_configured():
+        # Key is set but the live call failed — do NOT fall back to the fixed script.
+        err = llm_client.last_error() or "unknown LLM error"
+        state["llm_mode"] = False
+        _save_state(row, state)
+        return (
+            "I could not reach the AI interviewer brain just now. "
+            f"Please ask an admin to check Railway OPENAI_API_KEY / model. Detail: {err[:180]}. "
+            "Say yes again to retry."
+        )
+
+    # Offline/dev fallback only when no API key is configured.
     q = evaluator.TECH_BANK[0]
     state["current_qa_id"] = q["id"]
+    state["llm_mode"] = False
     _save_state(row, state)
     return (
         "Great. First conceptual question:\n\n"
@@ -307,6 +320,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
         _apply_score_communication(state, answer, score)
         state["qa_index"] = idx + 1
+        state["llm_mode"] = True
         tag = llm_result.get("topic_tag") or ""
         if tag:
             state.setdefault("asked_topics", []).append(tag)
@@ -321,7 +335,16 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         _save_state(row, state)
         return llm_result["reply"]
 
-    # Heuristic fallback.
+    if llm_client.llm_configured():
+        err = llm_client.last_error() or "LLM call failed"
+        state["qa_index"] = idx + 1
+        _save_state(row, state)
+        return (
+            "Thanks — I briefly lost the AI connection mid-question. "
+            f"({err[:120]}) Please continue your last point, or say done to wrap up."
+        )
+
+    # Heuristic fallback only without API key.
     qid = state.get("current_qa_id")
     bank = {q["id"]: q for q in evaluator.TECH_BANK}
     q = bank.get(qid, evaluator.TECH_BANK[0])

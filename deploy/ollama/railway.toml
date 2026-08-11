@@ -1,0 +1,11 @@
+# Optional Railway config if this folder is deployed as its own service root.
+# In Railway UI: set Root Directory = deploy/ollama  OR paste these settings manually.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+restartPolicyType = "ON_FAILURE"
+healthcheckPath = "/api/tags"
+healthcheckTimeout = 300
