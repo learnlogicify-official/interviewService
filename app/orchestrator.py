@@ -70,13 +70,16 @@ def _save_state(row: SessionRow, state: dict[str, Any]) -> None:
 
 
 def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
-    show_editor = row.stage in {"code", "explain"} and bool(state.get("current_problem_id"))
+    show_editor = row.stage in {"code", "explain"} and (
+        bool(state.get("moodle_problem_id")) or bool(state.get("current_problem_id"))
+    )
     return {
         "show_editor": show_editor,
         "awaiting": state.get("awaiting", "message"),
         "can_run": show_editor and row.stage == "code",
         "can_submit_idea": row.stage == "idea",
         "interrupt_active": row.stage == "explain",
+        "moodle_problem_id": int(state.get("moodle_problem_id") or 0),
     }
 
 
@@ -106,6 +109,7 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
         "student_name": row.student_name,
         "role_track": row.role_track,
         "problem": _current_problem(state),
+        "moodle_problem_id": int(state.get("moodle_problem_id") or 0),
         "ui": _ui_for(row, state),
         "scores": {
             "conceptual": state.get("score_conceptual", 0),
@@ -139,8 +143,11 @@ def start_session(
     role_track: str,
     duration_minutes: int,
     topics: list[str],
+    resume_text: str = "",
+    moodle_problem_id: int = 0,
 ) -> dict[str, Any]:
     session_id = uuid.uuid4().hex
+    resume = " ".join((resume_text or "").split())[:12000]
     state = {
         "topics": topics,
         "qa_index": 0,
@@ -157,6 +164,8 @@ def start_session(
         "score_explain": 0,
         "score_communication": 55,
         "current_code": "",
+        "resume_text": resume,
+        "moodle_problem_id": int(moodle_problem_id or 0),
     }
     row = SessionRow(
         id=session_id,
@@ -178,7 +187,7 @@ def start_session(
         f"Hi {student_name.split()[0] if student_name else 'there'}. "
         f"This is a live voice technical screen for about {duration_minutes} minutes. "
         "I will speak questions and listen while you answer naturally — you do not need to press a mic button. "
-        "Later you will code on screen; I can see your editor and may ask you to explain your logic. "
+        "Later you will code in the NexPractice editor; I can see your work and may ask you to explain. "
         "I will not solve the problem for you. "
         "When you are ready, just say yes."
     )
@@ -264,6 +273,7 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     dynamic = llm_client.first_question(
         role_track=row.role_track,
         topics=state.get("topics") or _loads(row.topics_json, []),
+        resume_text=state.get("resume_text") or "",
     )
     if dynamic:
         state["current_qa_id"] = dynamic.get("topic_tag") or "llm_opening"
@@ -301,6 +311,13 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     idx = int(state.get("qa_index", 0))
     target = int(settings.qa_target_exchanges or 3)
 
+    if llm_client.is_weak_answer(answer):
+        _save_state(row, state)
+        return (
+            "I need a fuller answer before we move on — take a breath and explain your reasoning "
+            "in a few clear sentences. What is the idea, and why does it work?"
+        )
+
     llm_result = llm_client.interviewer_turn(
         stage="qa",
         role_track=row.role_track,
@@ -311,11 +328,19 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             "seconds_remaining": _seconds_remaining(row),
             "qa_index": idx,
             "asked_topics": state.get("asked_topics", []),
+            "resume_text": state.get("resume_text") or "",
+            "moodle_problem_id": state.get("moodle_problem_id"),
         },
     )
 
     if llm_result:
         score = float(llm_result["score"])
+        action = llm_result["next_action"]
+        # Never advance on weak LLM scores that re-ask.
+        if action == "followup" and score < 35:
+            _save_state(row, state)
+            return llm_result["reply"]
+
         state.setdefault("qa_scores", []).append(score)
         state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
         _apply_score_communication(state, answer, score)
@@ -326,7 +351,6 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             state.setdefault("asked_topics", []).append(tag)
             state["current_qa_id"] = tag
 
-        action = llm_result["next_action"]
         force_coding = state["qa_index"] >= target or _seconds_remaining(row) < 16 * 60
         if action == "move_to_coding" or force_coding:
             _save_state(row, state)
@@ -337,7 +361,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
 
     if llm_client.llm_configured():
         err = llm_client.last_error() or "LLM call failed"
-        state["qa_index"] = idx + 1
+        # Do not bump qa_index on transport failure — ask them to continue.
         _save_state(row, state)
         return (
             "Thanks — I briefly lost the AI connection mid-question. "
@@ -373,6 +397,19 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     prefer = "easy"
     if state.get("score_conceptual", 0) >= 75:
         prefer = "medium"
+    moodle_pid = int(state.get("moodle_problem_id") or 0)
+    if moodle_pid:
+        state["awaiting"] = "idea"
+        row.stage = "idea"
+        state["idea_attempts"] = 0
+        state["explain_count"] = 0
+        _save_state(row, state)
+        return (
+            "Let's move to coding on the NexPractice problem on your screen.\n\n"
+            "Before you write code: outline your approach, data structures, complexity, and edge cases. "
+            "I will unlock the editor once the idea looks solid. I will not solve it for you."
+        )
+
     problem = pick_problem(state.get("used_problems", []), state.get("topics", []), prefer=prefer)
     state["current_problem_id"] = problem["id"]
     state.setdefault("used_problems", []).append(problem["id"])
@@ -392,8 +429,15 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
 
 
 def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
-    problem = get_problem(state["current_problem_id"])
-    assert problem
+    if llm_client.is_weak_answer(answer, min_words=8):
+        return (
+            "Give me a clearer plan first — data structure, main steps, time complexity, and one edge case. "
+            "Then I will unlock the editor."
+        )
+
+    problem = None
+    if state.get("current_problem_id"):
+        problem = get_problem(state["current_problem_id"])
     state["idea_attempts"] = int(state.get("idea_attempts", 0)) + 1
 
     llm_result = llm_client.interviewer_turn(
@@ -403,9 +447,15 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
         transcript=_recent_transcript(db, row.id),
         student_message=answer,
         context={
-            "problem": {"title": problem["title"], "prompt": problem["prompt"]},
+            "problem": (
+                {"title": problem["title"], "prompt": problem["prompt"]}
+                if problem
+                else {"moodle_problem_id": state.get("moodle_problem_id")}
+            ),
             "idea_attempts": state["idea_attempts"],
             "seconds_remaining": _seconds_remaining(row),
+            "resume_text": state.get("resume_text") or "",
+            "moodle_problem_id": state.get("moodle_problem_id"),
         },
     )
     if llm_result:
@@ -418,11 +468,21 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             _save_state(row, state)
             return (
                 llm_result["reply"]
-                + "\n\nEditor unlocked. Implement in Python and run tests when ready. "
+                + "\n\nEditor unlocked. Implement in the NexPractice IDE and run tests when ready. "
                 "I can see your editor and may ask about your logic — I will not give the solution."
             )
         _save_state(row, state)
         return llm_result["reply"]
+
+    if not problem:
+        row.stage = "code"
+        state["awaiting"] = "code"
+        state["score_idea"] = max(float(state.get("score_idea", 0)), 55.0)
+        _save_state(row, state)
+        return (
+            "Solid enough — editor unlocked. Implement in NexPractice and run tests when ready. "
+            "I may interrupt you to explain a piece of logic."
+        )
 
     result = evaluator.score_idea(answer, problem)
     state["score_idea"] = max(float(state.get("score_idea", 0)), result["score"])
@@ -537,7 +597,24 @@ def handle_message(db: Session, row: SessionRow, message: str) -> dict[str, Any]
 
     text = (message or "").strip()
     if not text:
-        _add_turn(db, row.id, row.stage, "assistant", "I didn't catch that — please type your answer.")
+        _add_turn(db, row.id, row.stage, "assistant", "I didn't catch that — please speak your answer clearly.")
+        db.commit()
+        db.refresh(row)
+        return session_view(db, row)
+
+    # Filler during Q&A / idea: acknowledge without logging a "scored" student turn advance path.
+    if row.stage in {"qa", "idea"} and llm_client.is_weak_answer(text):
+        _add_turn(db, row.id, row.stage, "student", text, {"weak": True})
+        if row.stage == "qa":
+            reply = (
+                "I need a fuller answer before we move on — take a breath and explain your reasoning "
+                "in a few clear sentences."
+            )
+        else:
+            reply = (
+                "Give me a clearer plan first — data structure, main steps, time complexity, and one edge case."
+            )
+        _add_turn(db, row.id, row.stage, "assistant", reply)
         db.commit()
         db.refresh(row)
         return session_view(db, row)
@@ -720,20 +797,31 @@ def list_reports_for_cm(db: Session, moodle_cm_id: int) -> list[dict[str, Any]]:
         .order_by(SessionRow.ended_at.desc())
         .all()
     )
-    out = []
-    for r in rows:
-        report = _loads(r.report_json, {})
-        out.append(
-            {
-                "session_id": r.id,
-                "moodle_user_id": r.moodle_user_id,
-                "student_name": r.student_name,
-                "overall_score": r.overall_score,
-                "recommendation": r.recommendation,
-                "band": report.get("band", ""),
-                "ended_at": r.ended_at.isoformat() if r.ended_at else None,
-                "dimensions": report.get("dimensions", {}),
-                "flags": report.get("flags", []),
-            }
-        )
-    return out
+    return [_report_item(r) for r in rows]
+
+
+def list_reports_for_user(db: Session, moodle_user_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    rows = (
+        db.query(SessionRow)
+        .filter(SessionRow.moodle_user_id == moodle_user_id, SessionRow.status == "completed")
+        .order_by(SessionRow.ended_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [_report_item(r) for r in rows]
+
+
+def _report_item(r: SessionRow) -> dict[str, Any]:
+    report = _loads(r.report_json, {})
+    return {
+        "session_id": r.id,
+        "moodle_user_id": r.moodle_user_id,
+        "student_name": r.student_name,
+        "role_track": r.role_track,
+        "overall_score": r.overall_score,
+        "recommendation": r.recommendation,
+        "band": report.get("band", ""),
+        "ended_at": r.ended_at.isoformat() if r.ended_at else None,
+        "dimensions": report.get("dimensions", {}),
+        "flags": report.get("flags", []),
+    }

@@ -33,7 +33,7 @@ def health() -> dict:
     return {
         "ok": True,
         "service": "interview-service",
-        "version": "0.2.1",
+        "version": "0.3.0",
         "llm_configured": llm_configured(),
         "llm_model": settings.openai_model if llm_configured() else None,
         "llm_base_url": base if llm_configured() else None,
@@ -83,6 +83,8 @@ def start(body: StartSessionRequest, db: Session = Depends(get_db)) -> SessionSt
         role_track=body.role_track,
         duration_minutes=body.duration_minutes,
         topics=body.topics,
+        resume_text=body.resume_text or "",
+        moodle_problem_id=int(body.moodle_problem_id or 0),
     )
     return SessionStateOut(**view)
 
@@ -139,3 +141,9 @@ def get_one(body: SessionViewRequest, db: Session = Depends(get_db)) -> SessionS
 def reports(cm_id: int, timestamp: int, signature: str, db: Session = Depends(get_db)) -> dict:
     verify_signature(["reports", cm_id], signature, timestamp)
     return {"items": orch.list_reports_for_cm(db, cm_id)}
+
+
+@router.get("/reports/user/{user_id}")
+def reports_user(user_id: int, timestamp: int, signature: str, db: Session = Depends(get_db)) -> dict:
+    verify_signature(["reports_user", user_id], signature, timestamp)
+    return {"items": orch.list_reports_for_user(db, user_id)}

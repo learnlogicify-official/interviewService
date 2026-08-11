@@ -19,13 +19,18 @@ _LAST_ERROR: str = ""
 INTERVIEWER_SYSTEM = """You are a strict but fair technical interviewer for campus / early-career software roles.
 Speak in short, natural spoken sentences (this is a voice interview).
 Rules:
+- Ask EXACTLY ONE question per reply. Never stack a second question in the same reply.
+- WAIT for the candidate's answer before moving on. Do not invent that they answered.
+- If the candidate's message is empty, filler ("um", "ok", "yes" alone mid-QA), or nonsense, set next_action=followup, score under 30, and ask them to answer the SAME question again.
 - NEVER give the solution, code, or step-by-step hints that solve the problem.
 - NEVER repeat a question already asked in the transcript.
 - NEVER reuse the same wording as a previous interviewer line.
 - Ask follow-ups based on what the candidate just said.
-- If the answer is shallow, probe once; if still weak, move on to a different topic.
+- If the answer is shallow, probe once (followup); only then move to a NEW topic (next_topic).
+- Only use move_to_coding after several real answered exchanges (not after noise).
+- You may see the candidate resume — personalize lightly (projects/stack) but NEVER solve problems from it.
 - You may see the candidate's current editor code — ask about THEIR code only; do not rewrite it.
-- Be professional and concise (2–5 sentences typically).
+- Be professional and concise (2–4 spoken sentences).
 
 Always respond with a single JSON object only (no markdown fences):
 {
@@ -35,6 +40,22 @@ Always respond with a single JSON object only (no markdown fences):
   "topic_tag": "short topic label"
 }
 """
+
+FILLER_RE = re.compile(
+    r"^(um+|uh+|ah+|ok|okay|yes|yeah|yep|no|hmm+|mhm+|huh|what|repeat|again)[.!\s]*$",
+    re.I,
+)
+
+
+def is_weak_answer(text: str, *, min_words: int = 6) -> bool:
+    """True if the utterance should not advance the interview."""
+    clean = " ".join((text or "").split()).strip()
+    if len(clean) < 12:
+        return True
+    if FILLER_RE.match(clean):
+        return True
+    words = re.findall(r"[A-Za-z0-9_]+", clean)
+    return len(words) < min_words
 
 
 def _api_key() -> str:
@@ -167,6 +188,8 @@ def interviewer_turn(
     history = "\n".join(history_lines) if history_lines else "(interview just started)"
 
     asked = ctx.get("asked_topics") or []
+    resume = (ctx.get("resume_text") or "")[:4000]
+    weak = is_weak_answer(student_message)
     user_payload = {
         "stage": stage,
         "role_track": role_track,
@@ -175,15 +198,20 @@ def interviewer_turn(
         "seconds_hint": ctx.get("seconds_remaining"),
         "qa_count": ctx.get("qa_index", 0),
         "problem": ctx.get("problem"),
+        "moodle_problem_id": ctx.get("moodle_problem_id"),
         "current_code_excerpt": ctx.get("code_excerpt"),
         "idea_attempts": ctx.get("idea_attempts"),
+        "resume_excerpt": resume or None,
+        "candidate_answer_looks_weak": weak,
         "transcript": history,
         "candidate_just_said": student_message,
         "stage_instructions": {
             "intro": "If they are ready, greet briefly and ask the first conceptual question. next_action=next_topic",
             "qa": (
-                "Evaluate their answer. Prefer a sharp follow-up (followup) OR a NEW related topic (next_topic). "
-                "Do not repeat prior questions. After about 3 solid exchanges or if time is low, next_action=move_to_coding."
+                "ONE question only. If candidate_answer_looks_weak is true, next_action MUST be followup "
+                "and re-ask/clarify the same topic — do not move_to_coding. "
+                "Otherwise evaluate: followup OR next_topic. "
+                "Only after about 3 solid answered exchanges (qa_count), next_action=move_to_coding."
             ),
             "idea": "They must outline approach before coding. If solid, next_action=unlock_editor. If weak, next_action=probe_idea. Never reveal the optimal solution.",
             "code": "They are coding. Acknowledge briefly. Do not help. next_action=continue_coding unless they clearly want to finish (wrap_up).",
@@ -232,7 +260,7 @@ def interviewer_turn(
     }
 
 
-def first_question(*, role_track: str, topics: list[str]) -> dict[str, Any] | None:
+def first_question(*, role_track: str, topics: list[str], resume_text: str = "") -> dict[str, Any] | None:
     """Generate the opening conceptual question dynamically."""
     if not llm_configured():
         return None
@@ -246,11 +274,13 @@ def first_question(*, role_track: str, topics: list[str]) -> dict[str, Any] | No
                         "stage": "qa",
                         "role_track": role_track,
                         "topics": topics,
+                        "resume_excerpt": (resume_text or "")[:4000] or None,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
                             "Ask ONE strong opening conceptual interview question tailored to the role/topics. "
+                            "You may lightly reference the resume (stack/projects) but do not grill soft skills. "
                             "Vary the topic (not always hash maps). next_action must be next_topic. "
-                            "Do not ask about coding problems yet."
+                            "Do not ask about coding problems yet. Exactly one question."
                         ),
                         "transcript": "(start)",
                     }
