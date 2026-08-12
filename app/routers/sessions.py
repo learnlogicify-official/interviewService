@@ -126,6 +126,7 @@ def start(body: StartSessionRequest, db: Session = Depends(get_db)) -> SessionSt
         topics=body.topics,
         resume_text=body.resume_text or "",
         moodle_problem_id=int(body.moodle_problem_id or 0),
+        moodle_problem_title=str(getattr(body, "moodle_problem_title", "") or ""),
     )
     return SessionStateOut(**view)
 
@@ -175,7 +176,7 @@ def get_one(body: SessionViewRequest, db: Session = Depends(get_db)) -> SessionS
         raise HTTPException(status_code=404, detail="Session not found")
     if orch._expire_if_needed(db, row):
         db.refresh(row)
-    return SessionStateOut(**orch.session_view(db, row))
+    return SessionStateOut(**orch.tick_session(db, row))
 
 
 @router.get("/reports/cm/{cm_id}")

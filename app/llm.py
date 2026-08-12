@@ -16,22 +16,23 @@ logger = logging.getLogger("interview.llm")
 # Last failure detail for /v1/health diagnostics (no secrets).
 _LAST_ERROR: str = ""
 
-INTERVIEWER_SYSTEM = """You are a strict but fair technical interviewer for campus / early-career software roles.
-Speak like a real interviewer on a live voice call: short, natural, conversational sentences.
-No markdown, no bullet lists, no stage directions, no "as an AI".
+INTERVIEWER_SYSTEM = """You are NexAI, a live voice technical interviewer for campus / early-career software roles.
+Introduce yourself as NexAI. Sound human: vary greetings, never reuse a canned script.
+Speak in short conversational sentences. No markdown, no bullets, no "as an AI".
+Interview shape (the engine enforces timing; you follow the current stage):
+- First ~5 minutes: conceptual questions only.
+- Then ONE coding problem. Keep the editor locked until their approach is solid (data structure, steps, complexity, one edge case).
+- After unlock: they code. Ask about THEIR written code, not a textbook solution.
+- Last ~2 minutes: brief spoken feedback covering concepts, approach, code, and communication, then close.
 Rules:
-- Ask EXACTLY ONE question per reply. Never stack a second question in the same reply.
-- WAIT for the candidate's answer before moving on. Do not invent that they answered.
-- If the candidate's message is empty, filler ("um", "ok", "yes" alone mid-QA), or nonsense, set next_action=followup, score under 30, and ask them to answer the SAME question again.
+- Ask EXACTLY ONE question per reply.
+- WAIT for the candidate. Do not invent that they answered.
+- If the answer is filler or empty, follow up on the SAME question.
 - NEVER give the solution, code, or step-by-step hints that solve the problem.
-- NEVER repeat a question already asked in the transcript.
-- NEVER reuse the same wording as a previous interviewer line.
-- Ground every follow-up in the candidate's LAST answer: quote or paraphrase one concrete claim, then challenge correctness, edge cases, complexity, or trade-offs.
-- Prefer concrete technical depth over generic praise. Avoid vague lines like "tell me more" without naming what to deepen.
-- If the answer is shallow, probe once (followup); only then move to a NEW topic (next_topic).
-- Only use move_to_coding after several real answered exchanges (not after noise).
-- You may see the candidate resume — personalize lightly (projects/stack) but NEVER solve problems from it.
-- You may see the candidate's current editor code — ask about THEIR code only; do not rewrite it.
+- NEVER repeat a question already asked.
+- Ground follow-ups in what they just said.
+- Only set next_action=unlock_editor when the approach is actually clear enough to code.
+- Only set move_to_coding when the engine's coding window has started or conceptual round is done.
 - Keep replies to 1–3 short spoken sentences.
 
 Always respond with a single JSON object only (no markdown fences):
@@ -284,11 +285,10 @@ def first_question(*, role_track: str, topics: list[str], resume_text: str = "")
                         "resume_excerpt": (resume_text or "")[:4000] or None,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
-                            "Greet the candidate by first name in one short clause, then ask ONE strong "
-                            "opening conceptual interview question tailored to the role/topics. "
-                            "Spoken voice only: no markdown. Vary the topic (not always hash maps). "
-                            "next_action must be next_topic. Do not ask about coding problems yet."
-                        ),
+                            "You are NexAI. Greet {name} with a FRESH spoken intro (never the same wording twice), "
+                            "say you are NexAI, mention a short technical screen then one coding problem, "
+                            "then ask ONE conceptual question. No markdown. next_action=next_topic."
+                        ).replace("{name}", "the candidate"),
                         "transcript": "(start)",
                     }
                 ),
@@ -308,3 +308,39 @@ def first_question(*, role_track: str, topics: list[str], resume_text: str = "")
         "next_action": "next_topic",
         "topic_tag": str(data.get("topic_tag") or "opening"),
     }
+
+
+def wrap_speech(*, student_name: str, scores: dict[str, Any], flags: list[str]) -> str | None:
+    """Short spoken closing feedback. Returns None if LLM unavailable."""
+    if not llm_configured():
+        return None
+    first = (student_name or "there").split()[0]
+    raw = chat(
+        [
+            {"role": "system", "content": INTERVIEWER_SYSTEM},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "stage": "wrap",
+                        "stage_instructions": (
+                            f"You are NexAI closing the interview with {first}. "
+                            "Give a brief spoken recap in 4-6 sentences covering conceptual answers, "
+                            "problem-solving approach, coding, and communication. Be specific and fair. "
+                            "Do not ask another question. End by thanking them. next_action=wrap_up."
+                        ),
+                        "scores": scores,
+                        "flags": flags,
+                    }
+                ),
+            },
+        ],
+        temperature=0.5,
+        max_tokens=280,
+    )
+    data = _extract_json(raw or "")
+    if data and str(data.get("reply") or "").strip():
+        return str(data["reply"]).strip()
+    if raw and not data:
+        return " ".join(str(raw).split())[:600] or None
+    return None

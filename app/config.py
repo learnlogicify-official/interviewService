@@ -24,10 +24,13 @@ class Settings(BaseSettings):
     openai_realtime_voice: str = "alloy"
     # Prefer realtime WebRTC voice when client requests a token.
     voice_mode: str = "realtime"  # realtime|legacy
-    default_duration_minutes: int = 30
+    default_duration_minutes: int = 17
     cors_origins: str = "*"
-    # How many Q&A exchanges before coding (LLM may move earlier/later).
-    qa_target_exchanges: int = 3
+    qa_seconds: int = 300
+    coding_seconds: int = 600
+    wrap_seconds: int = 120
+    # Soft cap on conceptual exchanges before coding (time still wins).
+    qa_target_exchanges: int = 4
 
 
 @lru_cache

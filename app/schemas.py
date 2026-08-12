@@ -13,10 +13,11 @@ class StartSessionRequest(BaseModel):
     moodle_instance_id: int = 0
     student_name: str = "Student"
     role_track: str = "sde_intern"
-    duration_minutes: int = 30
+    duration_minutes: int = 17
     topics: list[str] = Field(default_factory=lambda: ["arrays", "strings", "hashmap", "stacks"])
     resume_text: str = ""
     moodle_problem_id: int = 0
+    moodle_problem_title: str = ""
     timestamp: int
     signature: str
 

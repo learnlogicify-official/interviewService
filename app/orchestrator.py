@@ -72,18 +72,46 @@ def _save_state(row: SessionRow, state: dict[str, Any]) -> None:
     row.updated_at = _now()
 
 
+def _elapsed(row: SessionRow) -> int:
+    return max(0, int(row.duration_minutes) * 60 - _seconds_remaining(row))
+
+
+def _phase_bounds(row: SessionRow) -> tuple[int, int]:
+    settings = get_settings()
+    qa = int(settings.qa_seconds or 300)
+    wrap = int(settings.wrap_seconds or 120)
+    return qa, wrap
+
+
+def _should_enter_coding(row: SessionRow, state: dict[str, Any]) -> bool:
+    qa_secs, _wrap = _phase_bounds(row)
+    if _elapsed(row) >= qa_secs:
+        return True
+    target = int(get_settings().qa_target_exchanges or 4)
+    return int(state.get("qa_index", 0)) >= target
+
+
+def _should_wrap(row: SessionRow) -> bool:
+    _qa, wrap = _phase_bounds(row)
+    return _seconds_remaining(row) <= wrap
+
+
 def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
-    # Show NexPractice IDE once coding round begins (idea outline + code + explain).
-    show_editor = row.stage in {"idea", "code", "explain"} and (
+    # Show NexPractice once coding round begins so they can read the prompt.
+    # Keep the editor locked until the approach is accepted (stage == code/explain).
+    show_editor = row.stage in {"idea", "code", "explain", "wrap"} and (
         bool(state.get("moodle_problem_id")) or bool(state.get("current_problem_id"))
     )
+    editor_locked = show_editor and row.stage == "idea"
     return {
         "show_editor": show_editor,
+        "editor_locked": editor_locked,
         "awaiting": state.get("awaiting", "message"),
-        "can_run": show_editor and row.stage == "code",
+        "can_run": show_editor and row.stage in {"code", "explain"},
         "can_submit_idea": row.stage == "idea",
         "interrupt_active": row.stage == "explain",
         "moodle_problem_id": int(state.get("moodle_problem_id") or 0),
+        "problem_title": state.get("moodle_problem_title") or "",
     }
 
 
@@ -151,9 +179,14 @@ def start_session(
     topics: list[str],
     resume_text: str = "",
     moodle_problem_id: int = 0,
+    moodle_problem_title: str = "",
 ) -> dict[str, Any]:
     session_id = uuid.uuid4().hex
     resume = " ".join((resume_text or "").split())[:12000]
+    settings = get_settings()
+    duration_minutes = int(duration_minutes or settings.default_duration_minutes or 17)
+    if duration_minutes < 12 or duration_minutes > 22:
+        duration_minutes = 17
     state = {
         "topics": topics,
         "qa_index": 0,
@@ -172,6 +205,7 @@ def start_session(
         "current_code": "",
         "resume_text": resume,
         "moodle_problem_id": int(moodle_problem_id or 0),
+        "moodle_problem_title": (moodle_problem_title or "").strip()[:180],
         "skill_graph": skill_graph.default_graph(role_track),
         "claims": [],
         "voice_metrics": {},
@@ -193,15 +227,22 @@ def start_session(
     db.add(row)
     db.flush()
 
-    # Skip the "say yes" intro gate — it was a dead end when STT missed short replies.
+    # Varied NexAI intro + first conceptual question. No "say yes" gate.
     first = student_name.split()[0] if student_name else "there"
+    greetings = [
+        f"Hi {first}, I'm NexAI. We'll do about five minutes of technical questions, then one coding problem.",
+        f"Hey {first}. NexAI here — short conceptual round, then I'll give you one coding question from NexPractice.",
+        f"Welcome {first}. I'm NexAI, your interviewer today. Concepts first, then one timed coding problem.",
+        f"Good to meet you {first}. This is NexAI. Let's start with a few technical questions, then you'll code.",
+        f"{first}, I'm NexAI. Think of this as a live screen: a handful of questions, then one problem to implement.",
+    ]
+    greet = greetings[int(uuid.uuid4().int % len(greetings))]
     opening = _begin_qa(db, row, state)
     spoken = opening or (
-        f"Hi {first}. Let's start with a conceptual question: "
-        "when would you pick a hash map over a sorted array for lookups, and what's the trade-off?"
+        f"{greet} When would you pick a hash map over a sorted array for lookups, and what's the trade-off?"
     )
-    if spoken and not spoken.lower().lstrip().startswith("hi "):
-        spoken = f"Hi {first}. {spoken}"
+    if spoken and "nexai" not in spoken.lower() and "nex ai" not in spoken.lower():
+        spoken = f"{greet} {spoken}"
     _add_turn(db, session_id, row.stage or "qa", "assistant", spoken)
     db.commit()
     db.refresh(row)
@@ -215,6 +256,42 @@ def _expire_if_needed(db: Session, row: SessionRow) -> bool:
         finish_session(db, row, reason="time_up")
         return True
     return False
+
+
+def _spoken_wrap_text(row: SessionRow, state: dict[str, Any]) -> str:
+    first = (row.student_name or "there").split()[0]
+    scores = {
+        "conceptual": state.get("score_conceptual", 0),
+        "idea": state.get("score_idea", 0),
+        "coding": state.get("score_coding", 0),
+        "explain": state.get("score_explain", 0),
+        "communication": state.get("score_communication", 0),
+    }
+    spoken = llm_client.wrap_speech(
+        student_name=row.student_name,
+        scores=scores,
+        flags=list(state.get("flags") or []),
+    )
+    if spoken:
+        return spoken
+    bits = []
+    if scores["conceptual"] >= 70:
+        bits.append("your conceptual answers were solid")
+    else:
+        bits.append("your conceptual answers need more depth")
+    if scores["idea"] >= 60:
+        bits.append("the coding approach was reasonable")
+    else:
+        bits.append("the approach before coding was thin")
+    if scores["coding"] >= 70:
+        bits.append("the implementation looked promising")
+    else:
+        bits.append("keep practicing timed coding")
+    return (
+        f"{first}, this is NexAI wrapping up. "
+        + ", ".join(bits)
+        + ". Thanks for the session — you'll see a short report next."
+    )
 
 
 def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> dict[str, Any]:
@@ -241,17 +318,29 @@ def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> d
     row.ended_at = _now()
     _save_state(row, state)
 
-    summary = (
-        f"Interview complete ({reason.replace('_', ' ')}).\n\n"
-        f"**Overall:** {report['overall_score']:.0f}/100 — {report['band'].replace('_', ' ')}\n"
-        f"**Recommendation:** {report['recommendation']}\n\n"
-        f"Strengths: {', '.join(report['strengths'])}\n"
-        f"Focus areas: {', '.join(report['gaps'])}\n\n"
-        + "\n".join(f"• {s}" for s in report["next_steps"])
-    )
-    _add_turn(db, row.id, "done", "assistant", summary, {"report": True})
+    summary = _spoken_wrap_text(row, state)
+    _add_turn(db, row.id, "done", "assistant", summary, {"report": True, "spoken_wrap": True})
     db.commit()
     db.refresh(row)
+    return session_view(db, row)
+
+
+def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
+    """Apply timed phase changes (coding window / wrap-up) even if the student is silent."""
+    if row.status != "active":
+        return session_view(db, row)
+    if _should_wrap(row):
+        return finish_session(db, row, reason="time_up")
+    state = _state(row)
+    if row.stage == "qa" and _should_enter_coding(row, state):
+        spoken = _start_coding_round(db, row, state)
+        _add_turn(db, row.id, row.stage, "assistant", spoken)
+        db.commit()
+        db.refresh(row)
+        return session_view(db, row)
+    if _expire_if_needed(db, row):
+        db.refresh(row)
+        return session_view(db, row)
     return session_view(db, row)
 
 
@@ -373,9 +462,8 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     state["llm_mode"] = False
     _save_state(row, state)
     return (
-        "Great. First conceptual question:\n\n"
-        f"**{q['question']}**\n\n"
-        "Take a clear structured answer."
+        f"First question: {q['question']} "
+        "Give a clear structured answer."
     )
 
 
@@ -432,10 +520,10 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             evidence=(answer or "")[:160],
         )
 
-        force_coding = state["qa_index"] >= target or _seconds_remaining(row) < 16 * 60
-        if action == "move_to_coding" or force_coding:
+        force_coding = _should_enter_coding(row, state) or action == "move_to_coding"
+        if force_coding:
             _save_state(row, state)
-            return llm_result["reply"] + "\n\n" + _start_coding_round(db, row, state)
+            return llm_result["reply"] + " " + _start_coding_round(db, row, state)
 
         _save_state(row, state)
         return llm_result["reply"]
@@ -460,7 +548,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     state["qa_index"] = idx + 1
     feedback = f"Thanks — noted ({score:.0f}/100)."
 
-    if state["qa_index"] >= target or _seconds_remaining(row) < 18 * 60:
+    if state["qa_index"] >= target or _should_enter_coding(row, state):
         _save_state(row, state)
         return feedback + "\n\n" + _start_coding_round(db, row, state)
 
@@ -479,6 +567,7 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     if state.get("score_conceptual", 0) >= 75:
         prefer = "medium"
     moodle_pid = int(state.get("moodle_problem_id") or 0)
+    title = (state.get("moodle_problem_title") or "the NexPractice problem on your screen").strip()
     if moodle_pid:
         state["awaiting"] = "idea"
         row.stage = "idea"
@@ -486,9 +575,9 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
         state["explain_count"] = 0
         _save_state(row, state)
         return (
-            "Let's move to coding on the NexPractice problem on your screen.\n\n"
-            "Before you write code: outline your approach, data structures, complexity, and edge cases. "
-            "I will unlock the editor once the idea looks solid. I will not solve it for you."
+            f"Let's move to coding. Open {title} on your screen — the editor stays locked for now. "
+            "Walk me through your approach: data structure, main steps, time complexity, and one edge case. "
+            "I'll unlock the editor when that plan is solid. I will not solve it for you."
         )
 
     problem = pick_problem(state.get("used_problems", []), state.get("topics", []), prefer=prefer)
@@ -542,7 +631,15 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
     if llm_result:
         state["score_idea"] = max(float(state.get("score_idea", 0)), float(llm_result["score"]))
         action = llm_result["next_action"]
-        unlock = action == "unlock_editor" or state["idea_attempts"] >= 2
+        unlock = action == "unlock_editor"
+        # Don't unlock just because they tried twice — only if NexAI is satisfied,
+        # or the coding window is almost gone.
+        if not unlock and int(state.get("idea_attempts", 0)) >= 1 and _seconds_remaining(row) <= (
+            int(get_settings().wrap_seconds or 120) + 180
+        ):
+            unlock = True
+        if not unlock and int(state.get("idea_attempts", 0)) >= 5:
+            unlock = True
         if unlock:
             row.stage = "code"
             state["awaiting"] = "code"
@@ -567,19 +664,20 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
 
     result = evaluator.score_idea(answer, problem)
     state["score_idea"] = max(float(state.get("score_idea", 0)), result["score"])
-    if result["accepted"] or state["idea_attempts"] >= 2:
+    unlock = result["accepted"] or int(state.get("idea_attempts", 0)) >= 5
+    if unlock:
         row.stage = "code"
         state["awaiting"] = "code"
         _save_state(row, state)
-        unlock = (
+        note = (
             result["feedback"]
             if result["accepted"]
-            else "We'll proceed so you can show skill in code — keep refining as you go."
+            else "We'll proceed so you still have time to code — keep refining as you go."
         )
         return (
-            f"{unlock}\n\n"
-            "Editor unlocked. Implement the solution in Python, use Run tests when ready. "
-            "I may interrupt you to explain a piece of logic."
+            f"{note}\n\n"
+            "Editor unlocked. Implement in the NexPractice IDE and run tests when ready. "
+            "I may ask about the code you write — I will not give the solution."
         )
     _save_state(row, state)
     return result["feedback"] + " Reply with a clearer plan (structure + complexity + edges)."
@@ -588,22 +686,26 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
 def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: str) -> str | None:
     if row.stage != "code":
         return None
-    if int(state.get("explain_count", 0)) >= 2:
+    if _should_wrap(row):
         return None
-    if _seconds_remaining(row) < 5 * 60:
+    if int(state.get("explain_count", 0)) >= 5:
         return None
     nontrivial = sum(1 for ln in code.splitlines() if ln.strip() and "pass" not in ln)
-    if nontrivial < 6:
+    if nontrivial < 3:
         return None
-    seed = sum(ord(c) for c in row.id) + int(state.get("explain_count", 0)) * 7
-    if seed % 3 != 0 and state.get("explain_count", 0) == 0:
-        if int(state.get("run_count", 0)) < 1:
-            return None
+    last_len = int(state.get("interrupt_code_len", 0))
+    if last_len and abs(len(code) - last_len) < 24:
+        return None
+    last_at = float(state.get("last_interrupt_elapsed", 0) or 0)
+    if last_at and (_elapsed(row) - last_at) < 40:
+        return None
     excerpt = evaluator.pick_code_excerpt(code)
     if not excerpt:
         return None
     state["explain_excerpt"] = excerpt
     state["explain_count"] = int(state.get("explain_count", 0)) + 1
+    state["interrupt_code_len"] = len(code)
+    state["last_interrupt_elapsed"] = _elapsed(row)
     state["awaiting"] = "explain"
     row.stage = "explain"
     _save_state(row, state)
@@ -613,10 +715,10 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
         role_track=row.role_track,
         topics=state.get("topics", []),
         transcript=_recent_transcript(db, row.id),
-        student_message="(candidate is coding; interrupt now)",
+        student_message="(candidate is coding; ask about THEIR code now)",
         context={
             "code_excerpt": excerpt,
-            "problem": _current_problem(state),
+            "problem": _current_problem(state) or {"title": state.get("moodle_problem_title")},
             "seconds_remaining": _seconds_remaining(row),
         },
     )
@@ -624,10 +726,9 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
         return llm_result["reply"]
 
     return (
-        "Quick interrupt — I can see this part of your editor:\n"
-        f"```python\n{excerpt}\n```\n"
-        "Explain what this block is doing and why you chose this approach. "
-        "Do not rewrite it for me — just walk me through your reasoning."
+        "Quick pause — I can see this in your editor: "
+        f"{excerpt.replace(chr(10), ' ')}. "
+        "Why did you write it this way, and what happens on a duplicate or empty input?"
     )
 
 
@@ -678,6 +779,10 @@ def handle_message(
     *,
     duration_sec: float = 0.0,
 ) -> dict[str, Any]:
+    if row.status != "active":
+        return session_view(db, row)
+    if _should_wrap(row):
+        return finish_session(db, row, reason="time_up")
     if _expire_if_needed(db, row):
         db.refresh(row)
         return session_view(db, row)
@@ -779,6 +884,10 @@ def handle_message(
 
 
 def save_snapshot(db: Session, row: SessionRow, code: str, source: str = "autosave") -> dict[str, Any]:
+    if row.status != "active":
+        return session_view(db, row)
+    if _should_wrap(row):
+        return finish_session(db, row, reason="time_up")
     if _expire_if_needed(db, row):
         db.refresh(row)
         return session_view(db, row)
@@ -809,6 +918,15 @@ def run_code(db: Session, row: SessionRow, code: str, mode: str = "sample") -> t
             "total": 0,
             "details": [],
             "message": "Session ended",
+        }
+
+    if row.stage not in {"code", "explain"}:
+        return session_view(db, row), {
+            "ok": False,
+            "passed": 0,
+            "total": 0,
+            "details": [],
+            "message": "Editor is locked until your approach is accepted.",
         }
 
     state = _state(row)
