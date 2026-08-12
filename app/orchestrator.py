@@ -193,13 +193,16 @@ def start_session(
     db.add(row)
     db.flush()
 
-    greeting = (
-        f"Hi {student_name.split()[0] if student_name else 'there'}. "
-        f"This is about a {duration_minutes}-minute technical screen. "
-        "I'll ask questions out loud, then you'll code later. "
-        "Say yes when you're ready."
+    # Skip the "say yes" intro gate — it was a dead end when STT missed short replies.
+    first = student_name.split()[0] if student_name else "there"
+    opening = _begin_qa(db, row, state)
+    spoken = opening or (
+        f"Hi {first}. Let's start with a conceptual question: "
+        "when would you pick a hash map over a sorted array for lookups, and what's the trade-off?"
     )
-    _add_turn(db, session_id, "intro", "assistant", greeting)
+    if spoken and not spoken.lower().lstrip().startswith("hi "):
+        spoken = f"Hi {first}. {spoken}"
+    _add_turn(db, session_id, row.stage or "qa", "assistant", spoken)
     db.commit()
     db.refresh(row)
     return session_view(db, row)

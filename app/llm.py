@@ -284,10 +284,10 @@ def first_question(*, role_track: str, topics: list[str], resume_text: str = "")
                         "resume_excerpt": (resume_text or "")[:4000] or None,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
-                            "Ask ONE strong opening conceptual interview question tailored to the role/topics. "
-                            "You may lightly reference the resume (stack/projects) but do not grill soft skills. "
-                            "Vary the topic (not always hash maps). next_action must be next_topic. "
-                            "Do not ask about coding problems yet. Exactly one question."
+                            "Greet the candidate by first name in one short clause, then ask ONE strong "
+                            "opening conceptual interview question tailored to the role/topics. "
+                            "Spoken voice only: no markdown. Vary the topic (not always hash maps). "
+                            "next_action must be next_topic. Do not ask about coding problems yet."
                         ),
                         "transcript": "(start)",
                     }
