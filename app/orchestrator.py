@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -12,6 +13,8 @@ from sqlalchemy.orm import Session
 
 from app import evaluator
 from app import llm as llm_client
+from app import skills as skill_graph
+from app import voice_metrics
 from app.config import get_settings
 from app.models import CodingSnapshotRow, SessionRow, TurnRow
 from app.problems import get_problem, pick_problem, public_problem
@@ -120,6 +123,8 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
             "communication": state.get("score_communication", 0),
             "overall": row.overall_score,
         },
+        "skill_graph": {k: v for k, v in (state.get("skill_graph") or {}).items() if not str(k).startswith("_")},
+        "voice_metrics": state.get("voice_metrics") or {},
         "turns": [
             {
                 "seq": t.seq,
@@ -167,6 +172,10 @@ def start_session(
         "current_code": "",
         "resume_text": resume,
         "moodle_problem_id": int(moodle_problem_id or 0),
+        "skill_graph": skill_graph.default_graph(role_track),
+        "claims": [],
+        "voice_metrics": {},
+        "voice_metric_samples": [],
     }
     row = SessionRow(
         id=session_id,
@@ -265,6 +274,69 @@ def _apply_score_communication(state: dict[str, Any], answer: str, score: float)
     )
 
 
+def _extract_claims(answer: str) -> list[str]:
+    text = " ".join((answer or "").split())
+    claims: list[str] = []
+    patterns = [
+        r"\bI have (?:worked|used|built|designed|implemented|experience)[^.!?]{0,80}",
+        r"\bI(?:'ve| have) (?:\d+\+?\s*years?)[^.!?]{0,60}",
+        r"\bwe used [^.!?]{0,60}",
+    ]
+    for pat in patterns:
+        for m in re.finditer(pat, text, flags=re.I):
+            claim = m.group(0).strip()
+            if len(claim) >= 12:
+                claims.append(claim[:160])
+    return claims[:3]
+
+
+def _note_voice_and_claims(state: dict[str, Any], answer: str, duration_sec: float = 0.0) -> None:
+    metrics = voice_metrics.analyze_utterance(answer, duration_sec=duration_sec or None)
+    samples = state.setdefault("voice_metric_samples", [])
+    samples.append(metrics)
+    state["voice_metric_samples"] = samples[-30:]
+    # Aggregate latest rolling snapshot for the report.
+    state["voice_metrics"] = {
+        "speaking_rate_wpm": metrics["speaking_rate_wpm"],
+        "filler_count_total": sum(int(s.get("filler_count", 0)) for s in state["voice_metric_samples"]),
+        "clarity": round(
+            sum(float(s.get("clarity", 0)) for s in state["voice_metric_samples"]) / max(1, len(state["voice_metric_samples"])),
+            1,
+        ),
+        "structure": round(
+            sum(float(s.get("structure", 0)) for s in state["voice_metric_samples"]) / max(1, len(state["voice_metric_samples"])),
+            1,
+        ),
+        "samples": len(state["voice_metric_samples"]),
+        "latest": metrics,
+    }
+    state["score_communication"] = voice_metrics.blend_communication(
+        float(state.get("score_communication") or 55),
+        metrics,
+    )
+    for claim in _extract_claims(answer):
+        bag = state.setdefault("claims", [])
+        if claim not in bag:
+            bag.append(claim)
+        state["claims"] = bag[-20:]
+
+
+def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    graph = state.get("skill_graph") or skill_graph.default_graph(row.role_track)
+    ctx = {
+        "seconds_remaining": _seconds_remaining(row),
+        "qa_index": state.get("qa_index", 0),
+        "asked_topics": state.get("asked_topics", []),
+        "resume_text": state.get("resume_text") or "",
+        "moodle_problem_id": state.get("moodle_problem_id"),
+        "skill_graph_summary": skill_graph.summarize_for_llm(graph),
+        "claims": state.get("claims") or [],
+        "voice_metrics_latest": (state.get("voice_metrics") or {}).get("latest"),
+    }
+    ctx.update(extra)
+    return ctx
+
+
 def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     row.stage = "qa"
     state["qa_index"] = 0
@@ -325,13 +397,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         topics=topics,
         transcript=_recent_transcript(db, row.id),
         student_message=answer,
-        context={
-            "seconds_remaining": _seconds_remaining(row),
-            "qa_index": idx,
-            "asked_topics": state.get("asked_topics", []),
-            "resume_text": state.get("resume_text") or "",
-            "moodle_problem_id": state.get("moodle_problem_id"),
-        },
+        context=_llm_context(row, state),
     )
 
     if llm_result:
@@ -339,6 +405,13 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         action = llm_result["next_action"]
         # Never advance on weak LLM scores that re-ask.
         if action == "followup" and score < 35:
+            tag = llm_result.get("topic_tag") or state.get("current_qa_id") or ""
+            state["skill_graph"] = skill_graph.update_skill(
+                state.get("skill_graph") or skill_graph.default_graph(row.role_track),
+                topic_tag=tag,
+                score_0_100=score,
+                evidence=f"Weak/follow-up on: {(answer or '')[:120]}",
+            )
             _save_state(row, state)
             return llm_result["reply"]
 
@@ -351,6 +424,12 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         if tag:
             state.setdefault("asked_topics", []).append(tag)
             state["current_qa_id"] = tag
+        state["skill_graph"] = skill_graph.update_skill(
+            state.get("skill_graph") or skill_graph.default_graph(row.role_track),
+            topic_tag=tag or state.get("current_qa_id") or "",
+            score_0_100=score,
+            evidence=(answer or "")[:160],
+        )
 
         force_coding = state["qa_index"] >= target or _seconds_remaining(row) < 16 * 60
         if action == "move_to_coding" or force_coding:
@@ -591,7 +670,13 @@ def _handle_explain(db: Session, row: SessionRow, state: dict[str, Any], answer:
     )
 
 
-def handle_message(db: Session, row: SessionRow, message: str) -> dict[str, Any]:
+def handle_message(
+    db: Session,
+    row: SessionRow,
+    message: str,
+    *,
+    duration_sec: float = 0.0,
+) -> dict[str, Any]:
     if _expire_if_needed(db, row):
         db.refresh(row)
         return session_view(db, row)
@@ -605,7 +690,9 @@ def handle_message(db: Session, row: SessionRow, message: str) -> dict[str, Any]
 
     # Filler during Q&A / idea: acknowledge without logging a "scored" student turn advance path.
     if row.stage in {"qa", "idea"} and llm_client.is_weak_answer(text):
-        _add_turn(db, row.id, row.stage, "student", text, {"weak": True})
+        state = _state(row)
+        _note_voice_and_claims(state, text, duration_sec)
+        _add_turn(db, row.id, row.stage, "student", text, {"weak": True, "voice": state.get("voice_metrics", {}).get("latest")})
         if row.stage == "qa":
             reply = (
                 "I need a fuller answer before we move on — take a breath and explain your reasoning "
@@ -616,12 +703,14 @@ def handle_message(db: Session, row: SessionRow, message: str) -> dict[str, Any]
                 "Give me a clearer plan first — data structure, main steps, time complexity, and one edge case."
             )
         _add_turn(db, row.id, row.stage, "assistant", reply)
+        _save_state(row, state)
         db.commit()
         db.refresh(row)
         return session_view(db, row)
 
     _add_turn(db, row.id, row.stage, "student", text)
     state = _state(row)
+    _note_voice_and_claims(state, text, duration_sec)
     reply = ""
 
     if text.lower() in {"done", "finish", "end interview", "end"}:
@@ -645,11 +734,12 @@ def handle_message(db: Session, row: SessionRow, message: str) -> dict[str, Any]
             topics=state.get("topics", []),
             transcript=_recent_transcript(db, row.id),
             student_message=text,
-            context={
-                "problem": _current_problem(state),
-                "code_excerpt": evaluator.pick_code_excerpt(state.get("current_code", "")),
-                "seconds_remaining": _seconds_remaining(row),
-            },
+            context=_llm_context(
+                row,
+                state,
+                problem=_current_problem(state),
+                code_excerpt=evaluator.pick_code_excerpt(state.get("current_code", "")),
+            ),
         )
         if llm_result:
             if llm_result["next_action"] == "wrap_up":

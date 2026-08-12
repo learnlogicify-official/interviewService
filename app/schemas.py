@@ -24,6 +24,7 @@ class StartSessionRequest(BaseModel):
 class MessageRequest(BaseModel):
     session_id: str
     message: str
+    duration_sec: float = 0.0
     timestamp: int
     signature: str
 
@@ -76,6 +77,8 @@ class SessionStateOut(BaseModel):
     moodle_problem_id: int = 0
     ui: dict[str, Any] = Field(default_factory=dict)
     scores: dict[str, Any] = Field(default_factory=dict)
+    skill_graph: dict[str, Any] = Field(default_factory=dict)
+    voice_metrics: dict[str, Any] = Field(default_factory=dict)
     turns: list[TurnOut] = Field(default_factory=list)
     report: dict[str, Any] | None = None
 
@@ -102,3 +105,15 @@ class SttRequest(BaseModel):
     language: str = ""
     timestamp: int
     signature: str
+
+
+class RealtimeTokenRequest(BaseModel):
+    session_id: str
+    timestamp: int
+    signature: str
+
+
+class VoiceMetricsIn(BaseModel):
+    """Optional client-side timing for communication metrics."""
+
+    duration_sec: float = 0.0

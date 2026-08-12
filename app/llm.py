@@ -204,6 +204,9 @@ def interviewer_turn(
         "idea_attempts": ctx.get("idea_attempts"),
         "resume_excerpt": resume or None,
         "candidate_answer_looks_weak": weak,
+        "skill_graph_summary": ctx.get("skill_graph_summary"),
+        "claims": ctx.get("claims"),
+        "voice_metrics_latest": ctx.get("voice_metrics_latest"),
         "transcript": history,
         "candidate_just_said": student_message,
         "stage_instructions": {
@@ -211,7 +214,8 @@ def interviewer_turn(
             "qa": (
                 "ONE question only. If candidate_answer_looks_weak is true, next_action MUST be followup "
                 "and re-ask/clarify the same topic — do not move_to_coding. "
-                "Otherwise evaluate: followup OR next_topic. "
+                "Otherwise evaluate: followup OR next_topic. Prefer probing WEAKEST skills from skill_graph_summary. "
+                "If claims contain untested technology claims, drill one level deeper before moving on. "
                 "Only after about 3 solid answered exchanges (qa_count), next_action=move_to_coding."
             ),
             "idea": "They must outline approach before coding. If solid, next_action=unlock_editor. If weak, next_action=probe_idea. Never reveal the optimal solution.",

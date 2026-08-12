@@ -11,6 +11,7 @@ from app import orchestrator as orch
 from app.schemas import (
     EndSessionRequest,
     MessageRequest,
+    RealtimeTokenRequest,
     RunCodeRequest,
     RunResultOut,
     SessionStateOut,
@@ -26,6 +27,7 @@ router = APIRouter(prefix="/v1", tags=["sessions"])
 
 @router.get("/health")
 def health() -> dict:
+    from app import __version__
     from app.config import get_settings
     from app.llm import last_error, llm_configured
 
@@ -34,13 +36,15 @@ def health() -> dict:
     return {
         "ok": True,
         "service": "interview-service",
-        "version": "0.3.1",
+        "version": __version__,
         "llm_configured": llm_configured(),
         "llm_model": settings.openai_model if llm_configured() else None,
         "llm_base_url": base if llm_configured() else None,
         "llm_last_error": last_error() or None,
         "tts_model": settings.openai_tts_model if llm_configured() else None,
         "stt_model": settings.openai_stt_model if llm_configured() else None,
+        "realtime_model": settings.openai_realtime_model if llm_configured() else None,
+        "voice_mode": settings.voice_mode,
     }
 
 
@@ -50,6 +54,24 @@ def llm_ping() -> dict:
     from app.llm import ping
 
     return ping()
+
+
+@router.post("/realtime/token")
+def realtime_token(body: RealtimeTokenRequest, db: Session = Depends(get_db)) -> dict:
+    """Mint ephemeral OpenAI Realtime client secret for browser WebRTC."""
+    from app import realtime as realtime_mod
+
+    verify_signature(["realtime_token", body.session_id], body.signature, body.timestamp)
+    row = orch.get_session(db, body.session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return realtime_mod.create_client_secret(
+        session_id=row.id,
+        student_name=row.student_name,
+        role_track=row.role_track,
+        stage=row.stage,
+        moodle_user_id=row.moodle_user_id,
+    )
 
 
 @router.post("/tts")
@@ -114,7 +136,7 @@ def message(body: MessageRequest, db: Session = Depends(get_db)) -> SessionState
     row = orch.get_session(db, body.session_id)
     if not row:
         raise HTTPException(status_code=404, detail="Session not found")
-    return SessionStateOut(**orch.handle_message(db, row, body.message))
+    return SessionStateOut(**orch.handle_message(db, row, body.message, duration_sec=float(body.duration_sec or 0)))
 
 
 @router.post("/sessions/snapshot", response_model=SessionStateOut)

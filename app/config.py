@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     openai_tts_voice: str = "alloy"
     openai_stt_base_url: str = ""
     openai_stt_model: str = "whisper-1"
+    openai_realtime_model: str = "gpt-realtime"
+    openai_realtime_voice: str = "alloy"
+    # Prefer realtime WebRTC voice when client requests a token.
+    voice_mode: str = "realtime"  # realtime|legacy
     default_duration_minutes: int = 30
     cors_origins: str = "*"
     # How many Q&A exchanges before coding (LLM may move earlier/later).

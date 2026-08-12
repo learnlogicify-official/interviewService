@@ -80,6 +80,12 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
             "explanation": round(explanation, 1),
             "communication": round(communication, 1),
         },
+        "skill_graph": {
+            k: v for k, v in (state.get("skill_graph") or {}).items() if not str(k).startswith("_")
+        },
+        "skill_evidence": (state.get("skill_graph") or {}).get("_evidence") or [],
+        "voice_metrics": state.get("voice_metrics") or {},
+        "claims": state.get("claims") or [],
         "strengths": strengths or ["Showed up and completed the full loop"],
         "gaps": gaps or ["Keep sharpening edge-case discussion"],
         "next_steps": next_steps,
