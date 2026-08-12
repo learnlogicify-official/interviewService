@@ -17,7 +17,8 @@ logger = logging.getLogger("interview.llm")
 _LAST_ERROR: str = ""
 
 INTERVIEWER_SYSTEM = """You are a strict but fair technical interviewer for campus / early-career software roles.
-Speak in short, natural spoken sentences (this is a voice interview).
+Speak like a real interviewer on a live voice call: short, natural, conversational sentences.
+No markdown, no bullet lists, no stage directions, no "as an AI".
 Rules:
 - Ask EXACTLY ONE question per reply. Never stack a second question in the same reply.
 - WAIT for the candidate's answer before moving on. Do not invent that they answered.
@@ -31,7 +32,7 @@ Rules:
 - Only use move_to_coding after several real answered exchanges (not after noise).
 - You may see the candidate resume — personalize lightly (projects/stack) but NEVER solve problems from it.
 - You may see the candidate's current editor code — ask about THEIR code only; do not rewrite it.
-- Be professional and concise (2–4 spoken sentences).
+- Keep replies to 1–3 short spoken sentences.
 
 Always respond with a single JSON object only (no markdown fences):
 {
@@ -210,9 +211,10 @@ def interviewer_turn(
         "transcript": history,
         "candidate_just_said": student_message,
         "stage_instructions": {
-            "intro": "If they are ready, greet briefly and ask the first conceptual question. next_action=next_topic",
+            "intro": "If they are ready, greet in ONE short spoken sentence then ask the first conceptual question. Sound natural, not like a script. next_action=next_topic",
             "qa": (
-                "ONE question only. If candidate_answer_looks_weak is true, next_action MUST be followup "
+                "ONE question only. Sound like a human interviewer on a call — short spoken sentences, no markdown, no bullet lists. "
+                "If candidate_answer_looks_weak is true, next_action MUST be followup "
                 "and re-ask/clarify the same topic — do not move_to_coding. "
                 "Otherwise evaluate: followup OR next_topic. Prefer probing WEAKEST skills from skill_graph_summary. "
                 "If claims contain untested technology claims, drill one level deeper before moving on. "

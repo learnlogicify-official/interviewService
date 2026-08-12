@@ -195,11 +195,9 @@ def start_session(
 
     greeting = (
         f"Hi {student_name.split()[0] if student_name else 'there'}. "
-        f"This is a live voice technical screen for about {duration_minutes} minutes. "
-        "I will speak questions and listen while you answer naturally — you do not need to press a mic button. "
-        "Later you will code in the NexPractice editor; I can see your work and may ask you to explain. "
-        "I will not solve the problem for you. "
-        "When you are ready, just say yes."
+        f"This is about a {duration_minutes}-minute technical screen. "
+        "I'll ask questions out loud, then you'll code later. "
+        "Say yes when you're ready."
     )
     _add_turn(db, session_id, "intro", "assistant", greeting)
     db.commit()
@@ -717,10 +715,15 @@ def handle_message(
         return finish_session(db, row, reason="student_ended")
 
     if row.stage == "intro":
-        if any(w in text.lower() for w in ("yes", "ready", "start", "ok", "okay")):
+        # Accept common ready phrases, not only exact "yes".
+        ready = re.search(
+            r"\b(yes|yeah|yep|ready|start|sure|okay|ok|let'?s go|i'?m ready)\b",
+            text.lower(),
+        )
+        if ready:
             reply = _begin_qa(db, row, state)
         else:
-            reply = "When you're ready, reply **yes** and we'll start the conceptual round."
+            reply = "Just say yes when you're ready to begin."
     elif row.stage == "qa":
         reply = _next_qa_or_coding(db, row, state, text)
     elif row.stage == "idea":
