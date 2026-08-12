@@ -18,22 +18,19 @@ _LAST_ERROR: str = ""
 
 INTERVIEWER_SYSTEM = """You are NexAI, a live voice technical interviewer for campus / early-career software roles.
 Introduce yourself as NexAI. Sound human: vary greetings, never reuse a canned script.
-Speak in short conversational sentences. No markdown, no bullets, no "as an AI".
-Interview shape (the engine enforces timing; you follow the current stage):
-- First ~5 minutes: conceptual questions only.
-- Then ONE coding problem. Keep the editor locked until their approach is solid (data structure, steps, complexity, one edge case).
-- After unlock: they code. Ask about THEIR written code, not a textbook solution.
-- Last ~2 minutes: brief spoken feedback covering concepts, approach, code, and communication, then close.
+Speak in 1–2 short sentences. No markdown, no bullets, no "as an AI".
+Shape (engine times this; you follow the stage):
+- ~30% conceptual questions. When this round closes, do not ask another technical question.
+- ~65% one coding problem. Editor stays locked until their approach is solid.
+- After unlock: ask about THEIR written code only.
+- ~5% brief spoken feedback, then close.
 Rules:
-- Ask EXACTLY ONE question per reply.
-- WAIT for the candidate. Do not invent that they answered.
-- If the answer is filler or empty, follow up on the SAME question.
-- NEVER give the solution, code, or step-by-step hints that solve the problem.
+- Ask EXACTLY ONE question per reply, and wait for their answer.
+- If they want to end early, ask them to confirm. Do not wrap_up unless they confirmed.
+- NEVER give the solution, code, or step-by-step hints.
 - NEVER repeat a question already asked.
-- Ground follow-ups in what they just said.
 - Only set next_action=unlock_editor when the approach is actually clear enough to code.
-- Only set move_to_coding when the engine's coding window has started or conceptual round is done.
-- Keep replies to 1–3 short spoken sentences.
+- Do not set move_to_coding yourself; the engine closes the technical round.
 
 Always respond with a single JSON object only (no markdown fences):
 {
@@ -126,10 +123,9 @@ def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_token
     }
 
     try:
-        with httpx.Client(timeout=45.0) as client:
+        with httpx.Client(timeout=18.0) as client:
             resp = client.post(url, headers=headers, json={**payload_base, "response_format": {"type": "json_object"}})
             if resp.status_code >= 400:
-                # Retry without response_format (some proxies / older models).
                 body1 = resp.text[:300]
                 resp = client.post(url, headers=headers, json=payload_base)
                 if resp.status_code >= 400:
@@ -141,7 +137,7 @@ def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_token
             if not content:
                 _set_error("LLM returned empty content")
                 return None
-            _set_error("")  # clear on success
+            _set_error("")
             return content
     except Exception as exc:
         _set_error(f"{type(exc).__name__}: {exc}")
@@ -185,19 +181,19 @@ def interviewer_turn(
 
     ctx = context or {}
     history_lines = []
-    for t in transcript[-16:]:
+    for t in transcript[-8:]:
         role = "Interviewer" if t.get("role") == "assistant" else "Candidate"
-        history_lines.append(f"{role}: {t.get('content', '')}")
+        history_lines.append(f"{role}: {str(t.get('content', ''))[:360]}")
     history = "\n".join(history_lines) if history_lines else "(interview just started)"
 
     asked = ctx.get("asked_topics") or []
-    resume = (ctx.get("resume_text") or "")[:4000]
+    resume = (ctx.get("resume_text") or "")[:800]
     weak = is_weak_answer(student_message)
     user_payload = {
         "stage": stage,
         "role_track": role_track,
         "topics": topics,
-        "already_covered_topics": asked,
+        "already_covered_topics": asked[-8:],
         "seconds_hint": ctx.get("seconds_remaining"),
         "qa_count": ctx.get("qa_index", 0),
         "problem": ctx.get("problem"),
@@ -207,23 +203,19 @@ def interviewer_turn(
         "resume_excerpt": resume or None,
         "candidate_answer_looks_weak": weak,
         "skill_graph_summary": ctx.get("skill_graph_summary"),
-        "claims": ctx.get("claims"),
-        "voice_metrics_latest": ctx.get("voice_metrics_latest"),
+        "claims": (ctx.get("claims") or [])[:4],
         "transcript": history,
-        "candidate_just_said": student_message,
+        "candidate_just_said": (student_message or "")[:800],
         "stage_instructions": {
-            "intro": "If they are ready, greet in ONE short spoken sentence then ask the first conceptual question. Sound natural, not like a script. next_action=next_topic",
+            "intro": "Greet in ONE short spoken sentence then ask the first conceptual question. next_action=next_topic",
             "qa": (
-                "ONE question only. Sound like a human interviewer on a call — short spoken sentences, no markdown, no bullet lists. "
-                "If candidate_answer_looks_weak is true, next_action MUST be followup "
-                "and re-ask/clarify the same topic — do not move_to_coding. "
-                "Otherwise evaluate: followup OR next_topic. Prefer probing WEAKEST skills from skill_graph_summary. "
-                "If claims contain untested technology claims, drill one level deeper before moving on. "
-                "Only after about 3 solid answered exchanges (qa_count), next_action=move_to_coding."
+                "ONE short follow-up or next conceptual question. No markdown. "
+                "If candidate_answer_looks_weak is true, next_action MUST be followup on the SAME topic. "
+                "Otherwise next_action=next_topic. Do not move_to_coding."
             ),
-            "idea": "They must outline approach before coding. If solid, next_action=unlock_editor. If weak, next_action=probe_idea. Never reveal the optimal solution.",
-            "code": "They are coding. Acknowledge briefly. Do not help. next_action=continue_coding unless they clearly want to finish (wrap_up).",
-            "explain": "They explained a code excerpt. Score honesty/clarity. Then next_action=continue_coding.",
+            "idea": "They must outline approach before coding. If solid, next_action=unlock_editor. If weak, next_action=probe_idea. Never reveal the solution.",
+            "code": "They are coding. One short question about THEIR code, or a brief ack. next_action=continue_coding. If they asked to finish, next_action=wrap_up only to request confirmation.",
+            "explain": "Score their explanation of the excerpt. Then next_action=continue_coding.",
         }.get(stage, "Continue the interview professionally."),
     }
 
@@ -232,8 +224,8 @@ def interviewer_turn(
             {"role": "system", "content": INTERVIEWER_SYSTEM},
             {"role": "user", "content": json.dumps(user_payload)},
         ],
-        temperature=0.7,
-        max_tokens=450,
+        temperature=0.45,
+        max_tokens=180,
     )
     data = _extract_json(raw or "")
     if not data or not str(data.get("reply") or "").strip():
@@ -282,7 +274,7 @@ def first_question(*, role_track: str, topics: list[str], resume_text: str = "")
                         "stage": "qa",
                         "role_track": role_track,
                         "topics": topics,
-                        "resume_excerpt": (resume_text or "")[:4000] or None,
+                        "resume_excerpt": (resume_text or "")[:800] or None,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
                             "You are NexAI. Greet {name} with a FRESH spoken intro (never the same wording twice), "
@@ -294,8 +286,8 @@ def first_question(*, role_track: str, topics: list[str], resume_text: str = "")
                 ),
             },
         ],
-        temperature=0.85,
-        max_tokens=350,
+        temperature=0.6,
+        max_tokens=160,
     )
     data = _extract_json(raw or "")
     if not data or not str(data.get("reply") or "").strip():
@@ -325,7 +317,7 @@ def wrap_speech(*, student_name: str, scores: dict[str, Any], flags: list[str]) 
                         "stage": "wrap",
                         "stage_instructions": (
                             f"You are NexAI closing the interview with {first}. "
-                            "Give a brief spoken recap in 4-6 sentences covering conceptual answers, "
+                            "Give a brief spoken recap in 3-4 sentences covering conceptual answers, "
                             "problem-solving approach, coding, and communication. Be specific and fair. "
                             "Do not ask another question. End by thanking them. next_action=wrap_up."
                         ),
@@ -335,8 +327,8 @@ def wrap_speech(*, student_name: str, scores: dict[str, Any], flags: list[str]) 
                 ),
             },
         ],
-        temperature=0.5,
-        max_tokens=280,
+        temperature=0.4,
+        max_tokens=180,
     )
     data = _extract_json(raw or "")
     if data and str(data.get("reply") or "").strip():

@@ -22,7 +22,44 @@ from app.report import build_report
 from app.runner import evaluate_code
 
 
-STAGES = ("intro", "qa", "idea", "code", "explain", "wrap", "done")
+END_EXACT = {
+    "done",
+    "finish",
+    "end",
+    "stop",
+    "quit",
+    "wrap up",
+    "that's all",
+    "thats all",
+    "i'm done",
+    "im done",
+    "end interview",
+}
+END_PHRASE_RE = re.compile(
+    r"\b((i (want to|wanna|would like to) (end|stop|finish))|"
+    r"(end|stop|finish) (the )?(interview|session)|"
+    r"wrap up( the interview)?)\b",
+    re.I,
+)
+YES_RE = re.compile(r"\b(yes|yeah|yep|yup|sure|confirm|please do|go ahead|end it|that's fine|ok)\b", re.I)
+NO_RE = re.compile(r"\b(no|nope|continue|keep going|not yet|wait|don't|do not)\b", re.I)
+
+
+def _is_end_intent(text: str) -> bool:
+    t = " ".join((text or "").lower().split()).strip()
+    if t in END_EXACT:
+        return True
+    if len(t.split()) <= 10 and END_PHRASE_RE.search(t):
+        return True
+    return False
+
+
+def _is_yes(text: str) -> bool:
+    return bool(YES_RE.search(text or ""))
+
+
+def _is_no(text: str) -> bool:
+    return bool(NO_RE.search(text or ""))
 
 
 def _now() -> datetime:
@@ -77,18 +114,29 @@ def _elapsed(row: SessionRow) -> int:
 
 
 def _phase_bounds(row: SessionRow) -> tuple[int, int]:
+    """Return (qa_seconds, wrap_seconds) from 30% / 65% / 5% of the session."""
     settings = get_settings()
-    qa = int(settings.qa_seconds or 300)
-    wrap = int(settings.wrap_seconds or 120)
+    total = max(12, int(row.duration_minutes or 17)) * 60
+    qa_share = float(settings.qa_share or 0.30)
+    wrap_share = float(settings.wrap_share or 0.05)
+    qa = int(settings.qa_seconds) if int(settings.qa_seconds or 0) > 0 else int(total * qa_share)
+    wrap = int(settings.wrap_seconds) if int(settings.wrap_seconds or 0) > 0 else max(30, int(total * wrap_share))
     return qa, wrap
 
 
 def _should_enter_coding(row: SessionRow, state: dict[str, Any]) -> bool:
     qa_secs, _wrap = _phase_bounds(row)
-    if _elapsed(row) >= qa_secs:
-        return True
-    target = int(get_settings().qa_target_exchanges or 4)
-    return int(state.get("qa_index", 0)) >= target
+    return _elapsed(row) >= qa_secs or bool(state.get("coding_after_answer"))
+
+
+def _awaiting_student_reply(db: Session, row: SessionRow) -> bool:
+    last = (
+        db.query(TurnRow)
+        .filter(TurnRow.session_id == row.id, TurnRow.role.in_(["assistant", "student"]))
+        .order_by(TurnRow.seq.desc())
+        .first()
+    )
+    return bool(last and last.role == "assistant")
 
 
 def _should_wrap(row: SessionRow) -> bool:
@@ -326,14 +374,21 @@ def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> d
 
 
 def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
-    """Apply timed phase changes (coding window / wrap-up) even if the student is silent."""
+    """Apply timed phase changes. Never open coding while a technical question is unanswered."""
     if row.status != "active":
         return session_view(db, row)
     if _should_wrap(row):
         return finish_session(db, row, reason="time_up")
     state = _state(row)
-    if row.stage == "qa" and _should_enter_coding(row, state):
-        spoken = _start_coding_round(db, row, state)
+    if row.stage == "qa" and _elapsed(row) >= _phase_bounds(row)[0]:
+        if _awaiting_student_reply(db, row):
+            if not state.get("coding_after_answer"):
+                state["coding_after_answer"] = True
+                _save_state(row, state)
+                db.commit()
+                db.refresh(row)
+            return session_view(db, row)
+        spoken = _close_qa_then_code(db, row, state)
         _add_turn(db, row.id, row.stage, "assistant", spoken)
         db.commit()
         db.refresh(row)
@@ -344,7 +399,7 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
     return session_view(db, row)
 
 
-def _recent_transcript(db: Session, session_id: str, limit: int = 20) -> list[dict[str, str]]:
+def _recent_transcript(db: Session, session_id: str, limit: int = 8) -> list[dict[str, str]]:
     turns = (
         db.query(TurnRow)
         .filter(TurnRow.session_id == session_id, TurnRow.role.in_(["assistant", "student"]))
@@ -468,10 +523,8 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
 
 
 def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
-    settings = get_settings()
     topics = state.get("topics") or _loads(row.topics_json, [])
     idx = int(state.get("qa_index", 0))
-    target = int(settings.qa_target_exchanges or 3)
 
     if llm_client.is_weak_answer(answer):
         _save_state(row, state)
@@ -479,6 +532,14 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             "I need a fuller answer before we move on — take a breath and explain your reasoning "
             "in a few clear sentences. What is the idea, and why does it work?"
         )
+
+    # Time to close Q&A: do not ask another conceptual question, and skip the LLM for speed.
+    if _elapsed(row) >= _phase_bounds(row)[0] or state.get("coding_after_answer"):
+        state["qa_index"] = idx + 1
+        state["coding_after_answer"] = False
+        _apply_score_communication(state, answer, 60)
+        _save_state(row, state)
+        return _close_qa_then_code(db, row, state)
 
     llm_result = llm_client.interviewer_turn(
         stage="qa",
@@ -520,10 +581,11 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             evidence=(answer or "")[:160],
         )
 
-        force_coding = _should_enter_coding(row, state) or action == "move_to_coding"
+        force_coding = _should_enter_coding(row, state)
         if force_coding:
+            state["coding_after_answer"] = False
             _save_state(row, state)
-            return llm_result["reply"] + " " + _start_coding_round(db, row, state)
+            return _close_qa_then_code(db, row, state)
 
         _save_state(row, state)
         return llm_result["reply"]
@@ -548,9 +610,10 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     state["qa_index"] = idx + 1
     feedback = f"Thanks — noted ({score:.0f}/100)."
 
-    if state["qa_index"] >= target or _should_enter_coding(row, state):
+    if _should_enter_coding(row, state):
+        state["coding_after_answer"] = False
         _save_state(row, state)
-        return feedback + "\n\n" + _start_coding_round(db, row, state)
+        return _close_qa_then_code(db, row, state)
 
     used = set(state.get("asked_topics", []))
     nxt = next((item for item in evaluator.TECH_BANK if item["id"] not in used), None)
@@ -560,6 +623,16 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     state.setdefault("asked_topics", []).append(nxt["id"])
     _save_state(row, state)
     return feedback + f"\n\nNext question:\n\n**{nxt['question']}**"
+
+
+def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
+    """Close conceptual round, then open the coding problem. No new technical question."""
+    state["coding_after_answer"] = False
+    coding = _start_coding_round(db, row, state)
+    return (
+        "Thanks — that wraps the technical questions. "
+        + coding
+    )
 
 
 def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
@@ -794,6 +867,41 @@ def handle_message(
         db.refresh(row)
         return session_view(db, row)
 
+    state = _state(row)
+
+    if state.get("awaiting_end_confirm"):
+        _note_voice_and_claims(state, text, duration_sec)
+        _add_turn(db, row.id, row.stage, "student", text)
+        if _is_yes(text) and not _is_no(text):
+            state["awaiting_end_confirm"] = False
+            _save_state(row, state)
+            return finish_session(db, row, reason="student_ended")
+        if _is_no(text):
+            state["awaiting_end_confirm"] = False
+            reply = "Alright — we'll continue."
+            _add_turn(db, row.id, row.stage, "assistant", reply)
+            _save_state(row, state)
+            db.commit()
+            db.refresh(row)
+            return session_view(db, row)
+        reply = "Say yes to end the interview now, or no to keep going."
+        _add_turn(db, row.id, row.stage, "assistant", reply)
+        _save_state(row, state)
+        db.commit()
+        db.refresh(row)
+        return session_view(db, row)
+
+    if _is_end_intent(text):
+        _note_voice_and_claims(state, text, duration_sec)
+        _add_turn(db, row.id, row.stage, "student", text)
+        state["awaiting_end_confirm"] = True
+        reply = "Do you want to end the interview now? Say yes to wrap up, or no to continue."
+        _add_turn(db, row.id, row.stage, "assistant", reply)
+        _save_state(row, state)
+        db.commit()
+        db.refresh(row)
+        return session_view(db, row)
+
     # Filler during Q&A / idea: acknowledge without logging a "scored" student turn advance path.
     if row.stage in {"qa", "idea"} and llm_client.is_weak_answer(text):
         state = _state(row)
@@ -818,9 +926,6 @@ def handle_message(
     state = _state(row)
     _note_voice_and_claims(state, text, duration_sec)
     reply = ""
-
-    if text.lower() in {"done", "finish", "end interview", "end"}:
-        return finish_session(db, row, reason="student_ended")
 
     if row.stage == "intro":
         # Accept common ready phrases, not only exact "yes".
@@ -854,13 +959,17 @@ def handle_message(
         )
         if llm_result:
             if llm_result["next_action"] == "wrap_up":
-                _add_turn(db, row.id, row.stage, "assistant", llm_result["reply"])
-                _save_state(row, state)
-                db.commit()
-                return finish_session(db, row, reason="student_ended")
-            if any(w in text.lower() for w in ("hint", "give me the answer", "solution")):
+                state["awaiting_end_confirm"] = True
+                reply = (
+                    llm_result["reply"]
+                    if "?" in llm_result["reply"]
+                    else "Do you want to end the interview now? Say yes to wrap up, or no to keep coding."
+                )
+            elif any(w in text.lower() for w in ("hint", "give me the answer", "solution")):
                 state.setdefault("flags", []).append("asked_for_help")
-            reply = llm_result["reply"]
+                reply = llm_result["reply"]
+            else:
+                reply = llm_result["reply"]
         elif any(w in text.lower() for w in ("hint", "stuck", "help me", "give me the answer", "solution")):
             reply = (
                 "I can't give you the solution or walk you through the fix — this is an interview. "

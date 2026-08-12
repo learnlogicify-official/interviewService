@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     shared_secret: str = "dev-change-me-interview-secret"
     token_ttl_seconds: int = 60 * 60 * 4
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o"
+    openai_model: str = "gpt-4o-mini"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_tts_base_url: str = ""  # default: same as openai_base_url (use api.openai.com for TTS)
     openai_tts_model: str = "tts-1"
@@ -26,11 +26,14 @@ class Settings(BaseSettings):
     voice_mode: str = "realtime"  # realtime|legacy
     default_duration_minutes: int = 17
     cors_origins: str = "*"
-    qa_seconds: int = 300
-    coding_seconds: int = 600
-    wrap_seconds: int = 120
-    # Soft cap on conceptual exchanges before coding (time still wins).
-    qa_target_exchanges: int = 4
+    # Share of the session: technical Q&A / coding / spoken wrap.
+    qa_share: float = 0.30
+    coding_share: float = 0.65
+    wrap_share: float = 0.05
+    qa_seconds: int = 0  # 0 = derive from qa_share * duration
+    coding_seconds: int = 0
+    wrap_seconds: int = 0
+    qa_target_exchanges: int = 6
 
 
 @lru_cache

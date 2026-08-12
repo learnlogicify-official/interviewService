@@ -6,10 +6,19 @@ import os
 os.environ["DATABASE_URL"] = "sqlite:///./test_interview.db"
 os.environ["SHARED_SECRET"] = "test-secret"
 
+from datetime import datetime, timedelta, timezone
+
 from app.db import SessionLocal, init_db
 from app import orchestrator as orch
 from app.auth import sign_payload
 import time
+
+
+def _rewind(db, row, seconds_ago: int):
+    row.created_at = datetime.now(timezone.utc) - timedelta(seconds=seconds_ago)
+    db.commit()
+    db.refresh(row)
+    return row
 
 
 def test_flow_idea_and_code():
@@ -36,35 +45,25 @@ def test_flow_idea_and_code():
             row,
             "Hash maps give average O(1) lookups. Sorted arrays are O(log n) with binary search but use less overhead and keep order. Collisions and extra memory are the main hash trade-offs.",
         )
-        row = orch.get_session(db, sid)
-        view = orch.handle_message(
-            db,
-            row,
-            "Big-O describes growth. Linear scan of an array is O(n) time and can be O(1) extra space if done in place.",
-        )
+        assert view["stage"] == "qa"
+        row = _rewind(db, orch.get_session(db, sid), 320)
+        view = orch.tick_session(db, row)
+        assert view["stage"] == "qa"
         row = orch.get_session(db, sid)
         view = orch.handle_message(
             db,
             row,
             "A stack is LIFO. Valid parentheses and DFS traversal are classic stack problems because order of nesting matters.",
         )
-        assert view["stage"] in {"idea", "code", "qa"}
-        # After enough Q&A we should be in coding path (or still probing if LLM online).
-        if view["stage"] == "qa":
-            row = orch.get_session(db, sid)
-            view = orch.handle_message(
-                db,
-                row,
-                "Recursion uses the call stack for frames; convert to iteration when depth is large or tail recursion applies.",
-            )
         assert view["stage"] in {"idea", "code"}
+        spoken = " ".join(t["content"] for t in view["turns"] if t["role"] == "assistant")
+        assert "wraps the technical" in spoken.lower() or "move to coding" in spoken.lower()
         row = orch.get_session(db, sid)
         view = orch.handle_message(
             db,
             row,
             "I will use a hash map of value to index while scanning once. For each number check if target-num already seen. This is O(n) time and O(n) space. Edge cases: negatives and duplicates.",
         )
-        # May still be idea if different problem; send another if needed.
         row = orch.get_session(db, sid)
         if row.stage == "idea":
             view = orch.handle_message(
@@ -86,8 +85,6 @@ def test_nexai_timed_flow_and_editor_lock():
     init_db()
     db = SessionLocal()
     try:
-        from datetime import datetime, timedelta, timezone
-
         view = orch.start_session(
             db,
             moodle_user_id=2,
@@ -107,15 +104,24 @@ def test_nexai_timed_flow_and_editor_lock():
         assert view["ui"]["editor_locked"] is False
 
         sid = view["session_id"]
-        row = orch.get_session(db, sid)
-        row.created_at = datetime.now(timezone.utc) - timedelta(seconds=310)
-        db.commit()
-        db.refresh(row)
+        row = _rewind(db, orch.get_session(db, sid), 320)
         view = orch.tick_session(db, row)
+        # Open technical question must be answered before the IDE appears.
+        assert view["stage"] == "qa"
+        assert view["ui"]["show_editor"] is False
+
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(
+            db,
+            row,
+            "Hash maps give average O(1) lookups. Sorted arrays are O(log n) with binary search but use less memory.",
+        )
         assert view["stage"] == "idea"
         assert view["ui"]["show_editor"] is True
         assert view["ui"]["editor_locked"] is True
-        assert "valid parentheses" in " ".join(t["content"] for t in view["turns"]).lower()
+        joined = " ".join(t["content"] for t in view["turns"]).lower()
+        assert "wraps the technical" in joined
+        assert "valid parentheses" in joined
 
         row = orch.get_session(db, sid)
         view = orch.handle_message(
@@ -130,15 +136,44 @@ def test_nexai_timed_flow_and_editor_lock():
             assert view["stage"] in {"code", "explain"}
             assert view["ui"]["editor_locked"] is False
 
-        row = orch.get_session(db, sid)
-        row.created_at = datetime.now(timezone.utc) - timedelta(seconds=16 * 60)
-        db.commit()
-        db.refresh(row)
+        row = _rewind(db, orch.get_session(db, sid), 1000)
         view = orch.tick_session(db, row)
         assert view["status"] == "completed"
         last = view["turns"][-1]
         assert last["role"] == "assistant"
         assert last.get("meta", {}).get("spoken_wrap") or "nexai" in last["content"].lower()
+    finally:
+        db.close()
+
+
+def test_end_asks_permission():
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=3,
+            moodle_cm_id=0,
+            moodle_instance_id=0,
+            student_name="Dev",
+            role_track="sde_intern",
+            duration_minutes=17,
+            topics=["arrays"],
+        )
+        sid = view["session_id"]
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "I want to end the interview")
+        assert view["status"] == "active"
+        assert "yes" in view["turns"][-1]["content"].lower()
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "no, keep going")
+        assert view["status"] == "active"
+        assert view["stage"] == "qa"
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "end interview")
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "yes")
+        assert view["status"] == "completed"
     finally:
         db.close()
 

@@ -21,8 +21,8 @@ def synthesize(text: str) -> dict:
     settings = get_settings()
     key = _api_key()
     clean = " ".join((text or "").split())
-    if len(clean) > 900:
-        clean = clean[:900].rsplit(" ", 1)[0] + "."
+    if len(clean) > 520:
+        clean = clean[:520].rsplit(" ", 1)[0] + "."
     if not clean:
         return {"ok": False, "content_type": "", "audio_base64": "", "error": "empty text"}
     if not key:
@@ -37,7 +37,7 @@ def synthesize(text: str) -> dict:
     voice = settings.openai_tts_voice or "alloy"
 
     try:
-        with httpx.Client(timeout=60.0) as client:
+        with httpx.Client(timeout=20.0) as client:
             resp = client.post(
                 url,
                 headers={
@@ -49,6 +49,7 @@ def synthesize(text: str) -> dict:
                     "voice": voice,
                     "input": clean,
                     "response_format": "mp3",
+                    "speed": 1.12,
                 },
             )
             if resp.status_code >= 400:
