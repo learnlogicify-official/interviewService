@@ -16,29 +16,34 @@ logger = logging.getLogger("interview.llm")
 # Last failure detail for /v1/health diagnostics (no secrets).
 _LAST_ERROR: str = ""
 
-INTERVIEWER_SYSTEM = """You are NexAI, a live voice technical interviewer for campus / early-career software roles.
-Introduce yourself as NexAI. Sound human: vary greetings, never reuse a canned script.
-Speak in 1–2 short sentences. No markdown, no bullets, no "as an AI".
+INTERVIEWER_SYSTEM = """You are a live voice technical interviewer for campus / early-career software roles.
+Introduce yourself using the session interviewer name when provided. Sound human: vary greetings, never reuse a canned script.
+Speak in 1–2 short sentences for acknowledgements. For code-snippet / predict-output turns you may use a short multi-line code block, then ONE clear question.
+No markdown headings, no bullet lists, no "as an AI".
 Shape (engine times this; you follow the stage):
-- ~30% conceptual questions. When this round closes, do not ask another technical question.
-- ~65% one coding problem. Editor stays locked until their approach is solid.
+- Conceptual / applied Q&A first. When this round closes, do not ask another technical question.
+- If include_coding is true: later one coding problem; editor stays locked until approach is solid.
+- If include_coding is false: stay on spoken / snippet Q&A until wrap.
 - After unlock: ask about THEIR written code only.
-- ~5% brief spoken feedback, then close.
 Rules:
 - Ask EXACTLY ONE question per reply, and wait for their answer.
 - If they want to end early, ask them to confirm. Do not wrap_up unless they confirmed.
 - NEVER give the solution, code, or step-by-step teaching hints that solve it.
 - Probe, do not reveal. Prefer follow-ups that test understanding (DeepProbe style).
 - Hint ladder (you may only operate H0–H3): H0 none, H1 clarify, H2 soft probe, H3 directed nudge. Never H4 near-solution.
-- When question_node is provided, stay on that competency. Use spoken_now or a tight paraphrase — do not invent a new topic.
+- When question_node is provided AND dynamic_question_ok is false: stay on that competency; use spoken_now or a tight paraphrase.
+- When dynamic_question_ok is true OR a faculty briefing is present: you MAY invent a fresh question in the allowed topics.
+  Prefer variety across turns — mix of: concept, trade-off, predict-the-output from a short snippet, find-the-bug,
+  complexity of a given snippet, and "what would you change". Do NOT repeat the same stem as earlier turns.
 - Prefer probing WEAKEST skills from skill_graph_summary when choosing next_topic (engine may still override).
-- NEVER repeat a question already asked.
+- NEVER repeat a question already asked (check transcript / already_covered_topics).
 - Only set next_action=unlock_editor when the approach is actually clear enough to code.
 - Do not set move_to_coding yourself; the engine closes the technical round.
 - Score against rubric_strong / rubric_weak when present. Store topic_tag as the skill key when known.
 - If the candidate says they don't know / are not aware / cannot answer / skips, score MUST be exactly 0.
   Do not award partial credit for admitting ignorance. next_action=followup or next_topic is fine,
   but the score stays near zero.
+- Faculty briefing overrides default topic emphasis when present — follow it closely.
 
 Always respond with a single JSON object only (no markdown fences):
 {
@@ -254,26 +259,62 @@ def interviewer_turn(
     style = (ctx.get("interviewer_style") or "friendly").strip().lower()
     briefing = (ctx.get("interviewer_briefing") or "").strip()
     include_coding = bool(ctx.get("include_coding", True))
+    dynamic_ok = bool(ctx.get("dynamic_question_ok", False)) or bool(briefing)
+    suggested_format = str(ctx.get("suggested_format") or "concept")
 
     style_line = {
         "friendly": "Tone: warm and encouraging, still rigorous.",
         "strict": "Tone: crisp and demanding. Push for precision; do not soft-pedal weak answers.",
-        "brief": "Tone: concise. Keep every reply to one short sentence plus one question.",
+        "brief": "Tone: concise. Keep acknowledgements short; questions can still include a tiny snippet.",
     }.get(style, "Tone: professional and clear.")
 
     system = INTERVIEWER_SYSTEM
     extras = [
         f"Your spoken name for this session is {name}. Introduce yourself as {name}, not as a generic AI.",
         style_line,
+        f"dynamic_question_ok={str(dynamic_ok).lower()}",
+        f"This turn's preferred question format: {suggested_format}",
     ]
     if not include_coding:
         extras.append(
             "This profile has coding DISABLED. Do not mention an editor, NexPractice, or unlocking code. "
-            "Stay on spoken conceptual / problem-solving questions until wrap."
+            "Stay on spoken conceptual / snippet / predict-output questions until wrap."
         )
     if briefing:
-        extras.append(f"Faculty briefing (follow closely):\n{briefing[:2000]}")
+        extras.append(f"Faculty briefing (follow closely — this shapes WHAT you ask):\n{briefing[:2000]}")
+    if dynamic_ok:
+        extras.append(
+            "Invent fresh questions within topics + briefing. "
+            "Rotate formats: concept, trade-off, short code snippet + predict output, find-the-bug, complexity. "
+            "question_node is only a soft hint when present — do not parrot the same bank stem every time."
+        )
     system = system + "\n\nSession profile:\n- " + "\n- ".join(extras)
+
+    format_hint = {
+        "concept": "Ask a conceptual / definition + example question.",
+        "tradeoff": "Ask a trade-off or 'when would you choose X vs Y' question.",
+        "predict": (
+            "Show a SHORT 3–8 line code snippet (Python or JS matching the track), "
+            "then ask the candidate to predict the output or return value. Do not reveal the answer."
+        ),
+        "debug": (
+            "Show a SHORT buggy snippet, ask what is wrong or what breaks. Do not reveal the fix."
+        ),
+        "complexity": (
+            "Show a SHORT snippet and ask for time/space complexity of the main loop."
+        ),
+    }.get(suggested_format, "Ask one solid technical question.")
+
+    qa_instructions = (
+        "ONE short follow-up or next question. "
+        f"Preferred format this turn: {format_hint} "
+        "If question_node is set and dynamic_question_ok is false, stay on that node. "
+        "If dynamic_question_ok is true, invent a NEW question in topics/briefing "
+        "(paraphrase OK; do not reuse stems from the transcript). "
+        "If candidate_answer_looks_weak is true, next_action MUST be followup on the SAME topic "
+        "(bump hint_level by at most +1, max 3). "
+        "Otherwise next_action=next_topic. Do not move_to_coding. Prefer weakest skills when advancing."
+    )
 
     user_payload = {
         "stage": stage,
@@ -296,17 +337,13 @@ def interviewer_turn(
         "interviewer_name": name,
         "interviewer_style": style,
         "include_coding": include_coding,
+        "dynamic_question_ok": dynamic_ok,
+        "suggested_format": suggested_format,
         "transcript": history,
         "candidate_just_said": (student_message or "")[:800],
         "stage_instructions": {
             "intro": "Greet in ONE short spoken sentence then ask the first conceptual question. next_action=next_topic",
-            "qa": (
-                "ONE short follow-up or next conceptual question. No markdown. "
-                "If question_node is set, stay on that node. "
-                "If candidate_answer_looks_weak is true, next_action MUST be followup on the SAME topic "
-                "(use a followup/deep_probe from question_node; bump hint_level by at most +1, max 3). "
-                "Otherwise next_action=next_topic. Do not move_to_coding. Prefer weakest skills when advancing."
-            ),
+            "qa": qa_instructions,
             "idea": (
                 "They must outline approach before coding. If solid, next_action=unlock_editor. "
                 "If weak, next_action=probe_idea with H1–H3 nudge only. Never reveal the solution."
@@ -321,8 +358,8 @@ def interviewer_turn(
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user_payload)},
         ],
-        temperature=0.45,
-        max_tokens=180,
+        temperature=0.65 if dynamic_ok else 0.45,
+        max_tokens=280 if suggested_format in {"predict", "debug", "complexity"} else 180,
     )
     data = _extract_json(raw or "")
     if not data or not str(data.get("reply") or "").strip():
@@ -370,15 +407,57 @@ def first_question(
     topics: list[str],
     resume_text: str = "",
     question_node: dict[str, Any] | None = None,
+    interviewer_name: str = "NexAI",
+    interviewer_style: str = "friendly",
+    interviewer_briefing: str = "",
+    include_coding: bool = True,
+    suggested_format: str = "concept",
 ) -> dict[str, Any] | None:
     """Generate the opening conceptual question (anchored to question graph when provided)."""
     if not llm_configured():
         return None
     node = question_node or {}
     stem = str(node.get("spoken_now") or node.get("stem") or "").strip()
+    name = (interviewer_name or "NexAI").strip() or "NexAI"
+    briefing = (interviewer_briefing or "").strip()
+    dynamic_ok = bool(briefing)
+    coding_line = (
+        "mention a short technical screen then one coding problem"
+        if include_coding
+        else "mention this is a spoken technical screen without a coding editor"
+    )
+    format_hint = {
+        "predict": "Open with a SHORT code snippet and ask them to predict the output.",
+        "debug": "Open with a SHORT buggy snippet and ask what is wrong.",
+        "complexity": "Open with a SHORT snippet and ask time complexity.",
+        "tradeoff": "Open with a trade-off question (X vs Y).",
+        "concept": "Open with a conceptual question tied to the topics/briefing.",
+    }.get(suggested_format, "Open with a solid technical question.")
+
+    system = INTERVIEWER_SYSTEM
+    if briefing:
+        system += f"\n\nFaculty briefing (follow closely):\n{briefing[:2000]}"
+    system += (
+        f"\n\nYour name is {name}. dynamic_question_ok={str(dynamic_ok).lower()}. "
+        f"Style={interviewer_style}."
+    )
+
+    if dynamic_ok:
+        ask_rule = (
+            f"{format_hint} Stay inside topics {topics} and the faculty briefing. "
+            "Do NOT default to a generic hash-map question unless the briefing asks for it. "
+            + (f"Bank hint (optional only): {stem}" if stem else "")
+        )
+    else:
+        ask_rule = (
+            f"You MUST ask this competency question (paraphrase OK): {stem}"
+            if stem
+            else "Ask one solid opening conceptual question for the role track."
+        )
+
     raw = chat(
         [
-            {"role": "system", "content": INTERVIEWER_SYSTEM},
+            {"role": "system", "content": system},
             {
                 "role": "user",
                 "content": json.dumps(
@@ -387,26 +466,24 @@ def first_question(
                         "role_track": role_track,
                         "topics": topics,
                         "resume_excerpt": (resume_text or "")[:800] or None,
-                        "question_node": node or None,
+                        "question_node": None if dynamic_ok else (node or None),
+                        "dynamic_question_ok": dynamic_ok,
+                        "suggested_format": suggested_format,
+                        "include_coding": include_coding,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
-                            "You are NexAI. Greet the candidate with a FRESH spoken intro "
-                            "(never the same wording twice), say you are NexAI, mention a short "
-                            "technical screen then one coding problem, then ask ONE conceptual question. "
-                            + (
-                                f"You MUST ask this competency question (paraphrase OK): {stem}"
-                                if stem
-                                else "Ask one solid opening conceptual question for the role track."
-                            )
-                            + " No markdown. next_action=next_topic. hint_level=0."
+                            f"You are {name}. Greet the candidate with a FRESH spoken intro "
+                            f"(never the same wording twice), say you are {name}, {coding_line}, "
+                            f"then ask ONE technical question. {ask_rule} "
+                            "next_action=next_topic. hint_level=0."
                         ),
                         "transcript": "(start)",
                     }
                 ),
             },
         ],
-        temperature=0.55,
-        max_tokens=160,
+        temperature=0.7 if dynamic_ok else 0.55,
+        max_tokens=260 if suggested_format in {"predict", "debug", "complexity"} else 160,
     )
     data = _extract_json(raw or "")
     if not data or not str(data.get("reply") or "").strip():
@@ -420,7 +497,7 @@ def first_question(
         "next_action": "next_topic",
         "topic_tag": tag,
         "hint_level": 0,
-        "question_id": node.get("question_id") or "",
+        "question_id": "" if dynamic_ok else (node.get("question_id") or ""),
     }
 
 

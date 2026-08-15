@@ -564,6 +564,12 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
     qid = state.get("current_question_id") or ""
     node = question_graph.get_node(qid)
     hint = int(state.get("current_hint_level", 0) or 0)
+    briefing = state.get("interviewer_briefing") or ""
+    dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id"))
+    suggested = question_graph.suggested_format_for_turn(
+        int(state.get("qa_index", 0) or 0),
+        briefing,
+    )
     ctx = {
         "seconds_remaining": _seconds_remaining(row),
         "qa_index": state.get("qa_index", 0),
@@ -575,11 +581,15 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
         "voice_metrics_latest": (state.get("voice_metrics") or {}).get("latest"),
         "current_hint_level": hint,
         "difficulty_ceiling": int(state.get("difficulty_ceiling", 2) or 2),
-        "question_node": question_graph.node_context_for_llm(node, hint_level=hint),
+        "question_node": question_graph.node_context_for_llm(
+            node, hint_level=hint, dynamic_ok=dynamic_ok
+        ),
         "interviewer_name": state.get("interviewer_name") or "NexAI",
         "interviewer_style": state.get("interviewer_style") or "friendly",
-        "interviewer_briefing": state.get("interviewer_briefing") or "",
+        "interviewer_briefing": briefing,
         "include_coding": _include_coding(state),
+        "dynamic_question_ok": dynamic_ok,
+        "suggested_format": suggested,
     }
     ctx.update(extra)
     return ctx
@@ -610,19 +620,37 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     state.setdefault("difficulty_ceiling", 2)
 
     topics = state.get("topics") or _loads(row.topics_json, [])
-    node = question_graph.pick_opening(row.role_track, topics)
+    briefing = state.get("interviewer_briefing") or ""
+    dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id"))
+    suggested = question_graph.suggested_format_for_turn(0, briefing)
+    node = question_graph.pick_opening(
+        row.role_track,
+        topics,
+        briefing=briefing,
+        prefer_format=suggested if suggested in {"predict", "debug", "complexity"} else None,
+    )
     _activate_question(state, node)
-    node_ctx = question_graph.node_context_for_llm(node, hint_level=0)
+    node_ctx = question_graph.node_context_for_llm(node, hint_level=0, dynamic_ok=dynamic_ok)
 
     dynamic = llm_client.first_question(
         role_track=row.role_track,
         topics=topics,
         resume_text=state.get("resume_text") or "",
         question_node=node_ctx,
+        interviewer_name=str(state.get("interviewer_name") or "NexAI"),
+        interviewer_style=str(state.get("interviewer_style") or "friendly"),
+        interviewer_briefing=briefing,
+        include_coding=_include_coding(state),
+        suggested_format=suggested,
     )
     if dynamic:
         if dynamic.get("question_id"):
             state["current_question_id"] = dynamic["question_id"]
+        elif dynamic_ok:
+            # LLM invented the opener — keep skill tag soft, clear rigid bank lock.
+            state["current_question_id"] = ""
+            if dynamic.get("topic_tag"):
+                state["current_qa_id"] = str(dynamic["topic_tag"])[:80]
         state["llm_mode"] = True
         _save_state(row, state)
         return dynamic["reply"]
@@ -699,6 +727,8 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             graph=state["skill_graph"],
             asked_ids=list(state.get("asked_question_ids") or []),
             difficulty_ceiling=max(1, int(state.get("difficulty_ceiling", 2) or 2) - 1),
+            topics=topics,
+            briefing=state.get("interviewer_briefing") or "",
         )
         if nxt:
             _activate_question(state, nxt)
@@ -845,19 +875,31 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             return coding
 
         # Advance along the curated graph (weakest-skill policy).
+        briefing = state.get("interviewer_briefing") or ""
+        dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id"))
+        prefer_fmt = question_graph.suggested_format_for_turn(idx + 1, briefing)
         nxt = question_graph.pick_next(
             role_track=row.role_track,
             graph=state["skill_graph"],
             asked_ids=list(state.get("asked_question_ids") or []),
             difficulty_ceiling=int(state.get("difficulty_ceiling", 2) or 2),
+            topics=topics,
+            briefing=briefing,
+            prefer_format=prefer_fmt if prefer_fmt in {"predict", "debug", "complexity"} else None,
         )
+        model_reply = (llm_result.get("reply") or "").strip()
         if nxt:
             _activate_question(state, nxt)
+        # With a faculty briefing / custom interviewer, trust the LLM's next question
+        # so sessions aren't locked to the same bank stems.
+        if dynamic_ok and model_reply and "?" in model_reply:
+            if llm_result.get("topic_tag"):
+                state["current_qa_id"] = str(llm_result["topic_tag"])[:80]
+            _save_state(row, state)
+            return model_reply
+        if nxt:
             spoken = question_graph.spoken_prompt(nxt, hint_level=0)
-            model_reply = (llm_result.get("reply") or "").strip()
-            # If model already asked a next question, prefer graph stem for consistency.
-            if "?" in model_reply and len(model_reply) < 220:
-                # Light paraphrase allowed — keep model text when short.
+            if "?" in model_reply and len(model_reply) < 280:
                 out = model_reply
             else:
                 bridge = model_reply.split("?")[0].strip() if model_reply else "Thanks."
@@ -926,6 +968,8 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         graph=state["skill_graph"],
         asked_ids=list(state.get("asked_question_ids") or []),
         difficulty_ceiling=int(state.get("difficulty_ceiling", 2) or 2),
+        topics=state.get("topics") or _loads(row.topics_json, []),
+        briefing=state.get("interviewer_briefing") or "",
     )
     if nxt:
         _activate_question(state, nxt)

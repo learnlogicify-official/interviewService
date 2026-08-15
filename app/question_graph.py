@@ -300,7 +300,7 @@ QUESTION_BANK: list[QuestionNode] = [
     # —— AI / ML ——
     {
         "id": "ml.supervised.basics",
-        "tracks": ["ai_ml"],
+        "tracks": ["ai_ml", "ai_engineer"],
         "skill": ("ml", "supervised"),
         "difficulty": 2,
         "stem": "How do you choose between classification and regression for a business metric?",
@@ -318,7 +318,7 @@ QUESTION_BANK: list[QuestionNode] = [
     },
     {
         "id": "ml.eval.split",
-        "tracks": ["ai_ml"],
+        "tracks": ["ai_ml", "ai_engineer"],
         "skill": ("ml", "eval"),
         "difficulty": 2,
         "stem": "Why do we hold out a test set, and when is a single train/test split not enough?",
@@ -336,7 +336,7 @@ QUESTION_BANK: list[QuestionNode] = [
     },
     {
         "id": "ml.llm.rag",
-        "tracks": ["ai_ml"],
+        "tracks": ["ai_ml", "ai_engineer"],
         "skill": ("llm", "rag"),
         "difficulty": 3,
         "stem": "When is RAG a better fit than fine-tuning for company-specific answers?",
@@ -354,7 +354,7 @@ QUESTION_BANK: list[QuestionNode] = [
     },
     {
         "id": "ml.llm.prompting",
-        "tracks": ["ai_ml"],
+        "tracks": ["ai_ml", "ai_engineer"],
         "skill": ("llm", "prompting"),
         "difficulty": 2,
         "stem": "How would you structure a prompt so the model returns strict JSON your service can parse?",
@@ -370,6 +370,99 @@ QUESTION_BANK: list[QuestionNode] = [
             "weak": "Just say please return JSON.",
         },
     },
+    # —— Snippet / predict-output style (shared) ——
+    {
+        "id": "sde.snippet.listcomp",
+        "tracks": ["sde_intern", "backend", "ai_engineer", "ai_ml"],
+        "skill": ("dsa", "arrays"),
+        "difficulty": 2,
+        "format": "predict",
+        "stem": (
+            "Look at this Python: nums = [1, 2, 3, 4]; print([n * n for n in nums if n % 2 == 0]). "
+            "What prints, and why?"
+        ),
+        "keywords": ["list", "comprehension", "filter", "even", "4", "16"],
+        "followups": [
+            "How would you write the same result with an explicit for-loop?",
+        ],
+        "deep_probes": [
+            "If nums were a generator that can be consumed once, what breaks?",
+        ],
+        "rubric": {
+            "strong": "Predicts [4, 16] and explains filter + square.",
+            "weak": "Guesses without walking the filter.",
+        },
+    },
+    {
+        "id": "sde.snippet.hashcount",
+        "tracks": ["sde_intern", "backend"],
+        "skill": ("dsa", "hashmap"),
+        "difficulty": 2,
+        "format": "predict",
+        "stem": (
+            "def first_dup(a):\n"
+            "    seen = set()\n"
+            "    for x in a:\n"
+            "        if x in seen: return x\n"
+            "        seen.add(x)\n"
+            "    return None\n"
+            "What does first_dup([3, 1, 4, 1, 5]) return, and what is the time complexity?"
+        ),
+        "keywords": ["1", "set", "o(n)", "duplicate", "first"],
+        "followups": [
+            "What if you needed the last duplicate instead?",
+        ],
+        "deep_probes": [
+            "Is this still O(n) space in the worst case? When?",
+        ],
+        "rubric": {
+            "strong": "Returns 1 + O(n) time reasoning.",
+            "weak": "Wrong value or no complexity.",
+        },
+    },
+    {
+        "id": "sde.snippet.sqlnull",
+        "tracks": ["sde_intern", "backend"],
+        "skill": ("sql", "joins"),
+        "difficulty": 2,
+        "format": "predict",
+        "stem": (
+            "In SQL, SELECT COUNT(*) FROM t WHERE x = NULL — what do you get, and what should you write instead?"
+        ),
+        "keywords": ["null", "is null", "count", "three-valued", "unknown"],
+        "followups": [
+            "How does COUNT(x) differ from COUNT(*) when x has nulls?",
+        ],
+        "deep_probes": [
+            "Why is NULL = NULL not true in SQL?",
+        ],
+        "rubric": {
+            "strong": "Knows = NULL is wrong; uses IS NULL; count caveat.",
+            "weak": "Thinks = NULL matches null rows.",
+        },
+    },
+    {
+        "id": "fe.snippet.closureloop",
+        "tracks": ["frontend"],
+        "skill": ("javascript", "closures"),
+        "difficulty": 3,
+        "format": "debug",
+        "stem": (
+            "for (var i = 0; i < 3; i++) { setTimeout(() => console.log(i), 0) } "
+            "What prints, and how do you fix it to print 0 1 2?"
+        ),
+        "keywords": ["3", "var", "let", "closure", "loop"],
+        "followups": [
+            "Why does let fix it when var does not?",
+        ],
+        "deep_probes": [
+            "How would an IIFE fix the var version?",
+        ],
+        "rubric": {
+            "strong": "Prints 3 3 3 + let/IIFE fix.",
+            "weak": "Says 0 1 2 without understanding var.",
+        },
+    },
 ]
 
 
@@ -378,9 +471,16 @@ def _skill_key(node: QuestionNode) -> str:
     return f"{parent}.{child}"
 
 
+def _normalize_track(role_track: str) -> str:
+    track = (role_track or "sde_intern").strip()
+    if track == "ai_engineer":
+        return "ai_ml"
+    return track or "sde_intern"
+
+
 def nodes_for_track(role_track: str) -> list[QuestionNode]:
-    track = role_track if role_track else "sde_intern"
-    matched = [n for n in QUESTION_BANK if track in n.get("tracks", [])]
+    track = _normalize_track(role_track)
+    matched = [n for n in QUESTION_BANK if track in n.get("tracks", []) or role_track in n.get("tracks", [])]
     if matched:
         return matched
     return [n for n in QUESTION_BANK if "sde_intern" in n.get("tracks", [])]
@@ -395,23 +495,40 @@ def get_node(question_id: str | None) -> QuestionNode | None:
     return None
 
 
-def pick_opening(role_track: str, topics: list[str] | None = None) -> QuestionNode:
+def _topic_hit(node: QuestionNode, topics: list[str] | None, briefing: str = "") -> bool:
+    blob = (_skill_key(node) + " " + str(node.get("stem") or "") + " " + str(node.get("format") or "")).lower()
+    briefing_l = (briefing or "").lower()
+    for t in topics or []:
+        t = (t or "").lower().strip()
+        if t and t in blob:
+            return True
+    # Briefing keyword soft match on skill fragments.
+    for token in ("sql", "join", "index", "hash", "array", "stack", "oop", "react", "async", "ml", "prompt"):
+        if token in briefing_l and token in blob:
+            return True
+    return False
+
+
+def pick_opening(
+    role_track: str,
+    topics: list[str] | None = None,
+    *,
+    briefing: str = "",
+    prefer_format: str | None = None,
+) -> QuestionNode:
+    import random
+
     nodes = nodes_for_track(role_track)
-    topic_blob = " ".join(topics or []).lower()
-    # Prefer difficulty 1–2 that matches requested topics.
-    ranked = sorted(
-        nodes,
-        key=lambda n: (
-            0 if any(t and (t in _skill_key(n) or t in n["stem"].lower()) for t in (topics or [])) else 1,
-            abs(int(n.get("difficulty", 2)) - 2),
-            n["id"],
-        ),
-    )
-    if topic_blob:
-        for n in ranked:
-            if any(t and t in (_skill_key(n) + n["stem"].lower()) for t in (topics or [])):
-                return n
-    return ranked[0] if ranked else QUESTION_BANK[0]
+    # Prefer topic/briefing matches, then optional format, then easy/medium.
+    matched = [n for n in nodes if _topic_hit(n, topics, briefing)]
+    pool = matched or list(nodes)
+    if prefer_format:
+        fmt = [n for n in pool if str(n.get("format") or "concept") == prefer_format]
+        if fmt:
+            pool = fmt
+    easy = [n for n in pool if int(n.get("difficulty", 2)) <= 2]
+    pool = easy or pool
+    return random.choice(pool) if pool else QUESTION_BANK[0]
 
 
 def pick_next(
@@ -421,8 +538,13 @@ def pick_next(
     asked_ids: list[str],
     difficulty_ceiling: int = 3,
     prefer_skill: tuple[str, str] | None = None,
+    topics: list[str] | None = None,
+    briefing: str = "",
+    prefer_format: str | None = None,
 ) -> QuestionNode | None:
     """Choose next unused node: weakest skill first, then within difficulty ceiling."""
+    import random
+
     nodes = nodes_for_track(role_track)
     used = set(asked_ids or [])
     candidates = [
@@ -434,6 +556,15 @@ def pick_next(
         candidates = [n for n in nodes if n["id"] not in used]
     if not candidates:
         return None
+
+    topic_filtered = [n for n in candidates if _topic_hit(n, topics, briefing)]
+    if topic_filtered:
+        candidates = topic_filtered
+
+    if prefer_format:
+        fmt = [n for n in candidates if str(n.get("format") or "concept") == prefer_format]
+        if fmt:
+            candidates = fmt
 
     weak = skill_graph.weakest_skills(graph, limit=8)
     weak_keys = {f"{w['parent']}.{w['child']}": float(w["score"]) for w in weak}
@@ -449,11 +580,14 @@ def pick_next(
         elif sk in weak_keys:
             leaf = weak_keys[sk]
         prefer_boost = -30.0 if prefer_skill and n["skill"] == prefer_skill else 0.0
+        topic_boost = -8.0 if _topic_hit(n, topics, briefing) else 0.0
         # Lower leaf score = weaker = higher priority (sort ascending on first key).
-        return (leaf + prefer_boost, int(n.get("difficulty", 2)), n["id"])
+        return (leaf + prefer_boost + topic_boost, int(n.get("difficulty", 2)), n["id"])
 
     candidates.sort(key=score_row)
-    return candidates[0]
+    # Shuffle among the top few so consecutive interviews don't feel identical.
+    top = candidates[: min(4, len(candidates))]
+    return random.choice(top)
 
 
 def spoken_prompt(node: QuestionNode, *, hint_level: int = 0, followup_index: int = 0) -> str:
@@ -485,13 +619,39 @@ def adjust_difficulty_ceiling(ceiling: int, score_0_100: float) -> int:
     return c
 
 
-def node_context_for_llm(node: QuestionNode | None, *, hint_level: int = 0) -> dict[str, Any] | None:
+def suggested_format_for_turn(qa_index: int, briefing: str = "") -> str:
+    """Rotate question shapes so sessions don't feel like one template."""
+    briefing_l = (briefing or "").lower()
+    cycle = ["concept", "predict", "tradeoff", "debug", "complexity"]
+    if any(k in briefing_l for k in ("snippet", "output", "predict", "code", "debug", "bug")):
+        cycle = ["predict", "debug", "complexity", "concept", "tradeoff"]
+    return cycle[int(qa_index) % len(cycle)]
+
+
+def node_context_for_llm(
+    node: QuestionNode | None,
+    *,
+    hint_level: int = 0,
+    dynamic_ok: bool = False,
+) -> dict[str, Any] | None:
     if not node:
         return None
+    rule = (
+        "question_node is a soft hint only. Invent a fresh question in the same skill/topics "
+        "or follow the faculty briefing. Prefer variety (snippet/predict/debug/trade-off). "
+        "Never reveal the answer. Hint ceiling is H3."
+        if dynamic_ok
+        else (
+            "Ask using spoken_now (or a tight paraphrase). Do not invent a new topic. "
+            "Never reveal the answer. Probe; do not teach the solution. "
+            "Hint ceiling is H3 — never H4 solution dump."
+        )
+    )
     return {
         "question_id": node["id"],
         "skill": _skill_key(node),
         "difficulty": node.get("difficulty"),
+        "format": node.get("format") or "concept",
         "stem": node["stem"],
         "spoken_now": spoken_prompt(node, hint_level=hint_level),
         "rubric_strong": (node.get("rubric") or {}).get("strong"),
@@ -499,9 +659,5 @@ def node_context_for_llm(node: QuestionNode | None, *, hint_level: int = 0) -> d
         "hint_level": hint_level,
         "followups": node.get("followups") or [],
         "deep_probes": node.get("deep_probes") or [],
-        "rule": (
-            "Ask using spoken_now (or a tight paraphrase). Do not invent a new topic. "
-            "Never reveal the answer. Probe; do not teach the solution. "
-            "Hint ceiling is H3 — never H4 solution dump."
-        ),
+        "rule": rule,
     }
