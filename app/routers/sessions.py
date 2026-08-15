@@ -10,6 +10,7 @@ from app.db import get_db
 from app import orchestrator as orch
 from app.schemas import (
     EndSessionRequest,
+    GladiaLiveRequest,
     MessageRequest,
     RealtimeTokenRequest,
     RunCodeRequest,
@@ -29,6 +30,7 @@ router = APIRouter(prefix="/v1", tags=["sessions"])
 def health() -> dict:
     from app import __version__
     from app.config import get_settings
+    from app.gladia import gladia_configured
     from app.llm import last_error, llm_configured
 
     settings = get_settings()
@@ -43,6 +45,8 @@ def health() -> dict:
         "llm_last_error": last_error() or None,
         "tts_model": settings.openai_tts_model if llm_configured() else None,
         "stt_model": settings.openai_stt_model if llm_configured() else None,
+        "stt_provider": settings.stt_provider,
+        "gladia_configured": gladia_configured(),
         "realtime_model": settings.openai_realtime_model if llm_configured() else None,
         "voice_mode": settings.voice_mode,
     }
@@ -71,6 +75,22 @@ def realtime_token(body: RealtimeTokenRequest, db: Session = Depends(get_db)) ->
         role_track=row.role_track,
         stage=row.stage,
         moodle_user_id=row.moodle_user_id,
+    )
+
+
+@router.post("/gladia/live")
+def gladia_live(body: GladiaLiveRequest, db: Session = Depends(get_db)) -> dict:
+    """Mint Gladia Live V2 WebSocket URL for browser mic streaming (API key stays server-side)."""
+    from app import gladia as gladia_mod
+
+    verify_signature(["gladia_live", body.session_id], body.signature, body.timestamp)
+    row = orch.get_session(db, body.session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return gladia_mod.create_live_session(
+        language=body.language or "en",
+        sample_rate=int(body.sample_rate or 16000),
+        session_id=row.id,
     )
 
 

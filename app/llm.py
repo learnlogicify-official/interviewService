@@ -27,17 +27,23 @@ Shape (engine times this; you follow the stage):
 Rules:
 - Ask EXACTLY ONE question per reply, and wait for their answer.
 - If they want to end early, ask them to confirm. Do not wrap_up unless they confirmed.
-- NEVER give the solution, code, or step-by-step hints.
+- NEVER give the solution, code, or step-by-step teaching hints that solve it.
+- Probe, do not reveal. Prefer follow-ups that test understanding (DeepProbe style).
+- Hint ladder (you may only operate H0–H3): H0 none, H1 clarify, H2 soft probe, H3 directed nudge. Never H4 near-solution.
+- When question_node is provided, stay on that competency. Use spoken_now or a tight paraphrase — do not invent a new topic.
+- Prefer probing WEAKEST skills from skill_graph_summary when choosing next_topic (engine may still override).
 - NEVER repeat a question already asked.
 - Only set next_action=unlock_editor when the approach is actually clear enough to code.
 - Do not set move_to_coding yourself; the engine closes the technical round.
+- Score against rubric_strong / rubric_weak when present. Store topic_tag as the skill key when known.
 
 Always respond with a single JSON object only (no markdown fences):
 {
   "reply": "what you say aloud to the candidate",
   "score": 0-100,
   "next_action": "followup" | "next_topic" | "move_to_coding" | "unlock_editor" | "probe_idea" | "continue_coding" | "wrap_up",
-  "topic_tag": "short topic label"
+  "topic_tag": "short topic label",
+  "hint_level": 0
 }
 """
 
@@ -203,6 +209,9 @@ def interviewer_turn(
         "resume_excerpt": resume or None,
         "candidate_answer_looks_weak": weak,
         "skill_graph_summary": ctx.get("skill_graph_summary"),
+        "question_node": ctx.get("question_node"),
+        "current_hint_level": ctx.get("current_hint_level", 0),
+        "difficulty_ceiling": ctx.get("difficulty_ceiling"),
         "claims": (ctx.get("claims") or [])[:4],
         "transcript": history,
         "candidate_just_said": (student_message or "")[:800],
@@ -210,10 +219,15 @@ def interviewer_turn(
             "intro": "Greet in ONE short spoken sentence then ask the first conceptual question. next_action=next_topic",
             "qa": (
                 "ONE short follow-up or next conceptual question. No markdown. "
-                "If candidate_answer_looks_weak is true, next_action MUST be followup on the SAME topic. "
-                "Otherwise next_action=next_topic. Do not move_to_coding."
+                "If question_node is set, stay on that node. "
+                "If candidate_answer_looks_weak is true, next_action MUST be followup on the SAME topic "
+                "(use a followup/deep_probe from question_node; bump hint_level by at most +1, max 3). "
+                "Otherwise next_action=next_topic. Do not move_to_coding. Prefer weakest skills when advancing."
             ),
-            "idea": "They must outline approach before coding. If solid, next_action=unlock_editor. If weak, next_action=probe_idea. Never reveal the solution.",
+            "idea": (
+                "They must outline approach before coding. If solid, next_action=unlock_editor. "
+                "If weak, next_action=probe_idea with H1–H3 nudge only. Never reveal the solution."
+            ),
             "code": "They are coding. One short question about THEIR code, or a brief ack. next_action=continue_coding. If they asked to finish, next_action=wrap_up only to request confirmation.",
             "explain": "Score their explanation of the excerpt. Then next_action=continue_coding.",
         }.get(stage, "Continue the interview professionally."),
@@ -252,18 +266,33 @@ def interviewer_turn(
         score = 60.0
     score = max(0.0, min(100.0, score))
 
+    try:
+        hint_level = int(data.get("hint_level", ctx.get("current_hint_level", 0) or 0))
+    except Exception:
+        hint_level = int(ctx.get("current_hint_level", 0) or 0)
+    hint_level = max(0, min(3, hint_level))  # model may not emit H4
+
     return {
         "reply": str(data["reply"]).strip(),
         "score": score,
         "next_action": action,
         "topic_tag": str(data.get("topic_tag") or ""),
+        "hint_level": hint_level,
     }
 
 
-def first_question(*, role_track: str, topics: list[str], resume_text: str = "") -> dict[str, Any] | None:
-    """Generate the opening conceptual question dynamically."""
+def first_question(
+    *,
+    role_track: str,
+    topics: list[str],
+    resume_text: str = "",
+    question_node: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    """Generate the opening conceptual question (anchored to question graph when provided)."""
     if not llm_configured():
         return None
+    node = question_node or {}
+    stem = str(node.get("spoken_now") or node.get("stem") or "").strip()
     raw = chat(
         [
             {"role": "system", "content": INTERVIEWER_SYSTEM},
@@ -275,18 +304,25 @@ def first_question(*, role_track: str, topics: list[str], resume_text: str = "")
                         "role_track": role_track,
                         "topics": topics,
                         "resume_excerpt": (resume_text or "")[:800] or None,
+                        "question_node": node or None,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
-                            "You are NexAI. Greet {name} with a FRESH spoken intro (never the same wording twice), "
-                            "say you are NexAI, mention a short technical screen then one coding problem, "
-                            "then ask ONE conceptual question. No markdown. next_action=next_topic."
-                        ).replace("{name}", "the candidate"),
+                            "You are NexAI. Greet the candidate with a FRESH spoken intro "
+                            "(never the same wording twice), say you are NexAI, mention a short "
+                            "technical screen then one coding problem, then ask ONE conceptual question. "
+                            + (
+                                f"You MUST ask this competency question (paraphrase OK): {stem}"
+                                if stem
+                                else "Ask one solid opening conceptual question for the role track."
+                            )
+                            + " No markdown. next_action=next_topic. hint_level=0."
+                        ),
                         "transcript": "(start)",
                     }
                 ),
             },
         ],
-        temperature=0.6,
+        temperature=0.55,
         max_tokens=160,
     )
     data = _extract_json(raw or "")
@@ -294,11 +330,14 @@ def first_question(*, role_track: str, topics: list[str], resume_text: str = "")
         if raw and not data:
             _set_error(f"Could not parse opening JSON: {(raw or '')[:200]}")
         return None
+    tag = str(data.get("topic_tag") or node.get("skill") or node.get("question_id") or "opening")
     return {
         "reply": str(data["reply"]).strip(),
         "score": 0,
         "next_action": "next_topic",
-        "topic_tag": str(data.get("topic_tag") or "opening"),
+        "topic_tag": tag,
+        "hint_level": 0,
+        "question_id": node.get("question_id") or "",
     }
 
 

@@ -12,7 +12,9 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app import evaluator
+from app import evidence as evidence_ledger
 from app import llm as llm_client
+from app import question_graph
 from app import skills as skill_graph
 from app import voice_metrics
 from app.config import get_settings
@@ -258,6 +260,13 @@ def start_session(
         "claims": [],
         "voice_metrics": {},
         "voice_metric_samples": [],
+        "evidence": [],
+        "hint_dependency": {},
+        "asked_question_ids": [],
+        "current_question_id": "",
+        "current_hint_level": 0,
+        "difficulty_ceiling": 2,
+        "followup_index": 0,
     }
     row = SessionRow(
         id=session_id,
@@ -468,6 +477,9 @@ def _note_voice_and_claims(state: dict[str, Any], answer: str, duration_sec: flo
 
 def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[str, Any]:
     graph = state.get("skill_graph") or skill_graph.default_graph(row.role_track)
+    qid = state.get("current_question_id") or ""
+    node = question_graph.get_node(qid)
+    hint = int(state.get("current_hint_level", 0) or 0)
     ctx = {
         "seconds_remaining": _seconds_remaining(row),
         "qa_index": state.get("qa_index", 0),
@@ -477,31 +489,57 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
         "skill_graph_summary": skill_graph.summarize_for_llm(graph),
         "claims": state.get("claims") or [],
         "voice_metrics_latest": (state.get("voice_metrics") or {}).get("latest"),
+        "current_hint_level": hint,
+        "difficulty_ceiling": int(state.get("difficulty_ceiling", 2) or 2),
+        "question_node": question_graph.node_context_for_llm(node, hint_level=hint),
     }
     ctx.update(extra)
     return ctx
+
+
+def _activate_question(state: dict[str, Any], node: dict[str, Any] | None) -> None:
+    if not node:
+        return
+    state["current_question_id"] = node["id"]
+    state["current_hint_level"] = 0
+    state["followup_index"] = 0
+    state["current_qa_id"] = f"{node['skill'][0]}.{node['skill'][1]}"
+    ids = state.setdefault("asked_question_ids", [])
+    if node["id"] not in ids:
+        ids.append(node["id"])
+    topics = state.setdefault("asked_topics", [])
+    tag = f"{node['skill'][0]}.{node['skill'][1]}"
+    if tag not in topics:
+        topics.append(tag)
 
 
 def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     row.stage = "qa"
     state["qa_index"] = 0
     state["awaiting"] = "message"
-    state["asked_topics"] = []
+    state.setdefault("asked_topics", [])
+    state.setdefault("asked_question_ids", [])
+    state.setdefault("difficulty_ceiling", 2)
+
+    topics = state.get("topics") or _loads(row.topics_json, [])
+    node = question_graph.pick_opening(row.role_track, topics)
+    _activate_question(state, node)
+    node_ctx = question_graph.node_context_for_llm(node, hint_level=0)
 
     dynamic = llm_client.first_question(
         role_track=row.role_track,
-        topics=state.get("topics") or _loads(row.topics_json, []),
+        topics=topics,
         resume_text=state.get("resume_text") or "",
+        question_node=node_ctx,
     )
     if dynamic:
-        state["current_qa_id"] = dynamic.get("topic_tag") or "llm_opening"
-        state.setdefault("asked_topics", []).append(state["current_qa_id"])
+        if dynamic.get("question_id"):
+            state["current_question_id"] = dynamic["question_id"]
         state["llm_mode"] = True
         _save_state(row, state)
         return dynamic["reply"]
 
     if llm_client.llm_configured():
-        # Key is set but the live call failed — do NOT fall back to the fixed script.
         err = llm_client.last_error() or "unknown LLM error"
         state["llm_mode"] = False
         _save_state(row, state)
@@ -511,13 +549,11 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
             "Say yes again to retry."
         )
 
-    # Offline/dev fallback only when no API key is configured.
-    q = evaluator.TECH_BANK[0]
-    state["current_qa_id"] = q["id"]
+    # Offline/dev fallback: speak the curated stem directly.
     state["llm_mode"] = False
     _save_state(row, state)
     return (
-        f"First question: {q['question']} "
+        f"First question: {node['stem']} "
         "Give a clear structured answer."
     )
 
@@ -525,12 +561,40 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
 def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
     topics = state.get("topics") or _loads(row.topics_json, [])
     idx = int(state.get("qa_index", 0))
+    graph = state.get("skill_graph") or skill_graph.default_graph(row.role_track)
+    qid = state.get("current_question_id") or ""
+    node = question_graph.get_node(qid)
+    skill_tag = (
+        f"{node['skill'][0]}.{node['skill'][1]}"
+        if node
+        else (state.get("current_qa_id") or "")
+    )
+    hint_now = int(state.get("current_hint_level", 0) or 0)
 
     if llm_client.is_weak_answer(answer):
+        # Soft H1 clarify without advancing the topic.
+        state["current_hint_level"] = evidence_ledger.bump_hint(hint_now, reason="followup")
+        evidence_ledger.record(
+            state,
+            stage="qa",
+            dimension="conceptual",
+            score=20.0,
+            skill=skill_tag,
+            question_id=qid,
+            hint_level=state["current_hint_level"],
+            note="Weak/filler utterance — clarification requested",
+            source="gate",
+            elapsed=_elapsed(row),
+        )
         _save_state(row, state)
+        clarify = (
+            question_graph.spoken_prompt(node, hint_level=1, followup_index=0)
+            if node
+            else "I need a fuller answer — explain the idea and why it works in a few clear sentences."
+        )
         return (
             "I need a fuller answer before we move on — take a breath and explain your reasoning "
-            "in a few clear sentences. What is the idea, and why does it work?"
+            f"in a few clear sentences. {clarify}"
         )
 
     # Time to close Q&A: do not ask another conceptual question, and skip the LLM for speed.
@@ -553,46 +617,116 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     if llm_result:
         score = float(llm_result["score"])
         action = llm_result["next_action"]
+        reported_hint = int(llm_result.get("hint_level", hint_now) or hint_now)
+
         # Never advance on weak LLM scores that re-ask.
-        if action == "followup" and score < 35:
-            tag = llm_result.get("topic_tag") or state.get("current_qa_id") or ""
-            state["skill_graph"] = skill_graph.update_skill(
-                state.get("skill_graph") or skill_graph.default_graph(row.role_track),
-                topic_tag=tag,
-                score_0_100=score,
-                evidence=f"Weak/follow-up on: {(answer or '')[:120]}",
+        if action == "followup" and score < 55:
+            new_hint = evidence_ledger.bump_hint(
+                max(hint_now, reported_hint),
+                reason="followup",
             )
+            state["current_hint_level"] = new_hint
+            state["followup_index"] = int(state.get("followup_index", 0) or 0) + 1
+            state["skill_graph"] = skill_graph.update_skill(
+                graph,
+                topic_tag=skill_tag or llm_result.get("topic_tag") or "",
+                score_0_100=score,
+                evidence=f"Follow-up H{new_hint}: {(answer or '')[:120]}",
+            )
+            evidence_ledger.record(
+                state,
+                stage="qa",
+                dimension="conceptual",
+                score=score,
+                skill=skill_tag,
+                question_id=qid,
+                hint_level=new_hint,
+                note=(answer or "")[:160],
+                source="llm",
+                elapsed=_elapsed(row),
+            )
+            # Prefer curated follow-up if the model drifted.
+            reply = llm_result["reply"]
+            if node and new_hint >= 1:
+                stem = question_graph.spoken_prompt(
+                    node,
+                    hint_level=new_hint,
+                    followup_index=int(state.get("followup_index", 0) or 0),
+                )
+                # Keep model phrasing if it already embeds a question; else append stem.
+                if "?" not in reply:
+                    reply = f"{reply} {stem}".strip()
             _save_state(row, state)
-            return llm_result["reply"]
+            return reply
 
         state.setdefault("qa_scores", []).append(score)
         state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
         _apply_score_communication(state, answer, score)
         state["qa_index"] = idx + 1
         state["llm_mode"] = True
-        tag = llm_result.get("topic_tag") or ""
-        if tag:
-            state.setdefault("asked_topics", []).append(tag)
-            state["current_qa_id"] = tag
+        state["difficulty_ceiling"] = question_graph.adjust_difficulty_ceiling(
+            int(state.get("difficulty_ceiling", 2) or 2),
+            score,
+        )
+
+        evidence_ledger.record(
+            state,
+            stage="qa",
+            dimension="conceptual",
+            score=score,
+            skill=skill_tag or str(llm_result.get("topic_tag") or ""),
+            question_id=qid,
+            hint_level=hint_now,
+            note=(answer or "")[:160],
+            source="llm",
+            elapsed=_elapsed(row),
+        )
         state["skill_graph"] = skill_graph.update_skill(
-            state.get("skill_graph") or skill_graph.default_graph(row.role_track),
-            topic_tag=tag or state.get("current_qa_id") or "",
+            graph,
+            topic_tag=skill_tag or llm_result.get("topic_tag") or state.get("current_qa_id") or "",
             score_0_100=score,
             evidence=(answer or "")[:160],
         )
 
         force_coding = _should_enter_coding(row, state)
-        if force_coding:
+        if force_coding or action == "move_to_coding":
             state["coding_after_answer"] = False
             _save_state(row, state)
-            return _close_qa_then_code(db, row, state)
+            # Still return the model's closing line then coding handoff.
+            coding = _close_qa_then_code(db, row, state)
+            ack = (llm_result.get("reply") or "").strip()
+            if ack and "coding" not in ack.lower():
+                return f"{ack} {coding}".strip()
+            return coding
+
+        # Advance along the curated graph (weakest-skill policy).
+        nxt = question_graph.pick_next(
+            role_track=row.role_track,
+            graph=state["skill_graph"],
+            asked_ids=list(state.get("asked_question_ids") or []),
+            difficulty_ceiling=int(state.get("difficulty_ceiling", 2) or 2),
+        )
+        if nxt:
+            _activate_question(state, nxt)
+            spoken = question_graph.spoken_prompt(nxt, hint_level=0)
+            model_reply = (llm_result.get("reply") or "").strip()
+            # If model already asked a next question, prefer graph stem for consistency.
+            if "?" in model_reply and len(model_reply) < 220:
+                # Light paraphrase allowed — keep model text when short.
+                out = model_reply
+            else:
+                bridge = model_reply.split("?")[0].strip() if model_reply else "Thanks."
+                if bridge and not bridge.endswith((".", "!", "?")):
+                    bridge += "."
+                out = f"{bridge} {spoken}".strip()
+            _save_state(row, state)
+            return out
 
         _save_state(row, state)
         return llm_result["reply"]
 
     if llm_client.llm_configured():
         err = llm_client.last_error() or "LLM call failed"
-        # Do not bump qa_index on transport failure — ask them to continue.
         _save_state(row, state)
         return (
             "Thanks — I briefly lost the AI connection mid-question. "
@@ -600,14 +734,41 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         )
 
     # Heuristic fallback only without API key.
-    qid = state.get("current_qa_id")
-    bank = {q["id"]: q for q in evaluator.TECH_BANK}
-    q = bank.get(qid, evaluator.TECH_BANK[0])
-    score = evaluator.score_keywords(answer, q["keywords"])
+    keywords = list((node or {}).get("keywords") or [])
+    if not keywords:
+        bank = {q["id"]: q for q in evaluator.TECH_BANK}
+        q = bank.get(state.get("current_qa_id"), evaluator.TECH_BANK[0])
+        keywords = q["keywords"]
+        score = evaluator.score_keywords(answer, keywords)
+    else:
+        score = evaluator.score_keywords(answer, keywords)
+
     state.setdefault("qa_scores", []).append(score)
     state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
     _apply_score_communication(state, answer, score)
     state["qa_index"] = idx + 1
+    state["difficulty_ceiling"] = question_graph.adjust_difficulty_ceiling(
+        int(state.get("difficulty_ceiling", 2) or 2),
+        score,
+    )
+    evidence_ledger.record(
+        state,
+        stage="qa",
+        dimension="conceptual",
+        score=score,
+        skill=skill_tag,
+        question_id=qid,
+        hint_level=hint_now,
+        note=(answer or "")[:160],
+        source="heuristic",
+        elapsed=_elapsed(row),
+    )
+    state["skill_graph"] = skill_graph.update_skill(
+        graph,
+        topic_tag=skill_tag,
+        score_0_100=score,
+        evidence=(answer or "")[:160],
+    )
     feedback = f"Thanks — noted ({score:.0f}/100)."
 
     if _should_enter_coding(row, state):
@@ -615,14 +776,25 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         _save_state(row, state)
         return _close_qa_then_code(db, row, state)
 
+    nxt = question_graph.pick_next(
+        role_track=row.role_track,
+        graph=state["skill_graph"],
+        asked_ids=list(state.get("asked_question_ids") or []),
+        difficulty_ceiling=int(state.get("difficulty_ceiling", 2) or 2),
+    )
+    if nxt:
+        _activate_question(state, nxt)
+        _save_state(row, state)
+        return feedback + f"\n\nNext question:\n\n**{nxt['stem']}**"
+
     used = set(state.get("asked_topics", []))
-    nxt = next((item for item in evaluator.TECH_BANK if item["id"] not in used), None)
-    if not nxt:
-        nxt = evaluator.TECH_BANK[state["qa_index"] % len(evaluator.TECH_BANK)]
-    state["current_qa_id"] = nxt["id"]
-    state.setdefault("asked_topics", []).append(nxt["id"])
+    bank_nxt = next((item for item in evaluator.TECH_BANK if item["id"] not in used), None)
+    if not bank_nxt:
+        bank_nxt = evaluator.TECH_BANK[state["qa_index"] % len(evaluator.TECH_BANK)]
+    state["current_qa_id"] = bank_nxt["id"]
+    state.setdefault("asked_topics", []).append(bank_nxt["id"])
     _save_state(row, state)
-    return feedback + f"\n\nNext question:\n\n**{nxt['question']}**"
+    return feedback + f"\n\nNext question:\n\n**{bank_nxt['question']}**"
 
 
 def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
@@ -637,7 +809,11 @@ def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> 
 
 def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     prefer = "easy"
-    if state.get("score_conceptual", 0) >= 75:
+    conceptual = float(state.get("score_conceptual", 0) or 0)
+    indep = evidence_ledger.independence_score(state)
+    if conceptual >= 75 and indep >= 60:
+        prefer = "medium"
+    if conceptual >= 88 and indep >= 75 and int(state.get("difficulty_ceiling", 2) or 2) >= 4:
         prefer = "medium"
     moodle_pid = int(state.get("moodle_problem_id") or 0)
     title = (state.get("moodle_problem_title") or "the NexPractice problem on your screen").strip()
@@ -705,6 +881,24 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
         state["score_idea"] = max(float(state.get("score_idea", 0)), float(llm_result["score"]))
         action = llm_result["next_action"]
         unlock = action == "unlock_editor"
+        idea_hint = evidence_ledger.bump_hint(
+            int(state.get("idea_hint_level", 0) or 0),
+            reason="probe_idea" if not unlock else "followup",
+        )
+        if not unlock:
+            state["idea_hint_level"] = idea_hint
+        evidence_ledger.record(
+            state,
+            stage="idea",
+            dimension="problem_solving",
+            score=float(llm_result["score"]),
+            skill="coding.approach",
+            question_id=str(state.get("current_problem_id") or state.get("moodle_problem_id") or "idea"),
+            hint_level=0 if unlock else idea_hint,
+            note=(answer or "")[:160],
+            source="llm",
+            elapsed=_elapsed(row),
+        )
         # Don't unlock just because they tried twice — only if NexAI is satisfied,
         # or the coding window is almost gone.
         if not unlock and int(state.get("idea_attempts", 0)) >= 1 and _seconds_remaining(row) <= (
@@ -713,6 +907,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             unlock = True
         if not unlock and int(state.get("idea_attempts", 0)) >= 5:
             unlock = True
+            state["idea_hint_level"] = 3
         if unlock:
             row.stage = "code"
             state["awaiting"] = "code"
@@ -823,6 +1018,18 @@ def _handle_explain(db: Session, row: SessionRow, state: dict[str, Any], answer:
         score = float(llm_result["score"])
         prev = float(state.get("score_explain", 0))
         state["score_explain"] = score if prev == 0 else (prev + score) / 2
+        evidence_ledger.record(
+            state,
+            stage="explain",
+            dimension="explanation",
+            score=score,
+            skill="coding.explanation",
+            question_id=str(state.get("current_problem_id") or "explain"),
+            hint_level=0,
+            note=(answer or "")[:160],
+            source="llm",
+            elapsed=_elapsed(row),
+        )
         if score < 50:
             state.setdefault("flags", []).append("weak_code_explanation")
         row.stage = "code"
@@ -833,6 +1040,18 @@ def _handle_explain(db: Session, row: SessionRow, state: dict[str, Any], answer:
     score = evaluator.score_explanation(answer, excerpt)
     prev = float(state.get("score_explain", 0))
     state["score_explain"] = score if prev == 0 else (prev + score) / 2
+    evidence_ledger.record(
+        state,
+        stage="explain",
+        dimension="explanation",
+        score=score,
+        skill="coding.explanation",
+        question_id=str(state.get("current_problem_id") or "explain"),
+        hint_level=0,
+        note=(answer or "")[:160],
+        source="heuristic",
+        elapsed=_elapsed(row),
+    )
     if score < 50:
         state.setdefault("flags", []).append("weak_code_explanation")
     row.stage = "code"

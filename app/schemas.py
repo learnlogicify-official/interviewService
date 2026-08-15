@@ -114,6 +114,14 @@ class RealtimeTokenRequest(BaseModel):
     signature: str
 
 
+class GladiaLiveRequest(BaseModel):
+    session_id: str
+    language: str = "en"
+    sample_rate: int = 16000
+    timestamp: int
+    signature: str
+
+
 class VoiceMetricsIn(BaseModel):
     """Optional client-side timing for communication metrics."""
 

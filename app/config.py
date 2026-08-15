@@ -24,6 +24,11 @@ class Settings(BaseSettings):
     openai_realtime_voice: str = "alloy"
     # Prefer realtime WebRTC voice when client requests a token.
     voice_mode: str = "realtime"  # realtime|legacy
+    # Gladia live STT — get key at https://app.gladia.io (API host: api.gladia.io)
+    gladia_api_key: str = ""
+    gladia_api_base: str = "https://api.gladia.io"
+    # auto = Gladia when key set, else OpenAI Whisper for batch /stt
+    stt_provider: str = "auto"  # auto|gladia|openai
     default_duration_minutes: int = 17
     cors_origins: str = "*"
     # Share of the session: technical Q&A / coding / spoken wrap.

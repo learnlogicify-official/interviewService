@@ -16,6 +16,8 @@
 #     OPENAI_API_KEY=...         (REQUIRED for dynamic AI — any non-empty token)
 #     OPENAI_MODEL=gpt-4o-mini   (or llama3.2:3b for Ollama)
 #     OPENAI_BASE_URL=https://api.openai.com/v1
+#     GLADIA_API_KEY=...         (recommended — realtime STT via app.gladia.io)
+#     STT_PROVIDER=auto          (auto|gladia|openai)
 #
 # Self-host LLM (Ollama on Railway or GPU):
 #   See docs/SELF_HOST_OLLAMA.md and deploy/ollama/
