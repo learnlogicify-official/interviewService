@@ -9,6 +9,8 @@ from app.auth import verify_signature
 from app.db import get_db
 from app import orchestrator as orch
 from app.schemas import (
+    AssignProblemRequest,
+    CodingResultRequest,
     EndSessionRequest,
     GladiaLiveRequest,
     MessageRequest,
@@ -177,6 +179,48 @@ def run(body: RunCodeRequest, db: Session = Depends(get_db)) -> dict:
         raise HTTPException(status_code=404, detail="Session not found")
     view, result = orch.run_code(db, row, body.code, body.mode)
     return {"session": SessionStateOut(**view).model_dump(), "result": RunResultOut(**result).model_dump()}
+
+
+@router.post("/sessions/coding_result", response_model=SessionStateOut)
+def coding_result(body: CodingResultRequest, db: Session = Depends(get_db)) -> SessionStateOut:
+    verify_signature(
+        ["coding_result", body.session_id, int(body.passed), int(body.total)],
+        body.signature,
+        body.timestamp,
+    )
+    row = orch.get_session(db, body.session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SessionStateOut(
+        **orch.handle_coding_result(
+            db,
+            row,
+            passed=int(body.passed),
+            total=int(body.total),
+            all_passed=bool(body.all_passed),
+            problem_id=int(body.problem_id or 0),
+        )
+    )
+
+
+@router.post("/sessions/assign_problem", response_model=SessionStateOut)
+def assign_problem(body: AssignProblemRequest, db: Session = Depends(get_db)) -> SessionStateOut:
+    verify_signature(
+        ["assign_problem", body.session_id, int(body.problem_id)],
+        body.signature,
+        body.timestamp,
+    )
+    row = orch.get_session(db, body.session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SessionStateOut(
+        **orch.assign_moodle_problem(
+            db,
+            row,
+            problem_id=int(body.problem_id),
+            problem_title=body.problem_title or "",
+        )
+    )
 
 
 @router.post("/sessions/end", response_model=SessionStateOut)

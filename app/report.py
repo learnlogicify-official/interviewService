@@ -35,6 +35,20 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
     independence = float(hint_meta["independence_score"])
     depth = evidence_ledger.depth_metrics(state)
 
+    answered = bool(state.get("qa_scores")) or int(state.get("problems_solved_count", 0) or 0) > 0
+    no_knowledge = int(state.get("no_knowledge_count", 0) or 0)
+    qa_n = len(state.get("qa_scores") or [])
+    substantive = answered and not (qa_n > 0 and no_knowledge >= max(1, int(qa_n * 0.7)))
+
+    # Don't let "I don't know" sessions look mid-pack on soft dimensions.
+    if not substantive:
+        conceptual = min(conceptual, 15.0)
+        communication = min(communication, 25.0)
+        independence = min(independence, 20.0)
+        hint_meta = dict(hint_meta)
+        hint_meta["independence_score"] = round(independence, 1)
+        hint_meta["independence_band"] = "hint_dependent"
+
     weights = {
         "conceptual": 0.18,
         "problem_solving": 0.18,
@@ -62,6 +76,7 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
         ("Communication clarity", communication),
         ("Independence (low hint reliance)", independence),
     ]
+
     for name, val in sorted(dims, key=lambda x: -x[1]):
         if val >= 70 and len(strengths) < 3:
             strengths.append(f"{name} ({val:.0f})")
@@ -73,20 +88,52 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
     weak = skill_graph.weakest_skills(graph, 3)
     strong = skill_graph.strongest_skills(graph, 3)
 
+    # Only surface skills that were actually tested this session (not untouched 50 defaults).
+    touched = set(graph.get("_touched") or [])
+    if not touched:
+        for e in (graph.get("_evidence") or []):
+            sk = str(e.get("skill") or "")
+            if sk:
+                touched.add(sk)
+    skill_confidence: dict[str, Any] = {}
+    for parent, node in graph.items():
+        if str(parent).startswith("_"):
+            continue
+        kids_out = {}
+        for child, val in (node.get("children") or {}).items():
+            key = f"{parent}.{child}"
+            if key in touched:
+                kids_out[child] = float(val)
+        if kids_out:
+            skill_confidence[parent] = {
+                "label": node.get("label", parent),
+                "children": kids_out,
+            }
+
     next_steps = []
+    if not substantive:
+        next_steps.append(
+            "In the next mock, give a real attempt even if unsure — define the term, give one example, then trade-offs."
+        )
+        next_steps.append("Pick 2–3 weak topics from this session and write 5-sentence answers before your next interview.")
     if coding < 70:
-        next_steps.append("Practice array/hashmap problems on NexPractice with timed runs.")
-    if explanation < 70:
+        next_steps.append("Practice array/hashmap problems on NexPractice with timed runs until all tests pass.")
+    if explanation < 70 and substantive:
         next_steps.append("After each solution, narrate every non-trivial block out loud.")
     if conceptual < 70:
         next_steps.append("Revise complexity, stacks, and database indexes with short written answers.")
-    if independence < 60:
+    if independence < 60 and substantive:
         next_steps.append("Practice answering first without hints — state approach, then edge cases, then complexity.")
-    if weak:
-        labels = ", ".join(w["label"] for w in weak[:2])
-        next_steps.append(f"Drill weakest skills from this session: {labels}.")
+    if weak and touched:
+        labels = ", ".join(w["label"] for w in weak[:2] if f"{w['parent']}.{w['child']}" in touched)
+        if labels:
+            next_steps.append(f"Drill weakest skills from this session: {labels}.")
     if not next_steps:
         next_steps.append("Take a harder mock with medium problems and stricter time.")
+
+    titles = list(state.get("moodle_problem_titles") or [])
+    if titles:
+        next_steps.insert(0, "Problems in this session: " + ", ".join(titles[:3]) + ".")
 
     evidence_rows = list(state.get("evidence") or [])[-24:]
     timeline = []
@@ -129,17 +176,28 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
         },
         "independence": hint_meta,
         "depth": depth,
-        "skill_graph": {
-            k: v for k, v in graph.items() if not str(k).startswith("_")
-        },
-        "skill_weakest": weak,
-        "skill_strongest": strong,
+        "skill_graph": skill_confidence,
+        "skill_weakest": [w for w in weak if f"{w['parent']}.{w['child']}" in touched][:3],
+        "skill_strongest": [w for w in strong if f"{w['parent']}.{w['child']}" in touched][:3],
         "skill_evidence": graph.get("_evidence") or [],
         "evidence": evidence_rows,
         "voice_metrics": state.get("voice_metrics") or {},
         "claims": state.get("claims") or [],
-        "strengths": strengths or ["Showed up and completed the full loop"],
-        "gaps": gaps or ["Keep sharpening edge-case discussion"],
+        "strengths": strengths if strengths else (
+            ["Attempted the session"] if answered and not substantive
+            else (["Showed up for the session"] if not answered
+                  else ["No scored strengths yet — keep practicing"])
+        ),
+        "gaps": gaps if gaps else (
+            ["Most replies were 'I don't know' — need substantive technical answers"]
+            if answered and not substantive
+            else (
+                ["Complete at least one spoken answer and one passing submission"] if not answered
+                else ["Keep sharpening edge-case discussion"]
+            )
+        ),
+        "no_knowledge_count": no_knowledge,
+        "substantive_answers": substantive,
         "next_steps": next_steps,
         "timeline": timeline[-50:],
         "problem_ids": state.get("used_problems", []),

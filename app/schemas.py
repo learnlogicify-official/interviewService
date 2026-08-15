@@ -122,6 +122,24 @@ class GladiaLiveRequest(BaseModel):
     signature: str
 
 
+class CodingResultRequest(BaseModel):
+    session_id: str
+    passed: int = 0
+    total: int = 0
+    all_passed: bool = False
+    problem_id: int = 0
+    timestamp: int
+    signature: str
+
+
+class AssignProblemRequest(BaseModel):
+    session_id: str
+    problem_id: int
+    problem_title: str = ""
+    timestamp: int
+    signature: str
+
+
 class VoiceMetricsIn(BaseModel):
     """Optional client-side timing for communication metrics."""
 

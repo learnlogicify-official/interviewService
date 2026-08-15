@@ -90,6 +90,7 @@ def update_skill(
     topic_tag: str,
     score_0_100: float,
     evidence: str = "",
+    weight: float = 0.35,
 ) -> dict[str, Any]:
     """Blend a 0–100 answer score into the matching skill leaf."""
     tag = (topic_tag or "").strip().lower()
@@ -123,16 +124,23 @@ def update_skill(
         child = next(iter(kids)) if kids else "general"
         kids.setdefault(child, 0.5)
 
+    w = max(0.15, min(0.9, float(weight)))
     target = _clamp(score_0_100 / 100.0)
     prev = float(kids.get(child, 0.5))
     # Exponential moving average — recent answers matter more.
-    kids[child] = _clamp(prev * 0.65 + target * 0.35)
+    kids[child] = _clamp(prev * (1.0 - w) + target * w)
+
+    touched = graph.setdefault("_touched", [])
+    key = f"{parent}.{child}"
+    if key not in touched:
+        touched.append(key)
+    graph["_touched"] = touched[-40:]
 
     evidence_list = graph.setdefault("_evidence", [])
     if evidence:
         evidence_list.append(
             {
-                "skill": f"{parent}.{child}",
+                "skill": key,
                 "score": round(score_0_100, 1),
                 "note": evidence[:240],
             }

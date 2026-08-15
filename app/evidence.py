@@ -89,7 +89,7 @@ def independence_score(state: dict[str, Any]) -> float:
 
     deps = state.get("hint_dependency") or {}
     if not deps:
-        return 70.0  # neutral when no data
+        return 0.0  # no answers / no evidence → no independence credit
     levels = [clamp_hint(int(v)) for v in deps.values()]
     avg = sum(levels) / len(levels)
     return max(0.0, min(100.0, 100.0 - avg * 22.0))

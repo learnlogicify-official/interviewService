@@ -36,6 +36,9 @@ Rules:
 - Only set next_action=unlock_editor when the approach is actually clear enough to code.
 - Do not set move_to_coding yourself; the engine closes the technical round.
 - Score against rubric_strong / rubric_weak when present. Store topic_tag as the skill key when known.
+- If the candidate says they don't know / are not aware / cannot answer, score MUST be 0–10.
+  Do not award partial credit for admitting ignorance. next_action=followup or next_topic is fine,
+  but the score stays near zero.
 
 Always respond with a single JSON object only (no markdown fences):
 {
@@ -52,6 +55,28 @@ FILLER_RE = re.compile(
     re.I,
 )
 
+# Admissions of ignorance / no technical substance (still long enough to pass weak-gate).
+NO_KNOWLEDGE_RE = re.compile(
+    r"(?i)\b("
+    r"i\s*(?:do\s*not|don't|dont)\s+know|"
+    r"i\s*(?:am\s+)?not\s+(?:pretty\s+)?(?:much\s+)?aware|"
+    r"not\s+aware|"
+    r"completely\s+not\s+aware|"
+    r"no\s+idea|"
+    r"not\s+sure|"
+    r"i\s*(?:have\s+)?no\s+(?:idea|clue|knowledge)|"
+    r"i\s*(?:am|'m)\s+not\s+(?:that\s+)?strong|"
+    r"not\s+that\s+strong|"
+    r"i\s*(?:will\s+)?not\s+be\s+able\s+to\s+answer|"
+    r"cannot\s+answer|can't\s+answer|"
+    r"skip\s+(?:this|it)|"
+    r"pass\s+on\s+this|"
+    r"never\s+(?:studied|learned|heard)|"
+    r"don'?t\s+remember|"
+    r"no\s+experience\s+(?:with|in|on)"
+    r")\b"
+)
+
 
 def is_weak_answer(text: str, *, min_words: int = 6) -> bool:
     """True if the utterance should not advance the interview."""
@@ -62,6 +87,36 @@ def is_weak_answer(text: str, *, min_words: int = 6) -> bool:
         return True
     words = re.findall(r"[A-Za-z0-9_]+", clean)
     return len(words) < min_words
+
+
+def is_no_knowledge_answer(text: str) -> bool:
+    """
+    True when the candidate explicitly declines / admits they cannot answer.
+    These must score near zero — they are not partial credit answers.
+    """
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return True
+    if NO_KNOWLEDGE_RE.search(clean):
+        return True
+    # Short shrugs that look like refusal without keywords.
+    words = re.findall(r"[A-Za-z0-9_]+", clean.lower())
+    if len(words) <= 12 and any(w in {"idk", "dunno"} for w in words):
+        return True
+    return False
+
+
+def clamp_answer_score(text: str, score: float) -> float:
+    """Cap scores so 'I don't know' cannot become 40–70."""
+    try:
+        s = float(score)
+    except Exception:
+        s = 0.0
+    if is_no_knowledge_answer(text):
+        return min(s, 8.0)
+    if is_weak_answer(text):
+        return min(s, 20.0)
+    return max(0.0, min(100.0, s))
 
 
 def _api_key() -> str:
@@ -341,11 +396,20 @@ def first_question(
     }
 
 
-def wrap_speech(*, student_name: str, scores: dict[str, Any], flags: list[str]) -> str | None:
-    """Short spoken closing feedback. Returns None if LLM unavailable."""
+def wrap_speech(
+    *,
+    student_name: str,
+    scores: dict[str, Any],
+    flags: list[str],
+    evidence_tail: list[dict[str, Any]] | None = None,
+    problem_titles: list[str] | None = None,
+) -> str | None:
+    """Short spoken closing feedback tailored to this session. Returns None if LLM unavailable."""
     if not llm_configured():
         return None
     first = (student_name or "there").split()[0]
+    qa_n = int(scores.get("qa_answers") or 0)
+    solved = int(scores.get("problems_solved") or 0)
     raw = chat(
         [
             {"role": "system", "content": INTERVIEWER_SYSTEM},
@@ -356,18 +420,26 @@ def wrap_speech(*, student_name: str, scores: dict[str, Any], flags: list[str]) 
                         "stage": "wrap",
                         "stage_instructions": (
                             f"You are NexAI closing the interview with {first}. "
-                            "Give a brief spoken recap in 3-4 sentences covering conceptual answers, "
-                            "problem-solving approach, coding, and communication. Be specific and fair. "
+                            "Give a brief spoken recap in 3-5 sentences that is SPECIFIC to THESE scores "
+                            "and evidence — never reuse a canned script. "
+                            "If qa_answers is 0 and problems_solved is 0, say honestly that they didn't "
+                            "engage enough to score and what to do next time. "
+                            "Mention one strength only if a score is actually strong (>=70). "
+                            "Mention the weakest 1-2 areas with concrete practice advice. "
                             "Do not ask another question. End by thanking them. next_action=wrap_up."
                         ),
                         "scores": scores,
                         "flags": flags,
+                        "qa_answers": qa_n,
+                        "problems_solved": solved,
+                        "problem_titles": (problem_titles or [])[:4],
+                        "evidence_tail": (evidence_tail or [])[-6:],
                     }
                 ),
             },
         ],
-        temperature=0.4,
-        max_tokens=180,
+        temperature=0.55,
+        max_tokens=220,
     )
     data = _extract_json(raw or "")
     if data and str(data.get("reply") or "").strip():

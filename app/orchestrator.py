@@ -162,6 +162,10 @@ def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
         "interrupt_active": row.stage == "explain",
         "moodle_problem_id": int(state.get("moodle_problem_id") or 0),
         "problem_title": state.get("moodle_problem_title") or "",
+        "remount_ide": bool(state.get("_remount_ide")),
+        "need_next_problem": bool(state.get("need_next_problem")),
+        "used_moodle_problems": list(state.get("used_moodle_problems") or []),
+        "problems_solved_count": int(state.get("problems_solved_count", 0) or 0),
     }
 
 
@@ -251,7 +255,7 @@ def start_session(
         "score_idea": 0,
         "score_coding": 0,
         "score_explain": 0,
-        "score_communication": 55,
+        "score_communication": 0,
         "current_code": "",
         "resume_text": resume,
         "moodle_problem_id": int(moodle_problem_id or 0),
@@ -267,6 +271,10 @@ def start_session(
         "current_hint_level": 0,
         "difficulty_ceiling": 2,
         "followup_index": 0,
+        "used_moodle_problems": [int(moodle_problem_id)] if int(moodle_problem_id or 0) else [],
+        "moodle_problem_titles": [((moodle_problem_title or "").strip()[:180])] if (moodle_problem_title or "").strip() else [],
+        "problems_solved_count": 0,
+        "max_coding_problems": 2,
     }
     row = SessionRow(
         id=session_id,
@@ -323,27 +331,42 @@ def _spoken_wrap_text(row: SessionRow, state: dict[str, Any]) -> str:
         "coding": state.get("score_coding", 0),
         "explain": state.get("score_explain", 0),
         "communication": state.get("score_communication", 0),
+        "independence": evidence_ledger.independence_score(state),
+        "problems_solved": int(state.get("problems_solved_count", 0) or 0),
+        "qa_answers": len(state.get("qa_scores") or []),
     }
     spoken = llm_client.wrap_speech(
         student_name=row.student_name,
         scores=scores,
         flags=list(state.get("flags") or []),
+        evidence_tail=(state.get("evidence") or [])[-8:],
+        problem_titles=list(state.get("moodle_problem_titles") or []),
     )
     if spoken:
         return spoken
     bits = []
+    if scores["qa_answers"] == 0 and scores["problems_solved"] == 0:
+        return (
+            f"{first}, this is NexAI wrapping up. You didn't submit spoken answers or a passing solution "
+            "this round, so scores stay low. Come back when you can talk through one concept and finish "
+            "one timed problem. Thanks for trying — your report is next."
+        )
     if scores["conceptual"] >= 70:
         bits.append("your conceptual answers were solid")
+    elif scores["conceptual"] >= 40:
+        bits.append("your conceptual answers were mixed and need more depth")
     else:
-        bits.append("your conceptual answers need more depth")
+        bits.append("conceptual answers were missing or too thin")
     if scores["idea"] >= 60:
         bits.append("the coding approach was reasonable")
     else:
         bits.append("the approach before coding was thin")
     if scores["coding"] >= 70:
-        bits.append("the implementation looked promising")
+        bits.append(f"you cleared {scores['problems_solved'] or 1} coding problem(s)")
+    elif scores["coding"] >= 40:
+        bits.append("coding was partial — keep pushing tests to green")
     else:
-        bits.append("keep practicing timed coding")
+        bits.append("keep practicing timed coding to a full pass")
     return (
         f"{first}, this is NexAI wrapping up. "
         + ", ".join(bits)
@@ -356,16 +379,23 @@ def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> d
     if reason == "time_up" and "time_up" not in state.get("flags", []):
         state.setdefault("flags", []).append("time_up")
 
-    # Fill missing dimension scores with conservative defaults from available signal.
-    if not state.get("qa_scores") and state.get("score_conceptual", 0) == 0:
-        state["score_conceptual"] = 40
-    if state.get("score_communication", 0) == 0:
-        state["score_communication"] = 50
-
     turns = [
         {"stage": t.stage, "role": t.role, "content": t.content}
         for t in db.query(TurnRow).filter(TurnRow.session_id == row.id).order_by(TurnRow.seq.asc())
     ]
+    student_turns = [t for t in turns if t.get("role") == "student"]
+    # No padding for empty interviews — honest zeros.
+    if not student_turns and not state.get("qa_scores") and int(state.get("problems_solved_count", 0) or 0) == 0:
+        state["score_conceptual"] = 0.0
+        state["score_idea"] = float(state.get("score_idea") or 0)
+        state["score_coding"] = float(state.get("score_coding") or 0)
+        state["score_explain"] = float(state.get("score_explain") or 0)
+        state["score_communication"] = min(20.0, float(state.get("score_communication") or 0))
+        state.setdefault("flags", []).append("no_student_answers")
+    elif not state.get("qa_scores"):
+        # Never invent conceptual credit when no scored Q&A happened.
+        state["score_conceptual"] = float(state.get("score_conceptual") or 0)
+
     report = build_report(state, turns)
     row.status = "completed"
     row.stage = "done"
@@ -421,6 +451,12 @@ def _recent_transcript(db: Session, session_id: str, limit: int = 8) -> list[dic
 
 
 def _apply_score_communication(state: dict[str, Any], answer: str, score: float) -> None:
+    # Admitting "I don't know" is not strong communication performance.
+    if llm_client.is_no_knowledge_answer(answer):
+        prev = float(state.get("score_communication") or 0)
+        sample = min(22.0, 12.0 + min(10.0, len(answer.split()) * 0.4))
+        state["score_communication"] = sample if prev <= 0 else round(prev * 0.7 + sample * 0.3, 1)
+        return
     words = len(answer.split())
     state["score_communication"] = min(
         100.0,
@@ -464,10 +500,15 @@ def _note_voice_and_claims(state: dict[str, Any], answer: str, duration_sec: flo
         "samples": len(state["voice_metric_samples"]),
         "latest": metrics,
     }
-    state["score_communication"] = voice_metrics.blend_communication(
-        float(state.get("score_communication") or 55),
-        metrics,
-    )
+    if llm_client.is_no_knowledge_answer(answer):
+        # Don't let voice metrics inflate communication for "I don't know".
+        prev = float(state.get("score_communication") or 0)
+        state["score_communication"] = min(25.0, prev if prev > 0 else 18.0)
+    else:
+        state["score_communication"] = voice_metrics.blend_communication(
+            float(state.get("score_communication") or 0),
+            metrics,
+        )
     for claim in _extract_claims(answer):
         bag = state.setdefault("claims", [])
         if claim not in bag:
@@ -578,7 +619,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             state,
             stage="qa",
             dimension="conceptual",
-            score=20.0,
+            score=8.0 if llm_client.is_no_knowledge_answer(answer) else 20.0,
             skill=skill_tag,
             question_id=qid,
             hint_level=state["current_hint_level"],
@@ -595,6 +636,60 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         return (
             "I need a fuller answer before we move on — take a breath and explain your reasoning "
             f"in a few clear sentences. {clarify}"
+        )
+
+    # Explicit "I don't know" / not aware — score near zero, mark skill weak, move on.
+    if llm_client.is_no_knowledge_answer(answer):
+        score = 5.0
+        state.setdefault("qa_scores", []).append(score)
+        state.setdefault("no_knowledge_count", 0)
+        state["no_knowledge_count"] = int(state["no_knowledge_count"]) + 1
+        state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
+        _apply_score_communication(state, answer, score)
+        state["qa_index"] = idx + 1
+        state["current_hint_level"] = evidence_ledger.bump_hint(hint_now, reason="followup")
+        state["skill_graph"] = skill_graph.update_skill(
+            graph,
+            topic_tag=skill_tag or state.get("current_qa_id") or "",
+            score_0_100=score,
+            evidence=f"No-knowledge: {(answer or '')[:120]}",
+            weight=0.7,
+        )
+        evidence_ledger.record(
+            state,
+            stage="qa",
+            dimension="conceptual",
+            score=score,
+            skill=skill_tag,
+            question_id=qid,
+            hint_level=int(state["current_hint_level"]),
+            note=(answer or "")[:160],
+            source="no_knowledge",
+            elapsed=_elapsed(row),
+        )
+        if _should_enter_coding(row, state) or _elapsed(row) >= _phase_bounds(row)[0]:
+            state["coding_after_answer"] = False
+            _save_state(row, state)
+            return _close_qa_then_code(db, row, state)
+
+        nxt = question_graph.pick_next(
+            role_track=row.role_track,
+            graph=state["skill_graph"],
+            asked_ids=list(state.get("asked_question_ids") or []),
+            difficulty_ceiling=max(1, int(state.get("difficulty_ceiling", 2) or 2) - 1),
+        )
+        if nxt:
+            _activate_question(state, nxt)
+            spoken = question_graph.spoken_prompt(nxt, hint_level=0)
+            _save_state(row, state)
+            return (
+                "That's okay — we'll mark this topic as weak and move on. "
+                f"{spoken}"
+            )
+        _save_state(row, state)
+        return (
+            "That's okay — we'll note you weren't ready on that topic and keep going. "
+            "Take your next question seriously when you can."
         )
 
     # Time to close Q&A: do not ask another conceptual question, and skip the LLM for speed.
@@ -615,7 +710,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     )
 
     if llm_result:
-        score = float(llm_result["score"])
+        score = llm_client.clamp_answer_score(answer, float(llm_result["score"]))
         action = llm_result["next_action"]
         reported_hint = int(llm_result.get("hint_level", hint_now) or hint_now)
 
@@ -632,6 +727,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                 topic_tag=skill_tag or llm_result.get("topic_tag") or "",
                 score_0_100=score,
                 evidence=f"Follow-up H{new_hint}: {(answer or '')[:120]}",
+                weight=0.55 if score < 25 else 0.35,
             )
             evidence_ledger.record(
                 state,
@@ -686,6 +782,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             topic_tag=skill_tag or llm_result.get("topic_tag") or state.get("current_qa_id") or "",
             score_0_100=score,
             evidence=(answer or "")[:160],
+            weight=0.55 if score < 25 else 0.35,
         )
 
         force_coding = _should_enter_coding(row, state)
@@ -1327,6 +1424,142 @@ def run_code(db: Session, row: SessionRow, code: str, mode: str = "sample") -> t
     db.commit()
     db.refresh(row)
     return session_view(db, row), result
+
+
+def handle_coding_result(
+    db: Session,
+    row: SessionRow,
+    *,
+    passed: int,
+    total: int,
+    all_passed: bool,
+    problem_id: int = 0,
+) -> dict[str, Any]:
+    """Called when NexPractice submit finishes (Moodle judge)."""
+    if row.status != "active":
+        return session_view(db, row)
+    if _should_wrap(row):
+        return finish_session(db, row, reason="time_up")
+
+    state = _state(row)
+    passed = max(0, int(passed or 0))
+    total = max(0, int(total or 0))
+    ratio = passed / max(1, total)
+    pid = int(problem_id or state.get("moodle_problem_id") or 0)
+
+    if all_passed and total > 0:
+        state["score_coding"] = max(float(state.get("score_coding", 0) or 0), 85.0 + min(15.0, ratio * 15))
+        state["problems_solved_count"] = int(state.get("problems_solved_count", 0) or 0) + 1
+        evidence_ledger.record(
+            state,
+            stage="code",
+            dimension="coding",
+            score=float(state["score_coding"]),
+            skill="coding.correctness",
+            question_id=str(pid or "moodle"),
+            hint_level=int(state.get("idea_hint_level", 0) or 0),
+            note=f"All tests passed ({passed}/{total})",
+            source="nexpractice",
+            elapsed=_elapsed(row),
+        )
+        solved_n = int(state["problems_solved_count"])
+        max_n = int(state.get("max_coding_problems", 2) or 2)
+        # Enough time for another round? (~3+ minutes beyond wrap buffer)
+        time_ok = _seconds_remaining(row) > (int(get_settings().wrap_seconds or 120) + 180)
+        if solved_n < max_n and time_ok:
+            state["need_next_problem"] = True
+            _save_state(row, state)
+            _add_turn(
+                db,
+                row.id,
+                row.stage or "code",
+                "system",
+                f"Coding passed {passed}/{total}; requesting next problem.",
+                {"coding_passed": True},
+            )
+            db.commit()
+            db.refresh(row)
+            return session_view(db, row)
+
+        _save_state(row, state)
+        spoken = (
+            f"All {passed} tests passed — strong finish on coding. "
+            "I'll wrap up with brief feedback now."
+        )
+        _add_turn(db, row.id, row.stage or "code", "assistant", spoken, {"coding_passed": True})
+        db.commit()
+        return finish_session(db, row, reason="coding_complete")
+
+    # Partial / failed submit — score proportionally, keep coding.
+    partial = 35.0 + ratio * 45.0
+    state["score_coding"] = max(float(state.get("score_coding", 0) or 0), partial)
+    evidence_ledger.record(
+        state,
+        stage="code",
+        dimension="coding",
+        score=partial,
+        skill="coding.correctness",
+        question_id=str(pid or "moodle"),
+        hint_level=0,
+        note=f"Submit {passed}/{total} passed",
+        source="nexpractice",
+        elapsed=_elapsed(row),
+    )
+    _save_state(row, state)
+    spoken = (
+        f"Submit came back {passed} of {total}. Keep fixing failing cases — I won't give the solution. "
+        "Say done if you want to finish."
+    )
+    _add_turn(db, row.id, row.stage or "code", "assistant", spoken, {"coding_partial": True})
+    db.commit()
+    db.refresh(row)
+    return session_view(db, row)
+
+
+def assign_moodle_problem(
+    db: Session,
+    row: SessionRow,
+    *,
+    problem_id: int,
+    problem_title: str = "",
+) -> dict[str, Any]:
+    """Attach the next NexPractice problem and reopen the approach gate."""
+    if row.status != "active":
+        return session_view(db, row)
+    state = _state(row)
+    pid = int(problem_id or 0)
+    title = (problem_title or "the next NexPractice problem").strip()[:180]
+    if pid <= 0:
+        state["need_next_problem"] = False
+        _save_state(row, state)
+        return finish_session(db, row, reason="no_more_problems")
+
+    used = state.setdefault("used_moodle_problems", [])
+    if pid not in used:
+        used.append(pid)
+    titles = state.setdefault("moodle_problem_titles", [])
+    if title and title not in titles:
+        titles.append(title)
+
+    state["moodle_problem_id"] = pid
+    state["moodle_problem_title"] = title
+    state["need_next_problem"] = False
+    state["_remount_ide"] = True
+    state["idea_attempts"] = 0
+    state["explain_count"] = 0
+    state["idea_hint_level"] = 0
+    state["awaiting"] = "idea"
+    row.stage = "idea"
+    _save_state(row, state)
+    spoken = (
+        f"Nice work — all tests passed. Next problem: {title}. "
+        "Editor stays locked — walk me through your approach first: "
+        "data structure, main steps, complexity, and one edge case."
+    )
+    _add_turn(db, row.id, "idea", "assistant", spoken, {"next_problem": True, "moodle_problem_id": pid})
+    db.commit()
+    db.refresh(row)
+    return session_view(db, row)
 
 
 def get_session(db: Session, session_id: str) -> SessionRow | None:
