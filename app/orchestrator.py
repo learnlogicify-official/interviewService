@@ -118,7 +118,9 @@ def _elapsed(row: SessionRow) -> int:
 def _phase_bounds(row: SessionRow) -> tuple[int, int]:
     """Return (qa_seconds, wrap_seconds) from 30% / 65% / 5% of the session."""
     settings = get_settings()
-    total = max(12, int(row.duration_minutes or 17)) * 60
+    total = max(10, int(row.duration_minutes or 17)) * 60
+    # Load include_coding from state when available — callers that only have row
+    # still get default coding split.
     qa_share = float(settings.qa_share or 0.30)
     wrap_share = float(settings.wrap_share or 0.05)
     qa = int(settings.qa_seconds) if int(settings.qa_seconds or 0) > 0 else int(total * qa_share)
@@ -126,9 +128,25 @@ def _phase_bounds(row: SessionRow) -> tuple[int, int]:
     return qa, wrap
 
 
+def _include_coding(state: dict[str, Any]) -> bool:
+    return bool(state.get("include_coding", True))
+
+
 def _should_enter_coding(row: SessionRow, state: dict[str, Any]) -> bool:
+    if not _include_coding(state):
+        return False
     qa_secs, _wrap = _phase_bounds(row)
+    # Conceptual-only profiles: stretch Q&A until wrap window.
     return _elapsed(row) >= qa_secs or bool(state.get("coding_after_answer"))
+
+
+def _qa_budget_seconds(row: SessionRow, state: dict[str, Any]) -> int:
+    """When coding is off, keep Q&A until the wrap window."""
+    qa, wrap = _phase_bounds(row)
+    if not _include_coding(state):
+        total = max(10, int(row.duration_minutes or 17)) * 60
+        return max(qa, total - wrap)
+    return qa
 
 
 def _awaiting_student_reply(db: Session, row: SessionRow) -> bool:
@@ -234,13 +252,27 @@ def start_session(
     resume_text: str = "",
     moodle_problem_id: int = 0,
     moodle_problem_title: str = "",
+    interviewer_name: str = "NexAI",
+    interviewer_style: str = "friendly",
+    interviewer_briefing: str = "",
+    include_coding: bool = True,
+    moodle_interviewer_id: int = 0,
 ) -> dict[str, Any]:
     session_id = uuid.uuid4().hex
     resume = " ".join((resume_text or "").split())[:12000]
     settings = get_settings()
     duration_minutes = int(duration_minutes or settings.default_duration_minutes or 17)
-    if duration_minutes < 12 or duration_minutes > 22:
+    if duration_minutes < 10 or duration_minutes > 45:
         duration_minutes = 17
+    name = (interviewer_name or "NexAI").strip()[:80] or "NexAI"
+    style = (interviewer_style or "friendly").strip().lower()
+    if style not in {"friendly", "strict", "brief"}:
+        style = "friendly"
+    briefing = " ".join((interviewer_briefing or "").split())[:4000]
+    coding_on = bool(include_coding)
+    if not coding_on:
+        moodle_problem_id = 0
+        moodle_problem_title = ""
     state = {
         "topics": topics,
         "qa_index": 0,
@@ -274,7 +306,12 @@ def start_session(
         "used_moodle_problems": [int(moodle_problem_id)] if int(moodle_problem_id or 0) else [],
         "moodle_problem_titles": [((moodle_problem_title or "").strip()[:180])] if (moodle_problem_title or "").strip() else [],
         "problems_solved_count": 0,
-        "max_coding_problems": 2,
+        "max_coding_problems": 2 if coding_on else 0,
+        "include_coding": coding_on,
+        "interviewer_name": name,
+        "interviewer_style": style,
+        "interviewer_briefing": briefing,
+        "moodle_interviewer_id": int(moodle_interviewer_id or 0),
     }
     row = SessionRow(
         id=session_id,
@@ -292,21 +329,28 @@ def start_session(
     db.add(row)
     db.flush()
 
-    # Varied NexAI intro + first conceptual question. No "say yes" gate.
+    # Varied intro + first conceptual question. No "say yes" gate.
     first = student_name.split()[0] if student_name else "there"
-    greetings = [
-        f"Hi {first}, I'm NexAI. We'll do about five minutes of technical questions, then one coding problem.",
-        f"Hey {first}. NexAI here — short conceptual round, then I'll give you one coding question from NexPractice.",
-        f"Welcome {first}. I'm NexAI, your interviewer today. Concepts first, then one timed coding problem.",
-        f"Good to meet you {first}. This is NexAI. Let's start with a few technical questions, then you'll code.",
-        f"{first}, I'm NexAI. Think of this as a live screen: a handful of questions, then one problem to implement.",
-    ]
+    if coding_on:
+        greetings = [
+            f"Hi {first}, I'm {name}. We'll do a short technical round, then one coding problem.",
+            f"Hey {first}. {name} here — conceptual questions first, then you'll code.",
+            f"Welcome {first}. I'm {name}, your interviewer today. Concepts first, then coding.",
+            f"Good to meet you {first}. This is {name}. A few technical questions, then one problem to implement.",
+            f"{first}, I'm {name}. Think of this as a live screen: questions, then one problem to implement.",
+        ]
+    else:
+        greetings = [
+            f"Hi {first}, I'm {name}. This session is a spoken technical interview — no coding editor today.",
+            f"Hey {first}. {name} here. We'll stay on conceptual and problem-solving questions for this round.",
+            f"Welcome {first}. I'm {name}. Voice Q&A only for this interview — let's dig into your topics.",
+        ]
     greet = greetings[int(uuid.uuid4().int % len(greetings))]
     opening = _begin_qa(db, row, state)
     spoken = opening or (
         f"{greet} When would you pick a hash map over a sorted array for lookups, and what's the trade-off?"
     )
-    if spoken and "nexai" not in spoken.lower() and "nex ai" not in spoken.lower():
+    if spoken and name.lower() not in spoken.lower() and "nexai" not in spoken.lower():
         spoken = f"{greet} {spoken}"
     _add_turn(db, session_id, row.stage or "qa", "assistant", spoken)
     db.commit()
@@ -419,7 +463,7 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
     if _should_wrap(row):
         return finish_session(db, row, reason="time_up")
     state = _state(row)
-    if row.stage == "qa" and _elapsed(row) >= _phase_bounds(row)[0]:
+    if row.stage == "qa" and _elapsed(row) >= _qa_budget_seconds(row, state):
         if _awaiting_student_reply(db, row):
             if not state.get("coding_after_answer"):
                 state["coding_after_answer"] = True
@@ -451,11 +495,10 @@ def _recent_transcript(db: Session, session_id: str, limit: int = 8) -> list[dic
 
 
 def _apply_score_communication(state: dict[str, Any], answer: str, score: float) -> None:
-    # Admitting "I don't know" is not strong communication performance.
+    # Admitting "I don't know" earns no communication credit.
     if llm_client.is_no_knowledge_answer(answer):
         prev = float(state.get("score_communication") or 0)
-        sample = min(22.0, 12.0 + min(10.0, len(answer.split()) * 0.4))
-        state["score_communication"] = sample if prev <= 0 else round(prev * 0.7 + sample * 0.3, 1)
+        state["score_communication"] = 0.0 if prev <= 0 else round(prev * 0.5, 1)
         return
     words = len(answer.split())
     state["score_communication"] = min(
@@ -503,7 +546,7 @@ def _note_voice_and_claims(state: dict[str, Any], answer: str, duration_sec: flo
     if llm_client.is_no_knowledge_answer(answer):
         # Don't let voice metrics inflate communication for "I don't know".
         prev = float(state.get("score_communication") or 0)
-        state["score_communication"] = min(25.0, prev if prev > 0 else 18.0)
+        state["score_communication"] = 0.0 if prev <= 0 else round(min(prev, 10.0) * 0.5, 1)
     else:
         state["score_communication"] = voice_metrics.blend_communication(
             float(state.get("score_communication") or 0),
@@ -533,6 +576,10 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
         "current_hint_level": hint,
         "difficulty_ceiling": int(state.get("difficulty_ceiling", 2) or 2),
         "question_node": question_graph.node_context_for_llm(node, hint_level=hint),
+        "interviewer_name": state.get("interviewer_name") or "NexAI",
+        "interviewer_style": state.get("interviewer_style") or "friendly",
+        "interviewer_briefing": state.get("interviewer_briefing") or "",
+        "include_coding": _include_coding(state),
     }
     ctx.update(extra)
     return ctx
@@ -612,35 +659,10 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     )
     hint_now = int(state.get("current_hint_level", 0) or 0)
 
-    if llm_client.is_weak_answer(answer):
-        # Soft H1 clarify without advancing the topic.
-        state["current_hint_level"] = evidence_ledger.bump_hint(hint_now, reason="followup")
-        evidence_ledger.record(
-            state,
-            stage="qa",
-            dimension="conceptual",
-            score=8.0 if llm_client.is_no_knowledge_answer(answer) else 20.0,
-            skill=skill_tag,
-            question_id=qid,
-            hint_level=state["current_hint_level"],
-            note="Weak/filler utterance — clarification requested",
-            source="gate",
-            elapsed=_elapsed(row),
-        )
-        _save_state(row, state)
-        clarify = (
-            question_graph.spoken_prompt(node, hint_level=1, followup_index=0)
-            if node
-            else "I need a fuller answer — explain the idea and why it works in a few clear sentences."
-        )
-        return (
-            "I need a fuller answer before we move on — take a breath and explain your reasoning "
-            f"in a few clear sentences. {clarify}"
-        )
-
-    # Explicit "I don't know" / not aware — score near zero, mark skill weak, move on.
+    # Explicit "I don't know" / not aware — score exactly 0, mark skill weak, move on.
+    # Must run before the weak-answer gate (short "idk" would otherwise get soft credit).
     if llm_client.is_no_knowledge_answer(answer):
-        score = 5.0
+        score = 0.0
         state.setdefault("qa_scores", []).append(score)
         state.setdefault("no_knowledge_count", 0)
         state["no_knowledge_count"] = int(state["no_knowledge_count"]) + 1
@@ -653,7 +675,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             topic_tag=skill_tag or state.get("current_qa_id") or "",
             score_0_100=score,
             evidence=f"No-knowledge: {(answer or '')[:120]}",
-            weight=0.7,
+            weight=0.85,
         )
         evidence_ledger.record(
             state,
@@ -667,7 +689,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             source="no_knowledge",
             elapsed=_elapsed(row),
         )
-        if _should_enter_coding(row, state) or _elapsed(row) >= _phase_bounds(row)[0]:
+        if _should_enter_coding(row, state) or _elapsed(row) >= _qa_budget_seconds(row, state):
             state["coding_after_answer"] = False
             _save_state(row, state)
             return _close_qa_then_code(db, row, state)
@@ -692,8 +714,34 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             "Take your next question seriously when you can."
         )
 
+    if llm_client.is_weak_answer(answer):
+        # Soft H1 clarify without advancing the topic.
+        state["current_hint_level"] = evidence_ledger.bump_hint(hint_now, reason="followup")
+        evidence_ledger.record(
+            state,
+            stage="qa",
+            dimension="conceptual",
+            score=0.0,
+            skill=skill_tag,
+            question_id=qid,
+            hint_level=state["current_hint_level"],
+            note="Weak/filler utterance — clarification requested",
+            source="gate",
+            elapsed=_elapsed(row),
+        )
+        _save_state(row, state)
+        clarify = (
+            question_graph.spoken_prompt(node, hint_level=1, followup_index=0)
+            if node
+            else "I need a fuller answer — explain the idea and why it works in a few clear sentences."
+        )
+        return (
+            "I need a fuller answer before we move on — take a breath and explain your reasoning "
+            f"in a few clear sentences. {clarify}"
+        )
+
     # Time to close Q&A: do not ask another conceptual question, and skip the LLM for speed.
-    if _elapsed(row) >= _phase_bounds(row)[0] or state.get("coding_after_answer"):
+    if _elapsed(row) >= _qa_budget_seconds(row, state) or state.get("coding_after_answer"):
         state["qa_index"] = idx + 1
         state["coding_after_answer"] = False
         _apply_score_communication(state, answer, 60)
@@ -895,12 +943,29 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
 
 
 def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
-    """Close conceptual round, then open the coding problem. No new technical question."""
+    """Close conceptual round, then open coding — or wrap when coding is disabled."""
     state["coding_after_answer"] = False
+    if not _include_coding(state):
+        return _begin_wrap_no_coding(db, row, state)
     coding = _start_coding_round(db, row, state)
     return (
         "Thanks — that wraps the technical questions. "
         + coding
+    )
+
+
+def _begin_wrap_no_coding(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
+    """End a conceptual-only interview with brief spoken feedback."""
+    row.stage = "wrap"
+    state["awaiting"] = "wrap"
+    conceptual = float(state.get("score_conceptual") or 0)
+    name = (state.get("interviewer_name") or "NexAI").strip() or "NexAI"
+    band = "solid" if conceptual >= 70 else ("mixed" if conceptual >= 40 else "needs work")
+    _save_state(row, state)
+    return (
+        f"Thanks — that closes the technical questions for this {name} session. "
+        f"Your conceptual round looked {band} overall. "
+        "I'll wrap with a short summary on your report. You can end the session when you're ready."
     )
 
 

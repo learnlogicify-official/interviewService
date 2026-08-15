@@ -36,7 +36,7 @@ Rules:
 - Only set next_action=unlock_editor when the approach is actually clear enough to code.
 - Do not set move_to_coding yourself; the engine closes the technical round.
 - Score against rubric_strong / rubric_weak when present. Store topic_tag as the skill key when known.
-- If the candidate says they don't know / are not aware / cannot answer, score MUST be 0–10.
+- If the candidate says they don't know / are not aware / cannot answer / skips, score MUST be exactly 0.
   Do not award partial credit for admitting ignorance. next_action=followup or next_topic is fine,
   but the score stays near zero.
 
@@ -92,7 +92,7 @@ def is_weak_answer(text: str, *, min_words: int = 6) -> bool:
 def is_no_knowledge_answer(text: str) -> bool:
     """
     True when the candidate explicitly declines / admits they cannot answer.
-    These must score near zero — they are not partial credit answers.
+    These must score exactly 0 — no partial credit.
     """
     clean = " ".join((text or "").split()).strip()
     if not clean:
@@ -113,7 +113,7 @@ def clamp_answer_score(text: str, score: float) -> float:
     except Exception:
         s = 0.0
     if is_no_knowledge_answer(text):
-        return min(s, 8.0)
+        return 0.0
     if is_weak_answer(text):
         return min(s, 20.0)
     return max(0.0, min(100.0, s))
@@ -250,6 +250,31 @@ def interviewer_turn(
     asked = ctx.get("asked_topics") or []
     resume = (ctx.get("resume_text") or "")[:800]
     weak = is_weak_answer(student_message)
+    name = (ctx.get("interviewer_name") or "NexAI").strip() or "NexAI"
+    style = (ctx.get("interviewer_style") or "friendly").strip().lower()
+    briefing = (ctx.get("interviewer_briefing") or "").strip()
+    include_coding = bool(ctx.get("include_coding", True))
+
+    style_line = {
+        "friendly": "Tone: warm and encouraging, still rigorous.",
+        "strict": "Tone: crisp and demanding. Push for precision; do not soft-pedal weak answers.",
+        "brief": "Tone: concise. Keep every reply to one short sentence plus one question.",
+    }.get(style, "Tone: professional and clear.")
+
+    system = INTERVIEWER_SYSTEM
+    extras = [
+        f"Your spoken name for this session is {name}. Introduce yourself as {name}, not as a generic AI.",
+        style_line,
+    ]
+    if not include_coding:
+        extras.append(
+            "This profile has coding DISABLED. Do not mention an editor, NexPractice, or unlocking code. "
+            "Stay on spoken conceptual / problem-solving questions until wrap."
+        )
+    if briefing:
+        extras.append(f"Faculty briefing (follow closely):\n{briefing[:2000]}")
+    system = system + "\n\nSession profile:\n- " + "\n- ".join(extras)
+
     user_payload = {
         "stage": stage,
         "role_track": role_track,
@@ -268,6 +293,9 @@ def interviewer_turn(
         "current_hint_level": ctx.get("current_hint_level", 0),
         "difficulty_ceiling": ctx.get("difficulty_ceiling"),
         "claims": (ctx.get("claims") or [])[:4],
+        "interviewer_name": name,
+        "interviewer_style": style,
+        "include_coding": include_coding,
         "transcript": history,
         "candidate_just_said": (student_message or "")[:800],
         "stage_instructions": {
@@ -290,7 +318,7 @@ def interviewer_turn(
 
     raw = chat(
         [
-            {"role": "system", "content": INTERVIEWER_SYSTEM},
+            {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user_payload)},
         ],
         temperature=0.45,

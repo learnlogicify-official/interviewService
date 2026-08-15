@@ -149,6 +149,11 @@ def start(body: StartSessionRequest, db: Session = Depends(get_db)) -> SessionSt
         resume_text=body.resume_text or "",
         moodle_problem_id=int(body.moodle_problem_id or 0),
         moodle_problem_title=str(getattr(body, "moodle_problem_title", "") or ""),
+        interviewer_name=str(getattr(body, "interviewer_name", "") or "NexAI"),
+        interviewer_style=str(getattr(body, "interviewer_style", "") or "friendly"),
+        interviewer_briefing=str(getattr(body, "interviewer_briefing", "") or ""),
+        include_coding=bool(getattr(body, "include_coding", True)),
+        moodle_interviewer_id=int(getattr(body, "moodle_interviewer_id", 0) or 0),
     )
     return SessionStateOut(**view)
 

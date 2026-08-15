@@ -40,13 +40,13 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
     qa_n = len(state.get("qa_scores") or [])
     substantive = answered and not (qa_n > 0 and no_knowledge >= max(1, int(qa_n * 0.7)))
 
-    # Don't let "I don't know" sessions look mid-pack on soft dimensions.
+    # Don't-know-heavy sessions must read as zeros, not soft partial credit.
     if not substantive:
-        conceptual = min(conceptual, 15.0)
-        communication = min(communication, 25.0)
-        independence = min(independence, 20.0)
+        conceptual = 0.0 if no_knowledge >= qa_n and qa_n > 0 else min(conceptual, 5.0)
+        communication = 0.0 if no_knowledge >= qa_n and qa_n > 0 else min(communication, 5.0)
+        independence = 0.0
         hint_meta = dict(hint_meta)
-        hint_meta["independence_score"] = round(independence, 1)
+        hint_meta["independence_score"] = 0.0
         hint_meta["independence_band"] = "hint_dependent"
 
     weights = {

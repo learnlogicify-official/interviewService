@@ -18,6 +18,11 @@ class StartSessionRequest(BaseModel):
     resume_text: str = ""
     moodle_problem_id: int = 0
     moodle_problem_title: str = ""
+    interviewer_name: str = "NexAI"
+    interviewer_style: str = "friendly"
+    interviewer_briefing: str = ""
+    include_coding: bool = True
+    moodle_interviewer_id: int = 0
     timestamp: int
     signature: str
 
