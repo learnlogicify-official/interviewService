@@ -32,18 +32,19 @@ Rules:
 - Probe, do not reveal. Prefer follow-ups that test understanding (DeepProbe style).
 - Hint ladder (you may only operate H0–H3): H0 none, H1 clarify, H2 soft probe, H3 directed nudge. Never H4 near-solution.
 - When question_node is provided AND dynamic_question_ok is false: stay on that competency; use spoken_now or a tight paraphrase.
-- When dynamic_question_ok is true OR a faculty briefing is present: you MAY invent a fresh question in the allowed topics.
-  Prefer variety across turns — mix of: concept, trade-off, predict-the-output from a short snippet, find-the-bug,
-  complexity of a given snippet, and "what would you change". Do NOT repeat the same stem as earlier turns.
-- Prefer probing WEAKEST skills from skill_graph_summary when choosing next_topic (engine may still override).
+- When dynamic_question_ok is true OR a faculty briefing is present: invent fresh questions that FOLLOW THE FACULTY BRIEFING first
+  (topics, emphasis, difficulty, what to avoid). Do not ignore the briefing.
+- Default question style is spoken conceptual / trade-off. Only use code-snippet, predict-output, or find-the-bug
+  when suggested_format is predict|debug|complexity OR the briefing explicitly asks for that style.
 - NEVER repeat a question already asked (check transcript / already_covered_topics).
+- Prefer probing WEAKEST skills from skill_graph_summary when choosing next_topic (engine may still override).
 - Only set next_action=unlock_editor when the approach is actually clear enough to code.
 - Do not set move_to_coding yourself; the engine closes the technical round.
 - Score against rubric_strong / rubric_weak when present. Store topic_tag as the skill key when known.
 - If the candidate says they don't know / are not aware / cannot answer / skips, score MUST be exactly 0.
   Do not award partial credit for admitting ignorance. next_action=followup or next_topic is fine,
   but the score stays near zero.
-- Faculty briefing overrides default topic emphasis when present — follow it closely.
+- Faculty briefing is the highest-priority topic guide when present — follow it closely.
 
 Always respond with a single JSON object only (no markdown fences):
 {
@@ -269,51 +270,60 @@ def interviewer_turn(
     }.get(style, "Tone: professional and clear.")
 
     system = INTERVIEWER_SYSTEM
-    extras = [
-        f"Your spoken name for this session is {name}. Introduce yourself as {name}, not as a generic AI.",
-        style_line,
-        f"dynamic_question_ok={str(dynamic_ok).lower()}",
-        f"This turn's preferred question format: {suggested_format}",
-    ]
+    extras: list[str] = []
+    # Briefing first so the model treats it as primary.
+    if briefing:
+        extras.append(
+            "FACULTY BRIEFING (MUST FOLLOW — this decides topics and emphasis; "
+            "do not substitute a generic DSA script):\n"
+            f"{briefing[:2500]}"
+        )
+    extras.extend(
+        [
+            f"Your spoken name for this session is {name}. Introduce yourself as {name}.",
+            style_line,
+            f"dynamic_question_ok={str(dynamic_ok).lower()}",
+            f"suggested_format={suggested_format} "
+            "(only use predict/debug/complexity snippet styles when this is one of those "
+            "OR the briefing explicitly asks; otherwise ask conceptual/trade-off questions).",
+        ]
+    )
     if not include_coding:
         extras.append(
-            "This profile has coding DISABLED. Do not mention an editor, NexPractice, or unlocking code. "
-            "Stay on spoken conceptual / snippet / predict-output questions until wrap."
+            "This profile has coding DISABLED. Do not mention an editor, NexPractice, or unlocking code."
         )
-    if briefing:
-        extras.append(f"Faculty briefing (follow closely — this shapes WHAT you ask):\n{briefing[:2000]}")
     if dynamic_ok:
         extras.append(
-            "Invent fresh questions within topics + briefing. "
-            "Rotate formats: concept, trade-off, short code snippet + predict output, find-the-bug, complexity. "
-            "question_node is only a soft hint when present — do not parrot the same bank stem every time."
+            "Invent questions that match the faculty briefing and topics list. "
+            "Do not fall back to generic hash-map / Big-O openers unless the briefing asks for them."
         )
     system = system + "\n\nSession profile:\n- " + "\n- ".join(extras)
 
     format_hint = {
-        "concept": "Ask a conceptual / definition + example question.",
-        "tradeoff": "Ask a trade-off or 'when would you choose X vs Y' question.",
+        "concept": "Ask a conceptual / definition + example question aligned to the briefing.",
+        "tradeoff": "Ask a trade-off or 'when would you choose X vs Y' question aligned to the briefing.",
         "predict": (
-            "Show a SHORT 3–8 line code snippet (Python or JS matching the track), "
-            "then ask the candidate to predict the output or return value. Do not reveal the answer."
+            "ONLY because suggested_format=predict: include a SHORT fenced code block (```), "
+            "then ask them to predict the output. Do not reveal the answer."
         ),
         "debug": (
-            "Show a SHORT buggy snippet, ask what is wrong or what breaks. Do not reveal the fix."
+            "ONLY because suggested_format=debug: include a SHORT fenced buggy snippet (```), "
+            "ask what is wrong. Do not reveal the fix."
         ),
         "complexity": (
-            "Show a SHORT snippet and ask for time/space complexity of the main loop."
+            "ONLY because suggested_format=complexity: include a SHORT fenced snippet (```), "
+            "ask time/space complexity."
         ),
-    }.get(suggested_format, "Ask one solid technical question.")
+    }.get(suggested_format, "Ask one solid technical question aligned to the briefing.")
 
     qa_instructions = (
-        "ONE short follow-up or next question. "
-        f"Preferred format this turn: {format_hint} "
-        "If question_node is set and dynamic_question_ok is false, stay on that node. "
-        "If dynamic_question_ok is true, invent a NEW question in topics/briefing "
-        "(paraphrase OK; do not reuse stems from the transcript). "
+        "Follow the faculty briefing for WHAT to ask. "
+        f"This turn's format hint: {format_hint} "
+        "If dynamic_question_ok is true, invent a NEW question matching briefing+topics "
+        "(do not reuse stems from the transcript). "
         "If candidate_answer_looks_weak is true, next_action MUST be followup on the SAME topic "
         "(bump hint_level by at most +1, max 3). "
-        "Otherwise next_action=next_topic. Do not move_to_coding. Prefer weakest skills when advancing."
+        "Otherwise next_action=next_topic. Do not move_to_coding."
     )
 
     user_payload = {
@@ -427,26 +437,30 @@ def first_question(
         else "mention this is a spoken technical screen without a coding editor"
     )
     format_hint = {
-        "predict": "Open with a SHORT code snippet and ask them to predict the output.",
-        "debug": "Open with a SHORT buggy snippet and ask what is wrong.",
-        "complexity": "Open with a SHORT snippet and ask time complexity.",
-        "tradeoff": "Open with a trade-off question (X vs Y).",
-        "concept": "Open with a conceptual question tied to the topics/briefing.",
-    }.get(suggested_format, "Open with a solid technical question.")
+        "predict": "ONLY if needed: open with a SHORT fenced code snippet and ask them to predict the output.",
+        "debug": "ONLY if needed: open with a SHORT fenced buggy snippet and ask what is wrong.",
+        "complexity": "ONLY if needed: open with a SHORT fenced snippet and ask time complexity.",
+        "tradeoff": "Open with a trade-off question (X vs Y) matching the briefing.",
+        "concept": "Open with a conceptual question matching the faculty briefing and topics.",
+    }.get(suggested_format, "Open with a solid technical question matching the briefing.")
 
     system = INTERVIEWER_SYSTEM
     if briefing:
-        system += f"\n\nFaculty briefing (follow closely):\n{briefing[:2000]}"
+        system += (
+            "\n\nFACULTY BRIEFING (MUST FOLLOW — primary guide for this interview):\n"
+            f"{briefing[:2500]}"
+        )
     system += (
         f"\n\nYour name is {name}. dynamic_question_ok={str(dynamic_ok).lower()}. "
-        f"Style={interviewer_style}."
+        f"Style={interviewer_style}. suggested_format={suggested_format}."
     )
 
     if dynamic_ok:
         ask_rule = (
-            f"{format_hint} Stay inside topics {topics} and the faculty briefing. "
-            "Do NOT default to a generic hash-map question unless the briefing asks for it. "
-            + (f"Bank hint (optional only): {stem}" if stem else "")
+            "Follow the faculty briefing for topics and emphasis. "
+            f"{format_hint} "
+            "Do NOT default to generic hash-map / Big-O unless the briefing asks for it. "
+            + (f"Optional bank skill hint: {stem}" if stem else "")
         )
     else:
         ask_rule = (

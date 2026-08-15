@@ -627,7 +627,7 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
         row.role_track,
         topics,
         briefing=briefing,
-        prefer_format=suggested if suggested in {"predict", "debug", "complexity"} else None,
+        prefer_format=None,  # never force snippet openers
     )
     _activate_question(state, node)
     node_ctx = question_graph.node_context_for_llm(node, hint_level=0, dynamic_ok=dynamic_ok)
@@ -877,7 +877,6 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         # Advance along the curated graph (weakest-skill policy).
         briefing = state.get("interviewer_briefing") or ""
         dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id"))
-        prefer_fmt = question_graph.suggested_format_for_turn(idx + 1, briefing)
         nxt = question_graph.pick_next(
             role_track=row.role_track,
             graph=state["skill_graph"],
@@ -885,7 +884,8 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             difficulty_ceiling=int(state.get("difficulty_ceiling", 2) or 2),
             topics=topics,
             briefing=briefing,
-            prefer_format=prefer_fmt if prefer_fmt in {"predict", "debug", "complexity"} else None,
+            # Soft bank hint only; do not force snippet nodes every turn.
+            prefer_format=None,
         )
         model_reply = (llm_result.get("reply") or "").strip()
         if nxt:

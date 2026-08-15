@@ -620,11 +620,27 @@ def adjust_difficulty_ceiling(ceiling: int, score_0_100: float) -> int:
 
 
 def suggested_format_for_turn(qa_index: int, briefing: str = "") -> str:
-    """Rotate question shapes so sessions don't feel like one template."""
+    """Mostly conceptual; only sprinkle snippet formats when briefing asks for them."""
     briefing_l = (briefing or "").lower()
-    cycle = ["concept", "predict", "tradeoff", "debug", "complexity"]
-    if any(k in briefing_l for k in ("snippet", "output", "predict", "code", "debug", "bug")):
-        cycle = ["predict", "debug", "complexity", "concept", "tradeoff"]
+    wants_snippets = any(
+        k in briefing_l
+        for k in (
+            "snippet",
+            "predict the output",
+            "predict output",
+            "code snippet",
+            "find the bug",
+            "debug the",
+            "what does this print",
+            "output of",
+        )
+    )
+    if not wants_snippets:
+        # Default custom / standard interviews: conceptual + trade-offs only.
+        cycle = ["concept", "tradeoff", "concept", "concept", "tradeoff"]
+        return cycle[int(qa_index) % len(cycle)]
+    # Briefing explicitly wants applied/snippet style — still mostly concept.
+    cycle = ["concept", "predict", "tradeoff", "concept", "debug", "concept", "complexity"]
     return cycle[int(qa_index) % len(cycle)]
 
 
@@ -637,9 +653,10 @@ def node_context_for_llm(
     if not node:
         return None
     rule = (
-        "question_node is a soft hint only. Invent a fresh question in the same skill/topics "
-        "or follow the faculty briefing. Prefer variety (snippet/predict/debug/trade-off). "
-        "Never reveal the answer. Hint ceiling is H3."
+        "Faculty briefing and topics decide WHAT to ask. question_node is only a soft skill hint. "
+        "Default to spoken conceptual / trade-off questions. "
+        "Use a short code snippet + predict/debug ONLY when the briefing asks for that style "
+        "or suggested_format is predict/debug/complexity. Never reveal the answer. Hint ceiling H3."
         if dynamic_ok
         else (
             "Ask using spoken_now (or a tight paraphrase). Do not invent a new topic. "
