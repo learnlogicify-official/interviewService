@@ -75,8 +75,45 @@ def _loads(raw: str, default: Any) -> Any:
         return default
 
 
-def _dumps(data: Any) -> str:
-    return json.dumps(data, ensure_ascii=False)
+def _norm_q(text: str) -> str:
+    t = re.sub(r"```[\s\S]*?```", " ", text or "")
+    t = re.sub(r"[^a-z0-9\s]", " ", t.lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def _is_similar_q(a: str, b: str) -> bool:
+    na, nb = _norm_q(a), _norm_q(b)
+    if not na or not nb:
+        return False
+    if na == nb or na[:140] == nb[:140]:
+        return True
+    if len(na) > 48 and na[:72] in nb:
+        return True
+    if len(nb) > 48 and nb[:72] in na:
+        return True
+    return False
+
+
+def _last_assistant_texts(db: Session, session_id: str, limit: int = 8) -> list[str]:
+    rows = (
+        db.query(TurnRow)
+        .filter(TurnRow.session_id == session_id, TurnRow.role == "assistant")
+        .order_by(TurnRow.seq.desc())
+        .limit(limit)
+        .all()
+    )
+    return [str(r.content or "") for r in rows]
+
+
+def _dedupe_against_history(db: Session, session_id: str, reply: str) -> str:
+    """Drop a reply that restates a recent interviewer question."""
+    text = (reply or "").strip()
+    if not text:
+        return text
+    for prev in _last_assistant_texts(db, session_id):
+        if _is_similar_q(text, prev):
+            return ""
+    return text
 
 
 def _seconds_remaining(row: SessionRow) -> int:
@@ -827,8 +864,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                     hint_level=new_hint,
                     followup_index=int(state.get("followup_index", 0) or 0),
                 )
-                # Keep model phrasing if it already embeds a question; else append stem.
-                if "?" not in reply:
+                if "?" not in reply and not _is_similar_q(reply, stem):
                     reply = f"{reply} {stem}".strip()
             _save_state(row, state)
             return reply
@@ -867,12 +903,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         if force_coding or action == "move_to_coding":
             state["coding_after_answer"] = False
             _save_state(row, state)
-            # Still return the model's closing line then coding handoff.
-            coding = _close_qa_then_code(db, row, state)
-            ack = (llm_result.get("reply") or "").strip()
-            if ack and "coding" not in ack.lower():
-                return f"{ack} {coding}".strip()
-            return coding
+            # Do not prepend another conceptual question — that is how stems get repeated
+            # right as the problem statement appears.
+            return _close_qa_then_code(db, row, state)
 
         # Advance along the curated graph (weakest-skill policy).
         briefing = state.get("interviewer_briefing") or ""
@@ -888,21 +921,31 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             prefer_format=None,
         )
         model_reply = (llm_result.get("reply") or "").strip()
-        if nxt:
-            _activate_question(state, nxt)
         # With a faculty briefing / custom interviewer, trust the LLM's next question
-        # so sessions aren't locked to the same bank stems.
+        # so sessions aren't locked to the same bank stems. Do not activate a bank
+        # node we are not going to speak — that caused the next turn to re-ask it.
         if dynamic_ok and model_reply and "?" in model_reply:
             if llm_result.get("topic_tag"):
                 state["current_qa_id"] = str(llm_result["topic_tag"])[:80]
+            state["current_question_id"] = ""
             _save_state(row, state)
             return model_reply
         if nxt:
             spoken = question_graph.spoken_prompt(nxt, hint_level=0)
+            if model_reply and _is_similar_q(model_reply, spoken):
+                _activate_question(state, nxt)
+                _save_state(row, state)
+                return spoken
             if "?" in model_reply and len(model_reply) < 280:
+                _activate_question(state, nxt)
+                _save_state(row, state)
+                return model_reply
+            _activate_question(state, nxt)
+            bridge = model_reply.split("?")[0].strip() if model_reply else "Thanks."
+            if "?" in (model_reply or ""):
+                # Model already asked something — don't also speak the bank stem.
                 out = model_reply
             else:
-                bridge = model_reply.split("?")[0].strip() if model_reply else "Thanks."
                 if bridge and not bridge.endswith((".", "!", "?")):
                     bridge += "."
                 out = f"{bridge} {spoken}".strip()
@@ -1045,11 +1088,10 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     row.stage = "idea"
     _save_state(row, state)
     return (
-        "Let's move to coding.\n\n"
-        f"**Problem: {problem['title']}** ({problem['difficulty']})\n\n"
-        f"{problem['prompt']}\n\n"
-        "Before you write code: outline your approach, data structures, complexity, and edge cases. "
-        "I will unlock the editor once the idea looks solid. I will not solve it for you."
+        f"Let's move to coding. The problem on your screen is {problem['title']}. "
+        "The editor stays locked for now. Walk me through your approach: data structure, "
+        "main steps, time complexity, and one edge case. I will unlock the editor once "
+        "the idea looks solid. I will not solve it for you."
     )
 
 
@@ -1410,7 +1452,11 @@ def handle_message(
     else:
         reply = "Session is complete. Open your feedback report for details."
 
-    _add_turn(db, row.id, row.stage, "assistant", reply)
+    cleaned = _dedupe_against_history(db, row.id, reply)
+    if not cleaned and (reply or "").strip() and "?" in (reply or ""):
+        cleaned = "Thanks — stay with that last question and go a bit deeper rather than repeating it."
+    if cleaned:
+        _add_turn(db, row.id, row.stage, "assistant", cleaned)
     _save_state(row, state)
     db.commit()
     db.refresh(row)

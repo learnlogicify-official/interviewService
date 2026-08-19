@@ -37,6 +37,8 @@ Rules:
 - Default question style is spoken conceptual / trade-off. Only use code-snippet, predict-output, or find-the-bug
   when suggested_format is predict|debug|complexity OR the briefing explicitly asks for that style.
 - NEVER repeat a question already asked (check transcript / already_covered_topics).
+- NEVER paste or re-read a coding problem statement; it is already on their screen. Refer to it only by title.
+- Ask EXACTLY ONE new question. Do not restack a previous stem plus a new one.
 - Prefer probing WEAKEST skills from skill_graph_summary when choosing next_topic (engine may still override).
 - Only set next_action=unlock_editor when the approach is actually clear enough to code.
 - Do not set move_to_coding yourself; the engine closes the technical round.
@@ -355,7 +357,8 @@ def interviewer_turn(
             "intro": "Greet in ONE short spoken sentence then ask the first conceptual question. next_action=next_topic",
             "qa": qa_instructions,
             "idea": (
-                "They must outline approach before coding. If solid, next_action=unlock_editor. "
+                "They must outline approach before coding. The full problem is already visible in the IDE — "
+                "do NOT recite the problem statement. If solid, next_action=unlock_editor. "
                 "If weak, next_action=probe_idea with H1–H3 nudge only. Never reveal the solution."
             ),
             "code": "They are coding. One short question about THEIR code, or a brief ack. next_action=continue_coding. If they asked to finish, next_action=wrap_up only to request confirmation.",
