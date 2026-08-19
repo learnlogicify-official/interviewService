@@ -75,6 +75,10 @@ def _loads(raw: str, default: Any) -> Any:
         return default
 
 
+def _dumps(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False)
+
+
 RESUME_TRACKS = {"resume_deep"}
 
 RESUME_BRIEFING = (
