@@ -404,15 +404,20 @@ def analyze_resume(resume_text: str) -> dict[str, Any]:
         return fallback
     if not llm_configured():
         return fallback
-    raw = chat(
-        [
-            {"role": "system", "content": ANALYZE_SYSTEM},
-            {"role": "user", "content": json.dumps({"resume": text[:9000]})},
-        ],
-        temperature=0.15,
-        max_tokens=1400,
-        timeout=40.0,
-    )
+    try:
+        raw = chat(
+            [
+                {"role": "system", "content": ANALYZE_SYSTEM},
+                {"role": "user", "content": json.dumps({"resume": text[:6000]})},
+            ],
+            temperature=0.15,
+            max_tokens=700,
+            timeout=12.0,
+        )
+    except Exception as exc:
+        _set_error(f"analyze_resume {type(exc).__name__}: {exc}")
+        fallback["source"] = "heuristic_llm_failed"
+        return fallback
     data = _extract_json(raw or "")
     if not data:
         fallback["source"] = "heuristic_llm_failed"

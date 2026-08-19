@@ -137,25 +137,30 @@ def start(body: StartSessionRequest, db: Session = Depends(get_db)) -> SessionSt
         body.signature,
         body.timestamp,
     )
-    view = orch.start_session(
-        db,
-        moodle_user_id=body.moodle_user_id,
-        moodle_cm_id=body.moodle_cm_id,
-        moodle_instance_id=body.moodle_instance_id,
-        student_name=body.student_name,
-        role_track=body.role_track,
-        duration_minutes=body.duration_minutes,
-        topics=body.topics,
-        resume_text=body.resume_text or "",
-        moodle_problem_id=int(body.moodle_problem_id or 0),
-        moodle_problem_title=str(getattr(body, "moodle_problem_title", "") or ""),
-        interviewer_name=str(getattr(body, "interviewer_name", "") or "NexAI"),
-        interviewer_style=str(getattr(body, "interviewer_style", "") or "friendly"),
-        interviewer_briefing=str(getattr(body, "interviewer_briefing", "") or ""),
-        include_coding=bool(getattr(body, "include_coding", True)),
-        moodle_interviewer_id=int(getattr(body, "moodle_interviewer_id", 0) or 0),
-    )
-    return SessionStateOut(**view)
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=body.moodle_user_id,
+            moodle_cm_id=body.moodle_cm_id,
+            moodle_instance_id=body.moodle_instance_id,
+            student_name=body.student_name,
+            role_track=body.role_track,
+            duration_minutes=body.duration_minutes,
+            topics=body.topics,
+            resume_text=body.resume_text or "",
+            moodle_problem_id=int(body.moodle_problem_id or 0),
+            moodle_problem_title=str(getattr(body, "moodle_problem_title", "") or ""),
+            interviewer_name=str(getattr(body, "interviewer_name", "") or "NexAI"),
+            interviewer_style=str(getattr(body, "interviewer_style", "") or "friendly"),
+            interviewer_briefing=str(getattr(body, "interviewer_briefing", "") or ""),
+            include_coding=bool(getattr(body, "include_coding", True)),
+            moodle_interviewer_id=int(getattr(body, "moodle_interviewer_id", 0) or 0),
+        )
+        return SessionStateOut(**view)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"start_failed: {type(exc).__name__}: {exc}"[:400]) from exc
 
 
 @router.post("/sessions/message", response_model=SessionStateOut)

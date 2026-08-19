@@ -404,7 +404,10 @@ def start_session(
         "moodle_interviewer_id": int(moodle_interviewer_id or 0),
     }
     if len(resume) >= 40:
-        dossier = llm_client.analyze_resume(resume)
+        try:
+            dossier = llm_client.analyze_resume(resume)
+        except Exception:
+            dossier = {}
         state["resume_dossier"] = dossier or {}
         state["resume_plan"] = list((dossier or {}).get("question_plan") or [])
         state["resume_plan_index"] = 0
@@ -441,7 +444,10 @@ def start_session(
             f"Welcome {first}. I'm {name}. Spoken interview only — every question comes from your resume.",
         ]
     greet = greetings[int(uuid.uuid4().int % len(greetings))]
-    opening = _begin_qa(db, row, state)
+    try:
+        opening = _begin_qa(db, row, state)
+    except Exception:
+        opening = ""
     spoken = opening or (
         f"{greet} Walk me through the most technically demanding project on your resume — your role, the hardest bug, and how you measured success."
         if resume_only
@@ -734,6 +740,19 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     if node:
         _activate_question(state, node)
     node_ctx = question_graph.node_context_for_llm(node, hint_level=0, dynamic_ok=dynamic_ok) if node else None
+
+    # Resume track: do not wait on a second LLM call during /sessions/start
+    # (analyze + opening was exceeding Railway/Moodle timeouts → "Interview service error").
+    if resume_only:
+        nxt = _next_resume_item(state)
+        planned = str((nxt or {}).get("question") or "").strip()
+        if planned:
+            first = (row.student_name or "there").split()[0]
+            name = str(state.get("interviewer_name") or "NexAI")
+            state["llm_mode"] = True
+            state["resume_plan_index"] = int(state.get("resume_plan_index") or 0) + 1
+            _save_state(row, state)
+            return f"Hi {first}, I'm {name}. I read your resume. {planned}"
 
     dynamic = llm_client.first_question(
         role_track=row.role_track,
