@@ -170,7 +170,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
         return None
 
 
-def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_tokens: int = 500) -> str | None:
+def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_tokens: int = 500, timeout: float = 18.0) -> str | None:
     """Call chat completions; return assistant text or None on failure."""
     settings = get_settings()
     key = _api_key()
@@ -192,7 +192,7 @@ def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_token
     }
 
     try:
-        with httpx.Client(timeout=18.0) as client:
+        with httpx.Client(timeout=timeout) as client:
             resp = client.post(url, headers=headers, json={**payload_base, "response_format": {"type": "json_object"}})
             if resp.status_code >= 400:
                 body1 = resp.text[:300]
@@ -234,6 +234,150 @@ def ping() -> dict[str, Any]:
     }
 
 
+ANALYZE_SYSTEM = """You are a staff interviewer preparing a resume screen.
+Read the resume carefully. Extract concrete facts only — never invent employers, projects, or tools.
+Return JSON only with this shape:
+{
+  "summary": "one sentence about the candidate from the resume",
+  "projects": [{"name": "", "stack": [""], "claim": "", "hard_questions": [""]}],
+  "internships": [{"company": "", "role": "", "claim": "", "hard_questions": [""]}],
+  "skills": [{"name": "", "evidence": "where it appears on the resume"}],
+  "question_plan": [{"anchor": "exact project/company/skill from resume", "question": "one spoken interview question"}]
+}
+Rules for question_plan:
+- 8 to 12 questions.
+- Every question MUST name an anchor that appears in the resume text.
+- Probe ownership, architecture, trade-offs, failure modes, metrics, and debugging.
+- No generic DSA / hash-map / Big-O unless that topic is explicitly on the resume.
+"""
+
+
+def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
+    lines = [re.sub(r"^[\-\*\u2022]+\s*", "", ln).strip() for ln in (resume_text or "").splitlines()]
+    lines = [ln for ln in lines if len(ln) >= 12]
+    projects: list[dict[str, Any]] = []
+    skills: list[dict[str, Any]] = []
+    plan: list[dict[str, str]] = []
+    skill_blob = re.search(
+        r"(?is)(?:skills?|tech(?:nical)?\s+skills?|technologies)[:\n](.+?)(?:\n\n|\n[A-Z][A-Za-z ]{3,}:|$)",
+        resume_text or "",
+    )
+    if skill_blob:
+        for part in re.split(r"[,|/]| and ", skill_blob.group(1)):
+            name = re.sub(r"\s+", " ", part).strip(" .;")
+            if 2 <= len(name) <= 40:
+                skills.append({"name": name, "evidence": "skills section"})
+    for ln in lines:
+        if re.search(
+            r"(?i)\b(project|intern|developed|built|engineer|implemented|led|designed|application|platform)\b",
+            ln,
+        ):
+            projects.append({
+                "name": ln[:90],
+                "stack": [],
+                "claim": ln[:280],
+                "hard_questions": [
+                    f"On {ln[:60]}, what did you personally own versus the team, and what broke in production?"
+                ],
+            })
+            if len(projects) >= 6:
+                break
+    for p in projects:
+        plan.append({
+            "anchor": str(p.get("name") or "this project"),
+            "question": (p.get("hard_questions") or [""])[0],
+        })
+    for sk in skills[:6]:
+        plan.append({
+            "anchor": str(sk.get("name") or "this skill"),
+            "question": (
+                f"Your resume lists {sk.get('name')}. Give a concrete example from your work where you used it, "
+                "including a trade-off you made."
+            ),
+        })
+    if not plan and lines:
+        plan.append({
+            "anchor": lines[0][:80],
+            "question": f"Starting from '{lines[0][:70]}' on your resume, walk me through the hardest technical decision you made.",
+        })
+    return {
+        "summary": (lines[0][:180] if lines else "Resume on file."),
+        "projects": projects,
+        "internships": [],
+        "skills": skills,
+        "question_plan": plan[:12],
+        "source": "heuristic",
+    }
+
+
+def _ensure_question_plan(dossier: dict[str, Any]) -> list[dict[str, str]]:
+    plan: list[dict[str, str]] = []
+    raw_plan = dossier.get("question_plan") or []
+    for item in raw_plan:
+        if isinstance(item, dict) and str(item.get("question") or "").strip():
+            plan.append({
+                "anchor": str(item.get("anchor") or "").strip()[:120],
+                "question": str(item.get("question") or "").strip()[:400],
+            })
+        elif isinstance(item, str) and item.strip():
+            plan.append({"anchor": "", "question": item.strip()[:400]})
+    for bucket in ("projects", "internships"):
+        for row in dossier.get(bucket) or []:
+            if not isinstance(row, dict):
+                continue
+            name = str(row.get("name") or row.get("company") or "").strip()
+            for q in row.get("hard_questions") or []:
+                if str(q).strip():
+                    plan.append({"anchor": name[:120], "question": str(q).strip()[:400]})
+    # Dedupe by question text.
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    for item in plan:
+        key = re.sub(r"\s+", " ", item["question"].lower())[:160]
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out[:12]
+
+
+def analyze_resume(resume_text: str) -> dict[str, Any]:
+    """Turn raw resume text into a structured interview dossier + question plan."""
+    text = (resume_text or "").strip()
+    fallback = _heuristic_resume_dossier(text)
+    if len(text) < 40:
+        return fallback
+    if not llm_configured():
+        return fallback
+    raw = chat(
+        [
+            {"role": "system", "content": ANALYZE_SYSTEM},
+            {"role": "user", "content": json.dumps({"resume": text[:9000]})},
+        ],
+        temperature=0.15,
+        max_tokens=1400,
+        timeout=40.0,
+    )
+    data = _extract_json(raw or "")
+    if not data:
+        fallback["source"] = "heuristic_llm_failed"
+        return fallback
+    dossier = {
+        "summary": str(data.get("summary") or fallback.get("summary") or "")[:400],
+        "projects": data.get("projects") if isinstance(data.get("projects"), list) else fallback["projects"],
+        "internships": data.get("internships") if isinstance(data.get("internships"), list) else [],
+        "skills": data.get("skills") if isinstance(data.get("skills"), list) else fallback["skills"],
+        "question_plan": data.get("question_plan") if isinstance(data.get("question_plan"), list) else [],
+        "source": "llm",
+    }
+    plan = _ensure_question_plan(dossier)
+    if len(plan) < 3:
+        plan = _ensure_question_plan(fallback) or plan
+        dossier["source"] = "llm+heuristic"
+    dossier["question_plan"] = plan
+    return dossier
+
+
 def interviewer_turn(
     *,
     stage: str,
@@ -256,7 +400,9 @@ def interviewer_turn(
     history = "\n".join(history_lines) if history_lines else "(interview just started)"
 
     asked = ctx.get("asked_topics") or []
-    resume = (ctx.get("resume_text") or "")[:4500]
+    resume = (ctx.get("resume_text") or "")[:8000]
+    dossier = ctx.get("resume_dossier") or {}
+    must_ask = ctx.get("must_ask_next") or {}
     weak = is_weak_answer(student_message)
     name = (ctx.get("interviewer_name") or "NexAI").strip() or "NexAI"
     style = (ctx.get("interviewer_style") or "friendly").strip().lower()
@@ -297,11 +443,18 @@ def interviewer_turn(
         )
     if resume_only:
         extras.append(
-            "RESUME DEEP-DIVE MODE: questions MUST cite a specific project, internship, tool, or claim "
-            "from resume_excerpt. Do not ask generic DSA / hash-map / Big-O unless that skill is on the resume. "
+            "RESUME DEEP-DIVE MODE: You already analyzed the resume. Ask from resume_dossier / must_ask_next. "
+            "Name the project, company, or skill in the question. Do not ask generic DSA unless it is on the resume. "
             "Do not use code-snippet predict-output formats."
         )
-        extras.append("Use the full resume_excerpt, not a one-line summary.")
+        summary = str((dossier or {}).get("summary") or "").strip()
+        if summary:
+            extras.append("Resume analysis summary: " + summary[:400])
+        if must_ask and must_ask.get("question"):
+            extras.append(
+                "MUST ASK NEXT (paraphrase OK, keep the named anchor): "
+                f"anchor={must_ask.get('anchor') or ''} | {must_ask.get('question')}"
+            )
     if dynamic_ok:
         extras.append(
             "Invent questions that match the faculty briefing and topics list. "
@@ -348,6 +501,8 @@ def interviewer_turn(
         "current_code_excerpt": ctx.get("code_excerpt"),
         "idea_attempts": ctx.get("idea_attempts"),
         "resume_excerpt": resume or None,
+        "resume_dossier": dossier or None,
+        "must_ask_next": must_ask or None,
         "candidate_answer_looks_weak": weak,
         "skill_graph_summary": ctx.get("skill_graph_summary"),
         "question_node": ctx.get("question_node"),
@@ -440,6 +595,8 @@ def first_question(
     include_coding: bool = True,
     suggested_format: str = "concept",
     resume_only: bool = False,
+    resume_dossier: dict[str, Any] | None = None,
+    must_ask_next: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Generate the opening conceptual question (anchored to question graph when provided)."""
     if not llm_configured():
@@ -480,12 +637,18 @@ def first_question(
     )
     if resume_only:
         system += (
-            " RESUME MODE: the first question MUST name a project, internship, or skill from resume_excerpt."
+            " RESUME MODE: You already analyzed their resume. The first question MUST name "
+            "a project, internship, or skill from resume_dossier / must_ask_next."
         )
 
-    if resume_only:
+    if resume_only and must_ask_next and must_ask_next.get("question"):
         ask_rule = (
-            "Open by naming a specific project or internship from resume_excerpt, then ask one rigorous "
+            "Ask this planned question (paraphrase OK, keep the named project/company/skill): "
+            f"{must_ask_next.get('anchor') or ''} — {must_ask_next.get('question')}"
+        )
+    elif resume_only:
+        ask_rule = (
+            "Open by naming a specific project or internship from resume_dossier, then ask one rigorous "
             "question about THEIR contribution, a trade-off, or a failure they handled. "
             "Do not ask generic DSA."
         )
@@ -513,7 +676,9 @@ def first_question(
                         "stage": "qa",
                         "role_track": role_track,
                         "topics": topics,
-                        "resume_excerpt": (resume_text or "")[:4500] or None,
+                        "resume_excerpt": (resume_text or "")[:8000] or None,
+                        "resume_dossier": resume_dossier or None,
+                        "must_ask_next": must_ask_next or None,
                         "question_node": None if dynamic_ok else (node or None),
                         "dynamic_question_ok": dynamic_ok,
                         "suggested_format": suggested_format,

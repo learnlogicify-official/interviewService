@@ -93,6 +93,21 @@ RESUME_BRIEFING = (
 )
 
 
+def _normalize_resume(text: str) -> str:
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()[:16000]
+
+
+def _next_resume_item(state: dict[str, Any]) -> dict[str, Any] | None:
+    plan = list(state.get("resume_plan") or [])
+    idx = int(state.get("resume_plan_index") or 0)
+    if 0 <= idx < len(plan) and isinstance(plan[idx], dict):
+        return plan[idx]
+    return None
+
+
 def _is_resume_track(role_track: str = "", state: dict[str, Any] | None = None) -> bool:
     track = (role_track or "").strip()
     if state:
@@ -323,7 +338,7 @@ def start_session(
     moodle_interviewer_id: int = 0,
 ) -> dict[str, Any]:
     session_id = uuid.uuid4().hex
-    resume = " ".join((resume_text or "").split())[:12000]
+    resume = _normalize_resume(resume_text)
     settings = get_settings()
     duration_minutes = int(duration_minutes or settings.default_duration_minutes or 17)
     if duration_minutes < 10 or duration_minutes > 45:
@@ -361,6 +376,9 @@ def start_session(
         "score_communication": 0,
         "current_code": "",
         "resume_text": resume,
+        "resume_dossier": {},
+        "resume_plan": [],
+        "resume_plan_index": 0,
         "moodle_problem_id": int(moodle_problem_id or 0),
         "moodle_problem_title": (moodle_problem_title or "").strip()[:180],
         "skill_graph": skill_graph.default_graph(role_track),
@@ -385,6 +403,11 @@ def start_session(
         "interviewer_briefing": briefing,
         "moodle_interviewer_id": int(moodle_interviewer_id or 0),
     }
+    if len(resume) >= 40:
+        dossier = llm_client.analyze_resume(resume)
+        state["resume_dossier"] = dossier or {}
+        state["resume_plan"] = list((dossier or {}).get("question_plan") or [])
+        state["resume_plan_index"] = 0
     row = SessionRow(
         id=session_id,
         moodle_user_id=moodle_user_id,
@@ -666,6 +689,8 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
         "dynamic_question_ok": dynamic_ok,
         "suggested_format": suggested,
         "resume_only": resume_only,
+        "resume_dossier": state.get("resume_dossier") or {},
+        "must_ask_next": _next_resume_item(state),
     }
     ctx.update(extra)
     return ctx
@@ -721,6 +746,8 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
         include_coding=_include_coding(state),
         suggested_format=suggested,
         resume_only=resume_only,
+        resume_dossier=state.get("resume_dossier") or {},
+        must_ask_next=_next_resume_item(state),
     )
     if dynamic:
         if dynamic.get("question_id"):
@@ -731,6 +758,8 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
             if dynamic.get("topic_tag"):
                 state["current_qa_id"] = str(dynamic["topic_tag"])[:80]
         state["llm_mode"] = True
+        if resume_only:
+            state["resume_plan_index"] = int(state.get("resume_plan_index") or 0) + 1
         _save_state(row, state)
         return dynamic["reply"]
 
@@ -748,6 +777,9 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     state["llm_mode"] = False
     _save_state(row, state)
     if resume_only:
+        nxt = _next_resume_item(state)
+        if nxt and nxt.get("question"):
+            return str(nxt["question"])
         return (
             "Walk me through the most technically demanding project on your resume — "
             "your role, the hardest bug, and how you measured success."
@@ -921,6 +953,8 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
         _apply_score_communication(state, answer, score)
         state["qa_index"] = idx + 1
+        if _is_resume_track(row.role_track, state) and action != "followup":
+            state["resume_plan_index"] = int(state.get("resume_plan_index") or 0) + 1
         state["llm_mode"] = True
         state["difficulty_ceiling"] = question_graph.adjust_difficulty_ceiling(
             int(state.get("difficulty_ceiling", 2) or 2),
