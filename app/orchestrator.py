@@ -765,13 +765,24 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
 
     if llm_client.llm_configured():
         err = llm_client.last_error() or "unknown LLM error"
+        try:
+            logger = __import__("logging").getLogger("interview.orch")
+            logger.warning("Opening LLM failed: %s", err[:300])
+        except Exception:
+            pass
+        # Never speak Railway/JSON internals to the candidate.
         state["llm_mode"] = False
         _save_state(row, state)
-        return (
-            "I could not reach the AI interviewer brain just now. "
-            f"Please ask an admin to check Railway OPENAI_API_KEY / model. Detail: {err[:180]}. "
-            "Say yes again to retry."
-        )
+        if resume_only:
+            nxt = _next_resume_item(state)
+            if nxt and nxt.get("question"):
+                return str(nxt["question"])
+            return (
+                "Thanks for the resume. Walk me through the most technically demanding project on it — "
+                "your role, the hardest bug, and how you measured success."
+            )
+        stem = (node or {}).get("stem") or "Tell me about a challenging technical problem you solved recently."
+        return f"Let's begin. {stem}"
 
     # Offline/dev fallback: speak the curated stem directly.
     state["llm_mode"] = False

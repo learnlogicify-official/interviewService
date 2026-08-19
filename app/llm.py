@@ -161,13 +161,68 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     except Exception:
         pass
     match = re.search(r"\{[\s\S]*\}", text)
-    if not match:
+    if match:
+        try:
+            data = json.loads(match.group(0))
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+    # Truncated JSON still often has a usable reply string.
+    reply_m = re.search(r'"reply"\s*:\s*"((?:\\.|[^"\\])*)', text)
+    if reply_m:
+        try:
+            reply = json.loads('"' + reply_m.group(1) + '"')
+        except Exception:
+            reply = reply_m.group(1).replace('\\"', '"').replace("\\n", " ").strip()
+        if str(reply).strip():
+            return {
+                "reply": str(reply).strip(),
+                "score": 60,
+                "next_action": "next_topic",
+                "topic_tag": "",
+                "hint_level": 0,
+            }
+    return None
+
+
+def _compact_dossier(dossier: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not dossier or not isinstance(dossier, dict):
         return None
-    try:
-        data = json.loads(match.group(0))
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    projects = []
+    for p in (dossier.get("projects") or [])[:8]:
+        if isinstance(p, dict) and (p.get("name") or p.get("claim")):
+            projects.append({
+                "name": str(p.get("name") or "")[:80],
+                "stack": [str(x)[:40] for x in (p.get("stack") or [])[:6]],
+            })
+    internships = []
+    for p in (dossier.get("internships") or [])[:6]:
+        if isinstance(p, dict):
+            internships.append({
+                "company": str(p.get("company") or "")[:80],
+                "role": str(p.get("role") or "")[:80],
+            })
+    skills = []
+    for s in (dossier.get("skills") or [])[:12]:
+        if isinstance(s, dict) and s.get("name"):
+            skills.append(str(s.get("name"))[:40])
+        elif isinstance(s, str) and s.strip():
+            skills.append(s.strip()[:40])
+    plan = []
+    for item in (dossier.get("question_plan") or [])[:8]:
+        if isinstance(item, dict) and item.get("question"):
+            plan.append({
+                "anchor": str(item.get("anchor") or "")[:80],
+                "question": str(item.get("question") or "")[:220],
+            })
+    return {
+        "summary": str(dossier.get("summary") or "")[:280],
+        "projects": projects,
+        "internships": internships,
+        "skills": skills,
+        "question_plan": plan,
+    }
 
 
 def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_tokens: int = 500, timeout: float = 18.0) -> str | None:
@@ -500,8 +555,8 @@ def interviewer_turn(
         "moodle_problem_id": ctx.get("moodle_problem_id"),
         "current_code_excerpt": ctx.get("code_excerpt"),
         "idea_attempts": ctx.get("idea_attempts"),
-        "resume_excerpt": resume or None,
-        "resume_dossier": dossier or None,
+        "resume_excerpt": resume[:2500] or None,
+        "resume_dossier": _compact_dossier(dossier if isinstance(dossier, dict) else None),
         "must_ask_next": must_ask or None,
         "candidate_answer_looks_weak": weak,
         "skill_graph_summary": ctx.get("skill_graph_summary"),
@@ -541,7 +596,7 @@ def interviewer_turn(
             {"role": "user", "content": json.dumps(user_payload)},
         ],
         temperature=0.65 if dynamic_ok else 0.45,
-        max_tokens=280 if suggested_format in {"predict", "debug", "complexity"} else 180,
+        max_tokens=360 if resume_only else (280 if suggested_format in {"predict", "debug", "complexity"} else 220),
     )
     data = _extract_json(raw or "")
     if not data or not str(data.get("reply") or "").strip():
@@ -676,8 +731,8 @@ def first_question(
                         "stage": "qa",
                         "role_track": role_track,
                         "topics": topics,
-                        "resume_excerpt": (resume_text or "")[:8000] or None,
-                        "resume_dossier": resume_dossier or None,
+                        "resume_excerpt": (resume_text or "")[:2500] or None,
+                        "resume_dossier": _compact_dossier(resume_dossier),
                         "must_ask_next": must_ask_next or None,
                         "question_node": None if dynamic_ok else (node or None),
                         "dynamic_question_ok": dynamic_ok,
@@ -696,8 +751,9 @@ def first_question(
                 ),
             },
         ],
-        temperature=0.7 if dynamic_ok else 0.55,
-        max_tokens=220,
+        temperature=0.55 if resume_only else (0.7 if dynamic_ok else 0.55),
+        max_tokens=420,
+        timeout=30.0,
     )
     data = _extract_json(raw or "")
     if not data or not str(data.get("reply") or "").strip():
@@ -705,8 +761,13 @@ def first_question(
             _set_error(f"Could not parse opening JSON: {(raw or '')[:200]}")
         return None
     tag = str(data.get("topic_tag") or node.get("skill") or node.get("question_id") or "opening")
+    reply = str(data["reply"]).strip()
+    if resume_only and must_ask_next and must_ask_next.get("question"):
+        planned = str(must_ask_next.get("question") or "").strip()
+        if planned and "?" not in reply:
+            reply = (reply.rstrip(" .") + ". " + planned).strip()
     return {
-        "reply": str(data["reply"]).strip(),
+        "reply": reply,
         "score": 0,
         "next_action": "next_topic",
         "topic_tag": tag,
