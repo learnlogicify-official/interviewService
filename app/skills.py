@@ -35,6 +35,12 @@ TRACK_SKILLS: dict[str, dict[str, Any]] = {
         "coding": {"label": "Coding", "children": {"correctness": 0.5, "edge_cases": 0.5}},
         "communication": {"label": "Communication", "children": {"clarity": 0.5, "structure": 0.5}},
     },
+    "resume_deep": {
+        "projects": {"label": "Projects", "children": {"ownership": 0.5, "architecture": 0.5, "tradeoffs": 0.5}},
+        "experience": {"label": "Experience", "children": {"internships": 0.5, "impact": 0.5, "collaboration": 0.5}},
+        "stack": {"label": "Claimed stack", "children": {"depth": 0.5, "debugging": 0.5, "fundamentals": 0.5}},
+        "communication": {"label": "Communication", "children": {"clarity": 0.5, "structure": 0.5}},
+    },
 }
 
 

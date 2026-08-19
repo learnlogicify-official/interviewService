@@ -515,7 +515,7 @@ def pick_opening(
     *,
     briefing: str = "",
     prefer_format: str | None = None,
-) -> QuestionNode:
+) -> QuestionNode | None:
     import random
 
     nodes = nodes_for_track(role_track)
@@ -528,7 +528,9 @@ def pick_opening(
             pool = fmt
     easy = [n for n in pool if int(n.get("difficulty", 2)) <= 2]
     pool = easy or pool
-    return random.choice(pool) if pool else QUESTION_BANK[0]
+    if not pool:
+        return None
+    return random.choice(pool)
 
 
 def pick_next(

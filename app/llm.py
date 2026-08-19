@@ -256,14 +256,15 @@ def interviewer_turn(
     history = "\n".join(history_lines) if history_lines else "(interview just started)"
 
     asked = ctx.get("asked_topics") or []
-    resume = (ctx.get("resume_text") or "")[:800]
+    resume = (ctx.get("resume_text") or "")[:4500]
     weak = is_weak_answer(student_message)
     name = (ctx.get("interviewer_name") or "NexAI").strip() or "NexAI"
     style = (ctx.get("interviewer_style") or "friendly").strip().lower()
     briefing = (ctx.get("interviewer_briefing") or "").strip()
     include_coding = bool(ctx.get("include_coding", True))
-    dynamic_ok = bool(ctx.get("dynamic_question_ok", False)) or bool(briefing)
-    suggested_format = str(ctx.get("suggested_format") or "concept")
+    resume_only = bool(ctx.get("resume_only")) or str(role_track or "") == "resume_deep"
+    dynamic_ok = bool(ctx.get("dynamic_question_ok", False)) or bool(briefing) or resume_only
+    suggested_format = "concept" if resume_only else str(ctx.get("suggested_format") or "concept")
 
     style_line = {
         "friendly": "Tone: warm and encouraging, still rigorous.",
@@ -294,6 +295,13 @@ def interviewer_turn(
         extras.append(
             "This profile has coding DISABLED. Do not mention an editor, NexPractice, or unlocking code."
         )
+    if resume_only:
+        extras.append(
+            "RESUME DEEP-DIVE MODE: questions MUST cite a specific project, internship, tool, or claim "
+            "from resume_excerpt. Do not ask generic DSA / hash-map / Big-O unless that skill is on the resume. "
+            "Do not use code-snippet predict-output formats."
+        )
+        extras.append("Use the full resume_excerpt, not a one-line summary.")
     if dynamic_ok:
         extras.append(
             "Invent questions that match the faculty briefing and topics list. "
@@ -355,7 +363,13 @@ def interviewer_turn(
         "candidate_just_said": (student_message or "")[:800],
         "stage_instructions": {
             "intro": "Greet in ONE short spoken sentence then ask the first conceptual question. next_action=next_topic",
-            "qa": qa_instructions,
+            "qa": (
+                "RESUME MODE: next question must be grounded in resume_excerpt (a named project or skill). "
+                "If candidate_answer_looks_weak, followup on the SAME resume claim. "
+                "Otherwise next_topic from another resume bullet. Do not move_to_coding."
+                if resume_only
+                else qa_instructions
+            ),
             "idea": (
                 "They must outline approach before coding. The full problem is already visible in the IDE — "
                 "do NOT recite the problem statement. If solid, next_action=unlock_editor. "
@@ -425,6 +439,7 @@ def first_question(
     interviewer_briefing: str = "",
     include_coding: bool = True,
     suggested_format: str = "concept",
+    resume_only: bool = False,
 ) -> dict[str, Any] | None:
     """Generate the opening conceptual question (anchored to question graph when provided)."""
     if not llm_configured():
@@ -433,11 +448,17 @@ def first_question(
     stem = str(node.get("spoken_now") or node.get("stem") or "").strip()
     name = (interviewer_name or "NexAI").strip() or "NexAI"
     briefing = (interviewer_briefing or "").strip()
-    dynamic_ok = bool(briefing)
+    resume_only = bool(resume_only) or str(role_track or "") == "resume_deep"
+    dynamic_ok = bool(briefing) or resume_only
+    suggested_format = "concept" if resume_only else suggested_format
     coding_line = (
-        "mention a short technical screen then one coding problem"
-        if include_coding
-        else "mention this is a spoken technical screen without a coding editor"
+        "mention this is a resume deep-dive with no coding editor"
+        if resume_only
+        else (
+            "mention a short technical screen then one coding problem"
+            if include_coding
+            else "mention this is a spoken technical screen without a coding editor"
+        )
     )
     format_hint = {
         "predict": "ONLY if needed: open with a SHORT fenced code snippet and ask them to predict the output.",
@@ -457,8 +478,18 @@ def first_question(
         f"\n\nYour name is {name}. dynamic_question_ok={str(dynamic_ok).lower()}. "
         f"Style={interviewer_style}. suggested_format={suggested_format}."
     )
+    if resume_only:
+        system += (
+            " RESUME MODE: the first question MUST name a project, internship, or skill from resume_excerpt."
+        )
 
-    if dynamic_ok:
+    if resume_only:
+        ask_rule = (
+            "Open by naming a specific project or internship from resume_excerpt, then ask one rigorous "
+            "question about THEIR contribution, a trade-off, or a failure they handled. "
+            "Do not ask generic DSA."
+        )
+    elif dynamic_ok:
         ask_rule = (
             "Follow the faculty briefing for topics and emphasis. "
             f"{format_hint} "
@@ -482,11 +513,12 @@ def first_question(
                         "stage": "qa",
                         "role_track": role_track,
                         "topics": topics,
-                        "resume_excerpt": (resume_text or "")[:800] or None,
+                        "resume_excerpt": (resume_text or "")[:4500] or None,
                         "question_node": None if dynamic_ok else (node or None),
                         "dynamic_question_ok": dynamic_ok,
                         "suggested_format": suggested_format,
                         "include_coding": include_coding,
+                        "resume_only": resume_only,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
                             f"You are {name}. Greet the candidate with a FRESH spoken intro "
@@ -500,7 +532,7 @@ def first_question(
             },
         ],
         temperature=0.7 if dynamic_ok else 0.55,
-        max_tokens=260 if suggested_format in {"predict", "debug", "complexity"} else 160,
+        max_tokens=220,
     )
     data = _extract_json(raw or "")
     if not data or not str(data.get("reply") or "").strip():

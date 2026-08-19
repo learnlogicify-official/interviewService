@@ -75,8 +75,27 @@ def _loads(raw: str, default: Any) -> Any:
         return default
 
 
-def _dumps(data: Any) -> str:
-    return json.dumps(data, ensure_ascii=False)
+RESUME_TRACKS = {"resume_deep"}
+
+RESUME_BRIEFING = (
+    "RESUME-ONLY DEEP DIVE. No live coding, no editor, no LeetCode, no generic DSA bank. "
+    "Ground every question in THIS candidate's resume: internships, projects, tech stack, "
+    "ownership claims, metrics, coursework, and tools they listed. Be rigorous: architecture, "
+    "trade-offs, failure modes, what THEY built vs the team, how they measured impact, how they "
+    "debug. If they listed a skill, probe it with a scenario from THEIR project, not a textbook "
+    "definition. Do not invent projects that are not on the resume. If the resume is thin, grill "
+    "fundamentals of the tools they DID list. Never move_to_coding. next_action is followup or "
+    "next_topic only. Score harshly for vague 'we used X' answers."
+)
+
+
+def _is_resume_track(role_track: str = "", state: dict[str, Any] | None = None) -> bool:
+    track = (role_track or "").strip()
+    if state:
+        track = track or str(state.get("role_track") or "")
+        if state.get("resume_only"):
+            return True
+    return track in RESUME_TRACKS
 
 
 def _norm_q(text: str) -> str:
@@ -310,7 +329,14 @@ def start_session(
     if style not in {"friendly", "strict", "brief"}:
         style = "friendly"
     briefing = " ".join((interviewer_briefing or "").split())[:4000]
-    coding_on = bool(include_coding)
+    resume_only = _is_resume_track(role_track)
+    coding_on = bool(include_coding) and not resume_only
+    if resume_only:
+        style = "strict"
+        if not briefing:
+            briefing = RESUME_BRIEFING
+        if not topics:
+            topics = ["projects", "internships", "ownership", "impact", "stack", "tradeoffs"]
     if not coding_on:
         moodle_problem_id = 0
         moodle_problem_title = ""
@@ -349,6 +375,7 @@ def start_session(
         "problems_solved_count": 0,
         "max_coding_problems": 2 if coding_on else 0,
         "include_coding": coding_on,
+        "resume_only": resume_only,
         "interviewer_name": name,
         "interviewer_style": style,
         "interviewer_briefing": briefing,
@@ -382,14 +409,16 @@ def start_session(
         ]
     else:
         greetings = [
-            f"Hi {first}, I'm {name}. This session is a spoken technical interview — no coding editor today.",
-            f"Hey {first}. {name} here. We'll stay on conceptual and problem-solving questions for this round.",
-            f"Welcome {first}. I'm {name}. Voice Q&A only for this interview — let's dig into your topics.",
+            f"Hi {first}, I'm {name}. This is a resume deep-dive — no coding editor. I'll grill the work you listed.",
+            f"Hey {first}. {name} here. We'll stay on your resume: projects, internships, and the stack you claim.",
+            f"Welcome {first}. I'm {name}. Spoken interview only — every question comes from your resume.",
         ]
     greet = greetings[int(uuid.uuid4().int % len(greetings))]
     opening = _begin_qa(db, row, state)
     spoken = opening or (
-        f"{greet} When would you pick a hash map over a sorted array for lookups, and what's the trade-off?"
+        f"{greet} Walk me through the most technically demanding project on your resume — your role, the hardest bug, and how you measured success."
+        if resume_only
+        else f"{greet} When would you pick a hash map over a sorted array for lookups, and what's the trade-off?"
     )
     if spoken and name.lower() not in spoken.lower() and "nexai" not in spoken.lower():
         spoken = f"{greet} {spoken}"
@@ -606,8 +635,9 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
     node = question_graph.get_node(qid)
     hint = int(state.get("current_hint_level", 0) or 0)
     briefing = state.get("interviewer_briefing") or ""
-    dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id"))
-    suggested = question_graph.suggested_format_for_turn(
+    resume_only = _is_resume_track(row.role_track, state)
+    dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id")) or resume_only
+    suggested = "concept" if resume_only else question_graph.suggested_format_for_turn(
         int(state.get("qa_index", 0) or 0),
         briefing,
     )
@@ -631,6 +661,7 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
         "include_coding": _include_coding(state),
         "dynamic_question_ok": dynamic_ok,
         "suggested_format": suggested,
+        "resume_only": resume_only,
     }
     ctx.update(extra)
     return ctx
@@ -662,16 +693,18 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
 
     topics = state.get("topics") or _loads(row.topics_json, [])
     briefing = state.get("interviewer_briefing") or ""
-    dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id"))
-    suggested = question_graph.suggested_format_for_turn(0, briefing)
-    node = question_graph.pick_opening(
+    resume_only = _is_resume_track(row.role_track, state)
+    dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id")) or resume_only
+    suggested = "concept" if resume_only else question_graph.suggested_format_for_turn(0, briefing)
+    node = None if resume_only else question_graph.pick_opening(
         row.role_track,
         topics,
         briefing=briefing,
         prefer_format=None,  # never force snippet openers
     )
-    _activate_question(state, node)
-    node_ctx = question_graph.node_context_for_llm(node, hint_level=0, dynamic_ok=dynamic_ok)
+    if node:
+        _activate_question(state, node)
+    node_ctx = question_graph.node_context_for_llm(node, hint_level=0, dynamic_ok=dynamic_ok) if node else None
 
     dynamic = llm_client.first_question(
         role_track=row.role_track,
@@ -683,6 +716,7 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
         interviewer_briefing=briefing,
         include_coding=_include_coding(state),
         suggested_format=suggested,
+        resume_only=resume_only,
     )
     if dynamic:
         if dynamic.get("question_id"):
@@ -709,8 +743,14 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     # Offline/dev fallback: speak the curated stem directly.
     state["llm_mode"] = False
     _save_state(row, state)
+    if resume_only:
+        return (
+            "Walk me through the most technically demanding project on your resume — "
+            "your role, the hardest bug, and how you measured success."
+        )
+    stem = (node or {}).get("stem") or "Tell me about a challenging technical problem you solved recently."
     return (
-        f"First question: {node['stem']} "
+        f"First question: {stem} "
         "Give a clear structured answer."
     )
 
@@ -913,8 +953,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
 
         # Advance along the curated graph (weakest-skill policy).
         briefing = state.get("interviewer_briefing") or ""
-        dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id"))
-        nxt = question_graph.pick_next(
+        resume_only = _is_resume_track(row.role_track, state)
+        dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id")) or resume_only
+        nxt = None if resume_only else question_graph.pick_next(
             role_track=row.role_track,
             graph=state["skill_graph"],
             asked_ids=list(state.get("asked_question_ids") or []),
