@@ -75,6 +75,10 @@ def _loads(raw: str, default: Any) -> Any:
         return default
 
 
+def _dumps(data: Any) -> str:
+    return json.dumps(data, ensure_ascii=False)
+
+
 def _norm_q(text: str) -> str:
     t = re.sub(r"```[\s\S]*?```", " ", text or "")
     t = re.sub(r"[^a-z0-9\s]", " ", t.lower())

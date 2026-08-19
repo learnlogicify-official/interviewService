@@ -1,1 +1,1 @@
-web: sh scripts/start.sh
+web: sh -c 'uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8091}'
