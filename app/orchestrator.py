@@ -93,11 +93,27 @@ RESUME_BRIEFING = (
 )
 
 
+def _is_human_resume_line(ln: str) -> bool:
+    s = (ln or "").strip()
+    if len(s) < 8:
+        return False
+    letters = len(re.findall(r"[A-Za-z]", s))
+    if letters < 6:
+        return False
+    if letters / max(1, len(s)) < 0.42:
+        return False
+    if re.search(r"[ÿþßŠ¢ãÞµ«»¤¦§œžÐ]{2,}", s) and letters < 12:
+        return False
+    return True
+
+
 def _normalize_resume(text: str) -> str:
     t = (text or "").replace("\r\n", "\n").replace("\r", "\n")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
-    return t.strip()[:16000]
+    lines = [ln.strip() for ln in t.splitlines() if _is_human_resume_line(ln)]
+    t = "\n".join(lines).strip()
+    return t[:16000]
 
 
 def _next_resume_item(state: dict[str, Any]) -> dict[str, Any] | None:

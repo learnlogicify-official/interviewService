@@ -307,9 +307,23 @@ Rules for question_plan:
 """
 
 
+def _is_human_resume_line(ln: str) -> bool:
+    s = (ln or "").strip()
+    if len(s) < 8:
+        return False
+    letters = len(re.findall(r"[A-Za-z]", s))
+    if letters < 6:
+        return False
+    if letters / max(1, len(s)) < 0.42:
+        return False
+    if re.search(r"[ÿþßŠ¢ãÞµ«»¤¦§œžÐ]{2,}", s) and letters < 12:
+        return False
+    return True
+
+
 def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
     lines = [re.sub(r"^[\-\*\u2022]+\s*", "", ln).strip() for ln in (resume_text or "").splitlines()]
-    lines = [ln for ln in lines if len(ln) >= 12]
+    lines = [ln for ln in lines if _is_human_resume_line(ln)]
     projects: list[dict[str, Any]] = []
     skills: list[dict[str, Any]] = []
     plan: list[dict[str, str]] = []
@@ -353,7 +367,18 @@ def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
     if not plan and lines:
         plan.append({
             "anchor": lines[0][:80],
-            "question": f"Starting from '{lines[0][:70]}' on your resume, walk me through the hardest technical decision you made.",
+            "question": (
+                f"On {lines[0][:70]}, walk me through the hardest technical decision you made, "
+                "what you owned, and how you measured the result."
+            ),
+        })
+    if not plan:
+        plan.append({
+            "anchor": "resume",
+            "question": (
+                "Walk me through the most technically demanding project on your resume — "
+                "your role, the hardest bug, and how you measured success."
+            ),
         })
     return {
         "summary": (lines[0][:180] if lines else "Resume on file."),
@@ -392,6 +417,10 @@ def _ensure_question_plan(dossier: dict[str, Any]) -> list[dict[str, str]]:
         if key in seen:
             continue
         seen.add(key)
+        if re.search(r"[ÿþßŠ¢ãÞµ«»¤¦§œžÐ]{2,}", item["question"]):
+            continue
+        if item.get("anchor") and not _is_human_resume_line(item["anchor"]) and len(item["anchor"]) > 12:
+            item["anchor"] = ""
         out.append(item)
     return out[:12]
 
