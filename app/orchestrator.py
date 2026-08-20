@@ -926,12 +926,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         clarify = (
             question_graph.spoken_prompt(node, hint_level=1, followup_index=0)
             if node
-            else "I need a fuller answer — explain the idea and why it works in a few clear sentences."
+            else "Take a moment and walk me through it."
         )
-        return (
-            "I need a fuller answer before we move on — take a breath and explain your reasoning "
-            f"in a few clear sentences. {clarify}"
-        )
+        return f"Go a bit further. {clarify}"
 
     # Time to close Q&A: do not ask another conceptual question, and skip the LLM for speed.
     if _elapsed(row) >= _qa_budget_seconds(row, state) or state.get("coding_after_answer"):
@@ -1504,14 +1501,9 @@ def handle_message(
         _note_voice_and_claims(state, text, duration_sec)
         _add_turn(db, row.id, row.stage, "student", text, {"weak": True, "voice": state.get("voice_metrics", {}).get("latest")})
         if row.stage == "qa":
-            reply = (
-                "I need a fuller answer before we move on — take a breath and explain your reasoning "
-                "in a few clear sentences."
-            )
+            reply = "I'm still with you — keep going and finish that thought."
         else:
-            reply = (
-                "Give me a clearer plan first — data structure, main steps, time complexity, and one edge case."
-            )
+            reply = "Keep going — data structure, main steps, and time complexity."
         _add_turn(db, row.id, row.stage, "assistant", reply)
         _save_state(row, state)
         db.commit()

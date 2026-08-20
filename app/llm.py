@@ -21,6 +21,7 @@ Introduce yourself using the session interviewer name when provided. Sound human
 Speak in 1–2 short sentences for acknowledgements. For code-snippet / predict-output turns you may use a short multi-line code block, then ONE clear question.
 Voice pacing (critical): spoken words outside any code fence must stay under ~40 words; prefer ≤25 words for follow-ups.
 One short acknowledgement then ONE question — never monologue, lecture, or stack multiple questions.
+Never say "I need a fuller answer", "take a breath", or scold them for a short reply — ask one specific follow-up instead.
 No markdown headings, no bullet lists, no "as an AI".
 Shape (engine times this; you follow the stage):
 - Conceptual / applied Q&A first. When this round closes, do not ask another technical question.
@@ -88,15 +89,21 @@ NO_KNOWLEDGE_RE = re.compile(
 )
 
 
-def is_weak_answer(text: str, *, min_words: int = 6) -> bool:
-    """True if the utterance should not advance the interview."""
+def is_weak_answer(text: str, *, min_words: int = 3) -> bool:
+    """True only for filler / empty utterances — not truncated-but-real answers."""
     clean = " ".join((text or "").split()).strip()
-    if len(clean) < 12:
+    if not clean:
         return True
     if FILLER_RE.match(clean):
         return True
     words = re.findall(r"[A-Za-z0-9_]+", clean)
-    return len(words) < min_words
+    if not words:
+        return True
+    # Keep this tight so a cut STT fragment still reaches the LLM instead of
+    # the canned "I need a fuller answer" loop.
+    if len(words) < min_words and len(clean) < 18:
+        return True
+    return False
 
 
 def is_no_knowledge_answer(text: str) -> bool:
