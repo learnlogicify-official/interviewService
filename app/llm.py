@@ -21,7 +21,7 @@ Introduce yourself using the session interviewer name when provided. Sound human
 Speak in 1–2 short sentences for acknowledgements. For code-snippet / predict-output turns you may use a short multi-line code block, then ONE clear question.
 Voice pacing (critical): spoken words outside any code fence must stay under ~40 words; prefer ≤25 words for follow-ups.
 One short acknowledgement then ONE question — never monologue, lecture, or stack multiple questions.
-Never say "I need a fuller answer", "take a breath", or scold them for a short reply — ask one specific follow-up instead.
+Never scold, shame, or lecture about "fuller answers" — stay calm and specific.
 No markdown headings, no bullet lists, no "as an AI".
 Shape (engine times this; you follow the stage):
 - Conceptual / applied Q&A first. When this round closes, do not ask another technical question.
@@ -39,7 +39,15 @@ Rules:
   (topics, emphasis, difficulty, what to avoid). Do not ignore the briefing.
 - Default question style is spoken conceptual / trade-off. Only use code-snippet, predict-output, or find-the-bug
   when suggested_format is predict|debug|complexity OR the briefing explicitly asks for that style.
-- NEVER repeat a question already asked (check transcript / already_covered_topics).
+- Do not jump to a NEW topic while the current question is still unanswered.
+- EXCEPTION — unclear / incomplete / off-topic answers (critical for voice interviews):
+  If the candidate's reply is garbled, half-finished, off-topic, or not related to what you asked:
+  (1) briefly say you didn't catch a clear answer or it doesn't address the question,
+  (2) REPHRASE the SAME question in simpler words (same competency / same resume claim),
+  (3) set next_action=followup and keep score low (usually ≤35).
+  Rephrasing the same question is REQUIRED here — it is not "repeating" in the bad sense.
+- Only invent a brand-new topic when the previous answer was understandable AND on-topic
+  (check transcript / already_covered_topics).
 - NEVER paste or re-read a coding problem statement; it is already on their screen. Refer to it only by title.
 - Ask EXACTLY ONE new question. Do not restack a previous stem plus a new one.
 - Prefer probing WEAKEST skills from skill_graph_summary when choosing next_topic (engine may still override).
@@ -102,6 +110,24 @@ def is_weak_answer(text: str, *, min_words: int = 3) -> bool:
     # Keep this tight so a cut STT fragment still reaches the LLM instead of
     # the canned "I need a fuller answer" loop.
     if len(words) < min_words and len(clean) < 18:
+        return True
+    return False
+
+
+def looks_incomplete_answer(text: str) -> bool:
+    """True when speech looks cut off mid-thought (common with live STT)."""
+    clean = " ".join((text or "").split()).strip()
+    if not clean or is_weak_answer(clean):
+        return False
+    words = re.findall(r"[A-Za-z0-9_]+", clean)
+    if len(words) <= 10 and not re.search(r"[.!?]$", clean):
+        return True
+    if re.search(
+        r"(?i)\b(and|or|so|because|like|with|for|to|the|a|an|my|our|if|when|which)\s*$",
+        clean,
+    ):
+        return True
+    if clean.endswith(("...", "…", "-", "—")):
         return True
     return False
 
@@ -502,6 +528,7 @@ def interviewer_turn(
     dossier = ctx.get("resume_dossier") or {}
     must_ask = ctx.get("must_ask_next") or {}
     weak = is_weak_answer(student_message)
+    incomplete = looks_incomplete_answer(student_message)
     name = (ctx.get("interviewer_name") or "NexAI").strip() or "NexAI"
     style = (ctx.get("interviewer_style") or "friendly").strip().lower()
     briefing = (ctx.get("interviewer_briefing") or "").strip()
@@ -581,9 +608,12 @@ def interviewer_turn(
         "Follow the faculty briefing for WHAT to ask. "
         f"This turn's format hint: {format_hint} "
         "If dynamic_question_ok is true, invent a NEW question matching briefing+topics "
-        "(do not reuse stems from the transcript). "
-        "If candidate_answer_looks_weak is true, next_action MUST be followup on the SAME topic "
-        "(bump hint_level by at most +1, max 3). "
+        "(do not reuse stems from the transcript) — UNLESS the answer is weak/incomplete/off-topic. "
+        "If candidate_answer_looks_weak OR candidate_answer_looks_incomplete is true, "
+        "OR the answer does not address the last interviewer question: "
+        "next_action MUST be followup — briefly say you didn't get a clear/on-topic answer, "
+        "then REPHRASE the SAME question more simply (same topic). "
+        "(bump hint_level by at most +1, max 3). Score low. "
         "Otherwise next_action=next_topic. Do not move_to_coding."
     )
 
@@ -602,6 +632,7 @@ def interviewer_turn(
         "resume_dossier": _compact_dossier(dossier if isinstance(dossier, dict) else None),
         "must_ask_next": must_ask or None,
         "candidate_answer_looks_weak": weak,
+        "candidate_answer_looks_incomplete": incomplete,
         "skill_graph_summary": ctx.get("skill_graph_summary"),
         "question_node": ctx.get("question_node"),
         "current_hint_level": ctx.get("current_hint_level", 0),
@@ -618,7 +649,8 @@ def interviewer_turn(
             "intro": "Greet in ONE short spoken sentence then ask the first conceptual question. next_action=next_topic",
             "qa": (
                 "RESUME MODE: next question must be grounded in resume_excerpt (a named project or skill). "
-                "If candidate_answer_looks_weak, followup on the SAME resume claim. "
+                "If candidate_answer_looks_weak OR candidate_answer_looks_incomplete, "
+                "or the answer is off-topic: followup — say so briefly and rephrase the SAME resume question. "
                 "Otherwise next_topic from another resume bullet. Do not move_to_coding."
                 if resume_only
                 else qa_instructions

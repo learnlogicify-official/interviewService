@@ -168,10 +168,69 @@ def _dedupe_against_history(db: Session, session_id: str, reply: str) -> str:
     text = (reply or "").strip()
     if not text:
         return text
+    # Intentional re-ask / rephrase turns must be allowed (voice STT often needs this).
+    if re.search(
+        r"(?i)\b("
+        r"didn'?t catch|did not catch|not sure i (heard|follow|got)|"
+        r"came through (unclear|incomplete)|let me (ask|rephrase|put that)|"
+        r"ask (that|this) again|same question|another way|more simply|"
+        r"doesn'?t (quite )?answer|not (really )?related|off[- ]?topic"
+        r")\b",
+        text,
+    ):
+        return text
     for prev in _last_assistant_texts(db, session_id):
         if _is_similar_q(text, prev):
             return ""
     return text
+
+
+def _current_qa_stem(state: dict[str, Any], *, hint_bump: int = 1) -> str:
+    """Best spoken stem for the active Q&A node / resume item."""
+    hint = max(0, min(3, int(state.get("current_hint_level", 0) or 0) + hint_bump))
+    followup_index = int(state.get("followup_index", 0) or 0)
+    qid = str(state.get("current_question_id") or "")
+    node = question_graph.get_node(qid) if qid else None
+    if node:
+        return question_graph.spoken_prompt(
+            node,
+            hint_level=max(1, hint),
+            followup_index=followup_index,
+        )
+    nxt = _next_resume_item(state)
+    if nxt and nxt.get("question"):
+        return str(nxt["question"]).strip()
+    spoken = str(state.get("spoken_now") or state.get("last_question") or "").strip()
+    return spoken
+
+
+def _reask_current_question(
+    state: dict[str, Any],
+    *,
+    reason: str = "unclear",
+) -> str:
+    """
+    Brief acknowledge + rephrase the same question.
+    Used when STT is empty/weak or the answer is incomplete.
+    """
+    state["current_hint_level"] = evidence_ledger.bump_hint(
+        int(state.get("current_hint_level", 0) or 0),
+        reason="followup",
+    )
+    state["followup_index"] = int(state.get("followup_index", 0) or 0) + 1
+    stem = _current_qa_stem(state, hint_bump=0)
+    if reason == "empty":
+        lead = "I didn't catch that clearly."
+    elif reason == "weak":
+        lead = "That came through incomplete."
+    elif reason == "offtopic":
+        lead = "I'm not sure that answers what I asked."
+    else:
+        lead = "Let me ask that again more simply."
+    if stem:
+        # Avoid "Question: Question:" style doubles if stem already has a lead-in.
+        return f"{lead} {stem}".strip()
+    return f"{lead} Could you answer the last question again in your own words?"
 
 
 def _seconds_remaining(row: SessionRow) -> int:
@@ -908,7 +967,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         )
 
     if llm_client.is_weak_answer(answer):
-        # Soft H1 clarify without advancing the topic.
+        # Soft H1 clarify without advancing the topic — rephrase the same question.
         state["current_hint_level"] = evidence_ledger.bump_hint(hint_now, reason="followup")
         evidence_ledger.record(
             state,
@@ -923,12 +982,25 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             elapsed=_elapsed(row),
         )
         _save_state(row, state)
-        clarify = (
-            question_graph.spoken_prompt(node, hint_level=1, followup_index=0)
-            if node
-            else "Take a moment and walk me through it."
+        return _reask_current_question(state, reason="weak")
+
+    # Half-cut / trailing STT — rephrase instead of scoring a partial thought.
+    if llm_client.looks_incomplete_answer(answer):
+        evidence_ledger.record(
+            state,
+            stage="qa",
+            dimension="conceptual",
+            score=10.0,
+            skill=skill_tag,
+            question_id=qid,
+            hint_level=int(state.get("current_hint_level", 0) or 0),
+            note="Incomplete utterance — re-ask",
+            source="gate",
+            elapsed=_elapsed(row),
         )
-        return f"Go a bit further. {clarify}"
+        reply = _reask_current_question(state, reason="unclear")
+        _save_state(row, state)
+        return reply
 
     # Time to close Q&A: do not ask another conceptual question, and skip the LLM for speed.
     if _elapsed(row) >= _qa_budget_seconds(row, state) or state.get("coding_after_answer"):
@@ -951,6 +1023,14 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         score = llm_client.clamp_answer_score(answer, float(llm_result["score"]))
         action = llm_result["next_action"]
         reported_hint = int(llm_result.get("hint_level", hint_now) or hint_now)
+
+        # Off-topic / very weak: never advance — force a rephrase follow-up.
+        if action != "followup" and (
+            score < 40
+            or llm_client.looks_incomplete_answer(answer)
+            or llm_client.is_weak_answer(answer)
+        ):
+            action = "followup"
 
         # Never advance on weak LLM scores that re-ask.
         if action == "followup" and score < 55:
@@ -987,8 +1067,24 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                     hint_level=new_hint,
                     followup_index=int(state.get("followup_index", 0) or 0),
                 )
-                if "?" not in reply and not _is_similar_q(reply, stem):
-                    reply = f"{reply} {stem}".strip()
+                if "?" not in reply:
+                    lead = reply.rstrip()
+                    if not re.search(
+                        r"(?i)\b(didn'?t catch|rephrase|ask again|more simply|not sure)\b",
+                        lead,
+                    ):
+                        lead = "I'm not sure that answered it — let me ask again more simply."
+                    reply = f"{lead} {stem}".strip()
+                elif score < 35 and not re.search(
+                    r"(?i)\b(didn'?t catch|rephrase|again|more simply|not sure|unclear)\b",
+                    reply,
+                ):
+                    reply = f"I'm not sure that answered it. {reply}".strip()
+            elif score < 35 and "?" in reply and not re.search(
+                r"(?i)\b(didn'?t catch|rephrase|again|more simply|not sure|unclear)\b",
+                reply,
+            ):
+                reply = f"I'm not sure that answered it. {reply}".strip()
             _save_state(row, state)
             return reply
 
@@ -1455,7 +1551,13 @@ def handle_message(
 
     text = (message or "").strip()
     if not text:
-        _add_turn(db, row.id, row.stage, "assistant", "I didn't catch that — please speak your answer clearly.")
+        state = _state(row)
+        if row.stage in {"qa", "idea"}:
+            reply = _reask_current_question(state, reason="empty")
+        else:
+            reply = "I didn't catch that — please speak your answer clearly."
+        _add_turn(db, row.id, row.stage, "assistant", reply)
+        _save_state(row, state)
         db.commit()
         db.refresh(row)
         return session_view(db, row)
@@ -1495,15 +1597,22 @@ def handle_message(
         db.refresh(row)
         return session_view(db, row)
 
-    # Filler during Q&A / idea: acknowledge without logging a "scored" student turn advance path.
+    # Filler during Q&A / idea: rephrase the same question instead of advancing.
     if row.stage in {"qa", "idea"} and llm_client.is_weak_answer(text):
         state = _state(row)
         _note_voice_and_claims(state, text, duration_sec)
         _add_turn(db, row.id, row.stage, "student", text, {"weak": True, "voice": state.get("voice_metrics", {}).get("latest")})
         if row.stage == "qa":
-            reply = "I'm still with you — keep going and finish that thought."
+            reply = _reask_current_question(state, reason="weak")
         else:
-            reply = "Keep going — data structure, main steps, and time complexity."
+            reply = (
+                "That came through incomplete. "
+                "Outline the data structure, main steps, and time complexity again."
+            )
+            state["idea_hint_level"] = evidence_ledger.bump_hint(
+                int(state.get("idea_hint_level", 0) or 0),
+                reason="followup",
+            )
         _add_turn(db, row.id, row.stage, "assistant", reply)
         _save_state(row, state)
         db.commit()
@@ -1575,7 +1684,10 @@ def handle_message(
 
     cleaned = _dedupe_against_history(db, row.id, reply)
     if not cleaned and (reply or "").strip() and "?" in (reply or ""):
-        cleaned = "Thanks — stay with that last question and go a bit deeper rather than repeating it."
+        # Prefer a soft re-ask over "don't repeat" when voice answers were unclear.
+        cleaned = _reask_current_question(state, reason="unclear") if row.stage in {"qa", "idea"} else (
+            "Thanks — stay with that last question and go a bit deeper."
+        )
     if cleaned:
         _add_turn(db, row.id, row.stage, "assistant", cleaned)
     _save_state(row, state)
