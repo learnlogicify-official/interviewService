@@ -58,10 +58,10 @@ def create_live_session(
         "bit_depth": 16,
         "sample_rate": int(sample_rate or 16000),
         "channels": 1,
-        # Wait for a real pause — 0.55s was cutting mid-thought.
-        "endpointing": 1.4,
+        # Endpoint after a short pause — 1.4s felt stuck; 0.55s cut mid-thought.
+        "endpointing": 0.85,
         # Safety only — if noise never looks like silence, don't hang forever.
-        "maximum_duration_without_endpointing": 20,
+        "maximum_duration_without_endpointing": 16,
         "language_config": {
             "languages": [lang],
             "code_switching": False,
