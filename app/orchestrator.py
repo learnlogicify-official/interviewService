@@ -533,9 +533,8 @@ def start_session(
     if followup_depth not in {"light", "moderate", "deep"}:
         followup_depth = "moderate"
     avoid = " ".join((avoid_topics or "").split())[:500]
-    briefing = " ".join((interviewer_briefing or "").split())[:4000]
-    # Structured custom-interviewer rules → always merged into briefing so the LLM
-    # and engine follow the same profile even when freeform briefing is empty.
+    freeform = " ".join((interviewer_briefing or "").split())[:2500]
+    # Structured custom-interviewer rules FIRST so LLM truncate cannot drop them.
     profile_rules = _compose_profile_rules(
         style=style,
         difficulty=difficulty,
@@ -546,16 +545,20 @@ def start_session(
         include_coding=bool(include_coding),
         topics=topics,
     )
-    if profile_rules:
-        briefing = (briefing + "\n\n" + profile_rules).strip() if briefing else profile_rules
-        briefing = briefing[:4000]
+    if profile_rules and freeform:
+        briefing = (profile_rules + "\n\nFACULTY NOTES:\n" + freeform).strip()[:4000]
+    elif profile_rules:
+        briefing = profile_rules[:4000]
+    else:
+        briefing = freeform[:4000]
     resume_only = _is_resume_track(role_track)
     coding_on = bool(include_coding) and not resume_only
     if resume_only:
         style = "strict"
-        if not briefing or briefing == profile_rules:
-            briefing = RESUME_BRIEFING + (("\n\n" + profile_rules) if profile_rules else "")
-            briefing = briefing[:4000]
+        if not freeform:
+            briefing = (RESUME_BRIEFING + (("\n\n" + profile_rules) if profile_rules else "")).strip()[:4000]
+        else:
+            briefing = (RESUME_BRIEFING + "\n\n" + briefing).strip()[:4000]
         if not topics:
             topics = ["projects", "internships", "ownership", "impact", "stack", "tradeoffs"]
     if not coding_on:
@@ -964,14 +967,18 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     topics = state.get("topics") or _loads(row.topics_json, [])
     briefing = state.get("interviewer_briefing") or ""
     resume_only = _is_resume_track(row.role_track, state)
-    dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id")) or resume_only
+    custom_id = int(state.get("moodle_interviewer_id") or 0)
+    dynamic_ok = bool(briefing) or bool(custom_id) or resume_only
     suggested = "concept" if resume_only else question_graph.suggested_format_for_turn(0, briefing)
-    node = None if resume_only else question_graph.pick_opening(
-        row.role_track,
-        topics,
-        briefing=briefing,
-        prefer_format=None,  # never force snippet openers
-    )
+    # Custom interviewers: skip bank opener so hashmap stems cannot bias the first question.
+    node = None
+    if not resume_only and custom_id <= 0:
+        node = question_graph.pick_opening(
+            row.role_track,
+            topics,
+            briefing=briefing,
+            prefer_format=None,
+        )
     if node:
         _activate_question(state, node)
     node_ctx = question_graph.node_context_for_llm(node, hint_level=0, dynamic_ok=dynamic_ok) if node else None

@@ -19,7 +19,8 @@ _LAST_ERROR: str = ""
 INTERVIEWER_SYSTEM = """You are a live voice technical interviewer for campus / early-career software roles.
 Introduce yourself using the session interviewer name when provided. Sound human: vary greetings, never reuse a canned script.
 Speak in 1–2 short sentences for acknowledgements. For code-snippet / predict-output turns you may use a short multi-line code block, then ONE clear question.
-Voice pacing (critical): spoken words outside any code fence must stay under ~40 words; prefer ≤25 words for follow-ups.
+Voice pacing: acknowledgements ≤15 words. Opening and next-topic questions may be 40–60 words so they are specific
+(name the topic, ask for a concrete example / trade-off / failure mode). Follow-ups ≤35 words.
 One short acknowledgement then ONE question — never monologue, lecture, or stack multiple questions.
 Never scold, shame, or lecture about "fuller answers" — stay calm and specific.
 No markdown headings, no bullet lists, no "as an AI".
@@ -35,8 +36,10 @@ Rules:
 - Probe, do not reveal. Prefer follow-ups that test understanding (DeepProbe style).
 - Hint ladder (you may only operate H0–H3): H0 none, H1 clarify, H2 soft probe, H3 directed nudge. Never H4 near-solution.
 - When question_node is provided AND dynamic_question_ok is false: stay on that competency; use spoken_now or a tight paraphrase.
-- When dynamic_question_ok is true OR a faculty briefing is present: invent fresh questions that FOLLOW THE FACULTY BRIEFING first
-  (topics, emphasis, difficulty, what to avoid). Do not ignore the briefing.
+- When dynamic_question_ok is true OR a faculty briefing is present: invent fresh questions that FOLLOW THE FACULTY BRIEFING /
+  CUSTOM INTERVIEWER RULES first (topics, emphasis, difficulty, what to avoid). Do not ignore them.
+- Never default to generic hash-map / Big-O / sorted-array openers unless those topics are explicitly listed.
+- Prefer: name a focus topic → ask for a concrete scenario, trade-off, edge case, or failure mode matching difficulty.
 - Default question style is spoken conceptual / trade-off. Only use code-snippet, predict-output, or find-the-bug
   when suggested_format is predict|debug|complexity OR the briefing explicitly asks for that style.
 - Do not jump to a NEW topic while the current question is still unanswered.
@@ -57,7 +60,7 @@ Rules:
 - If the candidate says they don't know / are not aware / cannot answer / skips, score MUST be exactly 0.
   Do not award partial credit for admitting ignorance. next_action=followup or next_topic is fine,
   but the score stays near zero.
-- Faculty briefing is the highest-priority topic guide when present — follow it closely.
+- Faculty briefing / custom interviewer rules are the highest-priority topic guide when present — follow them closely.
 
 Always respond with a single JSON object only (no markdown fences):
 {
@@ -595,7 +598,11 @@ def interviewer_turn(
         extras.append(
             "Invent questions that match the faculty briefing, custom rules, and topics list. "
             "Vary question angles every turn — do not reuse stems from the transcript. "
-            "Do not fall back to generic hash-map / Big-O openers unless the briefing asks for them."
+            "Do not fall back to generic hash-map / Big-O openers unless the briefing asks for them. "
+            "Each next_topic question must name a focus topic and ask for a concrete example, "
+            "trade-off, edge case, or failure mode matching difficulty="
+            + difficulty
+            + "."
         )
     system = system + "\n\nSession profile:\n- " + "\n- ".join(extras)
 
@@ -688,7 +695,7 @@ def interviewer_turn(
             {"role": "user", "content": json.dumps(user_payload)},
         ],
         temperature=0.65 if dynamic_ok else 0.45,
-        max_tokens=360 if resume_only else (280 if suggested_format in {"predict", "debug", "complexity"} else 220),
+        max_tokens=420 if resume_only else (320 if dynamic_ok else (280 if suggested_format in {"predict", "debug", "complexity"} else 220)),
     )
     data = _extract_json(raw or "")
     if not data or not str(data.get("reply") or "").strip():
@@ -813,8 +820,11 @@ def first_question(
         ask_rule = (
             "Follow the faculty briefing and custom interviewer rules for topics and emphasis. "
             f"{format_hint} "
-            "Do NOT default to generic hash-map / Big-O unless the briefing asks for it. "
-            + (f"Optional bank skill hint: {stem}" if stem else "")
+            "Pick ONE focus topic from the topics list (or briefing). Name it in the question. "
+            "Ask for a concrete example, trade-off, or failure mode matching difficulty="
+            f"{difficulty}. "
+            "Do NOT default to generic hash-map / Big-O / sorted-array unless those topics are listed. "
+            "Do not use bank stems."
         )
     else:
         ask_rule = (
@@ -847,9 +857,9 @@ def first_question(
                         "followup_depth": followup_depth,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
-                            f"You are {name}. Give ONE clean spoken intro (greet once, say you are {name}, "
-                            f"{coding_line}), then ask ONE technical question. "
-                            "Do not stack two greetings. Do not add random filler. "
+                            f"You are {name}. Give ONE clean spoken intro only once "
+                            f"(greet, say you are {name}, {coding_line}), then ask ONE specific technical question. "
+                            "Do not stack two greetings. Do not add random filler or a second intro. "
                             f"{ask_rule} "
                             "next_action=next_topic. hint_level=0."
                         ),
@@ -859,7 +869,7 @@ def first_question(
             },
         ],
         temperature=0.55 if resume_only else (0.7 if dynamic_ok else 0.55),
-        max_tokens=420,
+        max_tokens=480 if dynamic_ok else 420,
         timeout=30.0,
     )
     data = _extract_json(raw or "")

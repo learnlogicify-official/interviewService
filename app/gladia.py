@@ -58,10 +58,10 @@ def create_live_session(
         "bit_depth": 16,
         "sample_rate": int(sample_rate or 16000),
         "channels": 1,
-        # Endpoint after a pause — longer = fewer mid-sentence cuts; still responsive.
-        "endpointing": 1.25,
+        # Endpoint after a thinking pause — shorter values cut mid-answer.
+        "endpointing": 2.2,
         # Safety only — if noise never looks like silence, don't hang forever.
-        "maximum_duration_without_endpointing": 22,
+        "maximum_duration_without_endpointing": 28,
         "language_config": {
             "languages": [lang],
             "code_switching": False,
