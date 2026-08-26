@@ -23,6 +23,11 @@ class StartSessionRequest(BaseModel):
     interviewer_briefing: str = ""
     include_coding: bool = True
     moodle_interviewer_id: int = 0
+    difficulty: str = "intermediate"
+    pace: str = "standard"
+    question_mix: str = "conceptual"
+    followup_depth: str = "moderate"
+    avoid_topics: str = ""
     timestamp: int
     signature: str
 

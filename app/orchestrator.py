@@ -93,6 +93,98 @@ RESUME_BRIEFING = (
 )
 
 
+def _compose_profile_rules(
+    *,
+    style: str,
+    difficulty: str,
+    pace: str,
+    question_mix: str,
+    followup_depth: str,
+    avoid_topics: str,
+    include_coding: bool,
+    topics: list[str] | None = None,
+) -> str:
+    """Turn structured custom-interviewer settings into briefing rules the LLM must follow."""
+    style_rules = {
+        "friendly": "Tone: warm, encouraging, still rigorous. Acknowledge briefly before probing.",
+        "strict": "Tone: crisp and demanding. Push for precision; do not soft-pedal weak answers.",
+        "brief": "Tone: concise. Keep acknowledgements under ~8 words; one sharp question.",
+        "socratic": (
+            "Tone: Socratic coach. Prefer guided questions that make the candidate reason aloud; "
+            "rarely lecture. Dig into why/how before accepting surface answers."
+        ),
+        "supportive": (
+            "Tone: supportive mentor. Reduce anxiety with calm pacing; still score honestly. "
+            "Rephrase gently when answers are incomplete."
+        ),
+        "panel": (
+            "Tone: panel-style hiring bar. Professional, structured, evidence-seeking. "
+            "Ask for concrete examples, trade-offs, and measurable outcomes."
+        ),
+    }
+    difficulty_rules = {
+        "beginner": "Difficulty: beginner — fundamentals, definitions with examples, simple trade-offs.",
+        "intermediate": "Difficulty: intermediate — applied scenarios, trade-offs, edge cases.",
+        "advanced": "Difficulty: advanced — deeper design, failure modes, scale, and precision.",
+    }
+    pace_rules = {
+        "relaxed": "Pace: relaxed — allow fuller answers; fewer topic jumps; patient follow-ups.",
+        "standard": "Pace: standard campus screen — keep turns moving without rushing.",
+        "brisk": "Pace: brisk — short follow-ups; move on after one clear rephrase if still weak.",
+    }
+    mix_rules = {
+        "conceptual": "Question mix: spoken conceptual / trade-off. Avoid code-snippet formats unless briefing asks.",
+        "mixed": "Question mix: mostly conceptual with occasional applied scenarios; snippets only if useful.",
+        "behavioral": (
+            "Question mix: behavioral + ownership (STAR-style). Ask for situation, action THEY took, result. "
+            "Still technical when the claim is technical."
+        ),
+        "system_design": (
+            "Question mix: lightweight system / architecture design for early-career. "
+            "Components, data flow, bottlenecks — keep scope small for voice."
+        ),
+    }
+    depth_rules = {
+        "light": "Follow-up depth: light — at most one rephrase, then move topic.",
+        "moderate": "Follow-up depth: moderate — up to two probes on the same competency.",
+        "deep": "Follow-up depth: deep — up to three probes before changing topic.",
+    }
+    parts = [
+        "CUSTOM INTERVIEWER RULES (MUST FOLLOW — same rules for every turn):",
+        style_rules.get(style, style_rules["friendly"]),
+        difficulty_rules.get(difficulty, difficulty_rules["intermediate"]),
+        pace_rules.get(pace, pace_rules["standard"]),
+        mix_rules.get(question_mix, mix_rules["conceptual"]),
+        depth_rules.get(followup_depth, depth_rules["moderate"]),
+        "Coding editor: " + ("ENABLED later in the session." if include_coding else "DISABLED — spoken Q&A only."),
+    ]
+    topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()]
+    if topic_list:
+        parts.append("Focus topics (priority order): " + ", ".join(topic_list[:12]) + ".")
+    if avoid_topics:
+        parts.append("Do NOT ask about: " + avoid_topics.strip()[:400] + ".")
+    parts.append(
+        "Invent fresh questions aligned to these rules. Do not default to generic hash-map / Big-O openers "
+        "unless topics or briefing explicitly include them."
+    )
+    return "\n".join(parts)
+
+
+def _opening_already_greets(text: str, name: str) -> bool:
+    """True if the LLM opening already has a greeting or self-intro (avoid double intro)."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if re.search(r"(?i)\b(hi|hey|hello|welcome|good (morning|afternoon|evening))\b", t):
+        return True
+    n = (name or "").strip()
+    if n and n.lower() in t.lower():
+        return True
+    if re.search(r"(?i)\b(i'?m|i am|this is)\b", t[:120]):
+        return True
+    return False
+
+
 def _is_human_resume_line(ln: str) -> bool:
     s = (ln or "").strip()
     if len(s) < 8:
@@ -411,6 +503,11 @@ def start_session(
     interviewer_briefing: str = "",
     include_coding: bool = True,
     moodle_interviewer_id: int = 0,
+    difficulty: str = "intermediate",
+    pace: str = "standard",
+    question_mix: str = "conceptual",
+    followup_depth: str = "moderate",
+    avoid_topics: str = "",
 ) -> dict[str, Any]:
     session_id = uuid.uuid4().hex
     resume = _normalize_resume(resume_text)
@@ -420,20 +517,52 @@ def start_session(
         duration_minutes = 17
     name = (interviewer_name or "NexAI").strip()[:80] or "NexAI"
     style = (interviewer_style or "friendly").strip().lower()
-    if style not in {"friendly", "strict", "brief"}:
+    allowed_styles = {"friendly", "strict", "brief", "socratic", "supportive", "panel"}
+    if style not in allowed_styles:
         style = "friendly"
+    difficulty = (difficulty or "intermediate").strip().lower()
+    if difficulty not in {"beginner", "intermediate", "advanced"}:
+        difficulty = "intermediate"
+    pace = (pace or "standard").strip().lower()
+    if pace not in {"relaxed", "standard", "brisk"}:
+        pace = "standard"
+    question_mix = (question_mix or "conceptual").strip().lower()
+    if question_mix not in {"conceptual", "mixed", "behavioral", "system_design"}:
+        question_mix = "conceptual"
+    followup_depth = (followup_depth or "moderate").strip().lower()
+    if followup_depth not in {"light", "moderate", "deep"}:
+        followup_depth = "moderate"
+    avoid = " ".join((avoid_topics or "").split())[:500]
     briefing = " ".join((interviewer_briefing or "").split())[:4000]
+    # Structured custom-interviewer rules → always merged into briefing so the LLM
+    # and engine follow the same profile even when freeform briefing is empty.
+    profile_rules = _compose_profile_rules(
+        style=style,
+        difficulty=difficulty,
+        pace=pace,
+        question_mix=question_mix,
+        followup_depth=followup_depth,
+        avoid_topics=avoid,
+        include_coding=bool(include_coding),
+        topics=topics,
+    )
+    if profile_rules:
+        briefing = (briefing + "\n\n" + profile_rules).strip() if briefing else profile_rules
+        briefing = briefing[:4000]
     resume_only = _is_resume_track(role_track)
     coding_on = bool(include_coding) and not resume_only
     if resume_only:
         style = "strict"
-        if not briefing:
-            briefing = RESUME_BRIEFING
+        if not briefing or briefing == profile_rules:
+            briefing = RESUME_BRIEFING + (("\n\n" + profile_rules) if profile_rules else "")
+            briefing = briefing[:4000]
         if not topics:
             topics = ["projects", "internships", "ownership", "impact", "stack", "tradeoffs"]
     if not coding_on:
         moodle_problem_id = 0
         moodle_problem_title = ""
+    difficulty_ceiling = {"beginner": 1, "intermediate": 2, "advanced": 3}.get(difficulty, 2)
+    max_followups = {"light": 1, "moderate": 2, "deep": 3}.get(followup_depth, 2)
     state = {
         "topics": topics,
         "qa_index": 0,
@@ -465,8 +594,9 @@ def start_session(
         "asked_question_ids": [],
         "current_question_id": "",
         "current_hint_level": 0,
-        "difficulty_ceiling": 2,
+        "difficulty_ceiling": difficulty_ceiling,
         "followup_index": 0,
+        "max_followups_per_question": max_followups,
         "used_moodle_problems": [int(moodle_problem_id)] if int(moodle_problem_id or 0) else [],
         "moodle_problem_titles": [((moodle_problem_title or "").strip()[:180])] if (moodle_problem_title or "").strip() else [],
         "problems_solved_count": 0,
@@ -477,6 +607,11 @@ def start_session(
         "interviewer_style": style,
         "interviewer_briefing": briefing,
         "moodle_interviewer_id": int(moodle_interviewer_id or 0),
+        "difficulty": difficulty,
+        "pace": pace,
+        "question_mix": question_mix,
+        "followup_depth": followup_depth,
+        "avoid_topics": avoid,
     }
     if len(resume) >= 40:
         try:
@@ -520,16 +655,36 @@ def start_session(
         ]
     greet = greetings[int(uuid.uuid4().int % len(greetings))]
     try:
-        opening = _begin_qa(db, row, state)
+        opening = (_begin_qa(db, row, state) or "").strip()
     except Exception:
         opening = ""
-    spoken = opening or (
-        f"{greet} Walk me through the most technically demanding project on your resume — your role, the hardest bug, and how you measured success."
-        if resume_only
-        else f"{greet} When would you pick a hash map over a sorted array for lookups, and what's the trade-off?"
-    )
-    if spoken and name.lower() not in spoken.lower() and "nexai" not in spoken.lower():
-        spoken = f"{greet} {spoken}"
+    if opening:
+        # Prefer a single LLM (or planned) opening — never prepend a second canned intro.
+        spoken = opening
+        if not _opening_already_greets(spoken, name):
+            spoken = f"Hi {first}, I'm {name}. {spoken}"
+    else:
+        # Topic-aware offline fallback (avoid random hash-map when topics/briefing exist).
+        topic_hint = ""
+        tops = [str(t).strip() for t in (topics or []) if str(t).strip()]
+        if tops:
+            topic_hint = tops[0]
+        if resume_only:
+            fallback_q = (
+                "Walk me through the most technically demanding project on your resume — "
+                "your role, the hardest bug, and how you measured success."
+            )
+        elif topic_hint:
+            fallback_q = (
+                f"Looking at {topic_hint}: what should a strong candidate explain first, "
+                "and what trade-off would you call out?"
+            )
+        else:
+            fallback_q = (
+                "Tell me about a recent technical problem you solved — the constraint, "
+                "your approach, and how you knew it worked."
+            )
+        spoken = f"{greet} {fallback_q}"
     _add_turn(db, session_id, row.stage or "qa", "assistant", spoken)
     db.commit()
     db.refresh(row)
@@ -772,6 +927,11 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
         "resume_only": resume_only,
         "resume_dossier": state.get("resume_dossier") or {},
         "must_ask_next": _next_resume_item(state),
+        "difficulty": state.get("difficulty") or "intermediate",
+        "pace": state.get("pace") or "standard",
+        "question_mix": state.get("question_mix") or "conceptual",
+        "followup_depth": state.get("followup_depth") or "moderate",
+        "avoid_topics": state.get("avoid_topics") or "",
     }
     ctx.update(extra)
     return ctx
@@ -842,6 +1002,12 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
         resume_only=resume_only,
         resume_dossier=state.get("resume_dossier") or {},
         must_ask_next=_next_resume_item(state),
+        dynamic_question_ok=dynamic_ok,
+        difficulty=str(state.get("difficulty") or "intermediate"),
+        pace=str(state.get("pace") or "standard"),
+        question_mix=str(state.get("question_mix") or "conceptual"),
+        followup_depth=str(state.get("followup_depth") or "moderate"),
+        avoid_topics=str(state.get("avoid_topics") or ""),
     )
     if dynamic:
         if dynamic.get("question_id"):
@@ -1024,69 +1190,80 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         action = llm_result["next_action"]
         reported_hint = int(llm_result.get("hint_level", hint_now) or hint_now)
 
-        # Off-topic / very weak: never advance — force a rephrase follow-up.
+        # Off-topic / very weak: never advance — force a rephrase follow-up
+        # (unless follow-up depth budget is exhausted → move on).
+        max_fu = int(state.get("max_followups_per_question", 2) or 2)
+        fu_count = int(state.get("followup_index", 0) or 0)
+        dynamic_ok = (
+            bool(state.get("interviewer_briefing"))
+            or bool(state.get("moodle_interviewer_id"))
+            or _is_resume_track(row.role_track, state)
+        )
         if action != "followup" and (
             score < 40
             or llm_client.looks_incomplete_answer(answer)
             or llm_client.is_weak_answer(answer)
         ):
-            action = "followup"
+            if fu_count < max_fu:
+                action = "followup"
+            else:
+                action = "next_topic"
+                llm_result["reply"] = "Thanks — let's move to the next topic."
+                llm_result["next_action"] = "next_topic"
 
         # Never advance on weak LLM scores that re-ask.
         if action == "followup" and score < 55:
-            new_hint = evidence_ledger.bump_hint(
-                max(hint_now, reported_hint),
-                reason="followup",
-            )
-            state["current_hint_level"] = new_hint
-            state["followup_index"] = int(state.get("followup_index", 0) or 0) + 1
-            state["skill_graph"] = skill_graph.update_skill(
-                graph,
-                topic_tag=skill_tag or llm_result.get("topic_tag") or "",
-                score_0_100=score,
-                evidence=f"Follow-up H{new_hint}: {(answer or '')[:120]}",
-                weight=0.55 if score < 25 else 0.35,
-            )
-            evidence_ledger.record(
-                state,
-                stage="qa",
-                dimension="conceptual",
-                score=score,
-                skill=skill_tag,
-                question_id=qid,
-                hint_level=new_hint,
-                note=(answer or "")[:160],
-                source="llm",
-                elapsed=_elapsed(row),
-            )
-            # Prefer curated follow-up if the model drifted.
-            reply = llm_result["reply"]
-            if node and new_hint >= 1:
-                stem = question_graph.spoken_prompt(
-                    node,
-                    hint_level=new_hint,
-                    followup_index=int(state.get("followup_index", 0) or 0),
+            if fu_count >= max_fu:
+                # Depth budget used — accept score and move topic instead of looping.
+                action = "next_topic"
+                llm_result["reply"] = "Thanks — let's move to the next topic."
+                llm_result["next_action"] = "next_topic"
+            else:
+                new_hint = evidence_ledger.bump_hint(
+                    max(hint_now, reported_hint),
+                    reason="followup",
                 )
-                if "?" not in reply:
-                    lead = reply.rstrip()
-                    if not re.search(
-                        r"(?i)\b(didn'?t catch|rephrase|ask again|more simply|not sure)\b",
-                        lead,
-                    ):
-                        lead = "I'm not sure that answered it — let me ask again more simply."
-                    reply = f"{lead} {stem}".strip()
-                elif score < 35 and not re.search(
-                    r"(?i)\b(didn'?t catch|rephrase|again|more simply|not sure|unclear)\b",
-                    reply,
-                ):
-                    reply = f"I'm not sure that answered it. {reply}".strip()
-            elif score < 35 and "?" in reply and not re.search(
-                r"(?i)\b(didn'?t catch|rephrase|again|more simply|not sure|unclear)\b",
-                reply,
-            ):
-                reply = f"I'm not sure that answered it. {reply}".strip()
-            _save_state(row, state)
-            return reply
+                state["current_hint_level"] = new_hint
+                state["followup_index"] = fu_count + 1
+                state["skill_graph"] = skill_graph.update_skill(
+                    graph,
+                    topic_tag=skill_tag or llm_result.get("topic_tag") or "",
+                    score_0_100=score,
+                    evidence=f"Follow-up H{new_hint}: {(answer or '')[:120]}",
+                    weight=0.55 if score < 25 else 0.35,
+                )
+                evidence_ledger.record(
+                    state,
+                    stage="qa",
+                    dimension="conceptual",
+                    score=score,
+                    skill=skill_tag,
+                    question_id=qid,
+                    hint_level=new_hint,
+                    note=(answer or "")[:160],
+                    source="llm",
+                    elapsed=_elapsed(row),
+                )
+                reply = (llm_result.get("reply") or "").strip()
+                # Bank-stem injection only for non-custom bank mode — custom / briefing
+                # interviews must stay on the LLM (and faculty rules), not DSA stems.
+                if (not dynamic_ok) and node and new_hint >= 1:
+                    stem = question_graph.spoken_prompt(
+                        node,
+                        hint_level=new_hint,
+                        followup_index=int(state.get("followup_index", 0) or 0),
+                    )
+                    if "?" not in reply:
+                        lead = reply.rstrip() or "Let me rephrase."
+                        reply = f"{lead} {stem}".strip()
+                if not reply:
+                    reply = "I didn't catch a clear answer — could you rephrase that in one sentence?"
+                _save_state(row, state)
+                return reply
+
+        if action == "next_topic":
+            state["followup_index"] = 0
+            state["current_hint_level"] = 0
 
         state.setdefault("qa_scores", []).append(score)
         state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])

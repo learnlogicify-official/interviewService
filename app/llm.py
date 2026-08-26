@@ -541,6 +541,9 @@ def interviewer_turn(
         "friendly": "Tone: warm and encouraging, still rigorous.",
         "strict": "Tone: crisp and demanding. Push for precision; do not soft-pedal weak answers.",
         "brief": "Tone: concise. Keep acknowledgements short; questions can still include a tiny snippet.",
+        "socratic": "Tone: Socratic. Ask why/how probes that make them reason; avoid lecturing.",
+        "supportive": "Tone: calm and supportive. Rephrase gently; still score honestly.",
+        "panel": "Tone: panel / hiring-bar. Ask for concrete evidence, trade-offs, and outcomes.",
     }.get(style, "Tone: professional and clear.")
 
     system = INTERVIEWER_SYSTEM
@@ -548,20 +551,28 @@ def interviewer_turn(
     # Briefing first so the model treats it as primary.
     if briefing:
         extras.append(
-            "FACULTY BRIEFING (MUST FOLLOW — this decides topics and emphasis; "
-            "do not substitute a generic DSA script):\n"
-            f"{briefing[:2500]}"
+            "FACULTY BRIEFING / CUSTOM INTERVIEWER RULES (MUST FOLLOW — this decides topics, "
+            "difficulty, pace, mix, and what to avoid; do not substitute a generic DSA script):\n"
+            f"{briefing[:2800]}"
         )
+    difficulty = str(ctx.get("difficulty") or "intermediate")
+    pace = str(ctx.get("pace") or "standard")
+    question_mix = str(ctx.get("question_mix") or "conceptual")
+    followup_depth = str(ctx.get("followup_depth") or "moderate")
+    avoid_topics = str(ctx.get("avoid_topics") or "").strip()
     extras.extend(
         [
             f"Your spoken name for this session is {name}. Introduce yourself as {name}.",
             style_line,
+            f"difficulty={difficulty}; pace={pace}; question_mix={question_mix}; followup_depth={followup_depth}",
             f"dynamic_question_ok={str(dynamic_ok).lower()}",
             f"suggested_format={suggested_format} "
             "(only use predict/debug/complexity snippet styles when this is one of those "
             "OR the briefing explicitly asks; otherwise ask conceptual/trade-off questions).",
         ]
     )
+    if avoid_topics:
+        extras.append(f"Do NOT ask about: {avoid_topics[:400]}")
     if not include_coding:
         extras.append(
             "This profile has coding DISABLED. Do not mention an editor, NexPractice, or unlocking code."
@@ -582,7 +593,8 @@ def interviewer_turn(
             )
     if dynamic_ok:
         extras.append(
-            "Invent questions that match the faculty briefing and topics list. "
+            "Invent questions that match the faculty briefing, custom rules, and topics list. "
+            "Vary question angles every turn — do not reuse stems from the transcript. "
             "Do not fall back to generic hash-map / Big-O openers unless the briefing asks for them."
         )
     system = system + "\n\nSession profile:\n- " + "\n- ".join(extras)
@@ -643,6 +655,11 @@ def interviewer_turn(
         "include_coding": include_coding,
         "dynamic_question_ok": dynamic_ok,
         "suggested_format": suggested_format,
+        "difficulty": difficulty,
+        "pace": pace,
+        "question_mix": question_mix,
+        "followup_depth": followup_depth,
+        "avoid_topics": avoid_topics or None,
         "transcript": history,
         "candidate_just_said": (student_message or "")[:800],
         "stage_instructions": {
@@ -727,6 +744,12 @@ def first_question(
     resume_only: bool = False,
     resume_dossier: dict[str, Any] | None = None,
     must_ask_next: dict[str, Any] | None = None,
+    dynamic_question_ok: bool = False,
+    difficulty: str = "intermediate",
+    pace: str = "standard",
+    question_mix: str = "conceptual",
+    followup_depth: str = "moderate",
+    avoid_topics: str = "",
 ) -> dict[str, Any] | None:
     """Generate the opening conceptual question (anchored to question graph when provided)."""
     if not llm_configured():
@@ -736,7 +759,7 @@ def first_question(
     name = (interviewer_name or "NexAI").strip() or "NexAI"
     briefing = (interviewer_briefing or "").strip()
     resume_only = bool(resume_only) or str(role_track or "") == "resume_deep"
-    dynamic_ok = bool(briefing) or resume_only
+    dynamic_ok = bool(dynamic_question_ok) or bool(briefing) or resume_only
     suggested_format = "concept" if resume_only else suggested_format
     coding_line = (
         "mention this is a resume deep-dive with no coding editor"
@@ -758,13 +781,17 @@ def first_question(
     system = INTERVIEWER_SYSTEM
     if briefing:
         system += (
-            "\n\nFACULTY BRIEFING (MUST FOLLOW — primary guide for this interview):\n"
-            f"{briefing[:2500]}"
+            "\n\nFACULTY BRIEFING / CUSTOM INTERVIEWER RULES (MUST FOLLOW — primary guide):\n"
+            f"{briefing[:2800]}"
         )
     system += (
         f"\n\nYour name is {name}. dynamic_question_ok={str(dynamic_ok).lower()}. "
-        f"Style={interviewer_style}. suggested_format={suggested_format}."
+        f"Style={interviewer_style}. Difficulty={difficulty}. Pace={pace}. "
+        f"Question mix={question_mix}. Follow-up depth={followup_depth}. "
+        f"suggested_format={suggested_format}."
     )
+    if avoid_topics:
+        system += f" Do NOT ask about: {avoid_topics[:400]}."
     if resume_only:
         system += (
             " RESUME MODE: You already analyzed their resume. The first question MUST name "
@@ -784,7 +811,7 @@ def first_question(
         )
     elif dynamic_ok:
         ask_rule = (
-            "Follow the faculty briefing for topics and emphasis. "
+            "Follow the faculty briefing and custom interviewer rules for topics and emphasis. "
             f"{format_hint} "
             "Do NOT default to generic hash-map / Big-O unless the briefing asks for it. "
             + (f"Optional bank skill hint: {stem}" if stem else "")
@@ -814,11 +841,16 @@ def first_question(
                         "suggested_format": suggested_format,
                         "include_coding": include_coding,
                         "resume_only": resume_only,
+                        "difficulty": difficulty,
+                        "pace": pace,
+                        "question_mix": question_mix,
+                        "followup_depth": followup_depth,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
-                            f"You are {name}. Greet the candidate with a FRESH spoken intro "
-                            f"(never the same wording twice), say you are {name}, {coding_line}, "
-                            f"then ask ONE technical question. {ask_rule} "
+                            f"You are {name}. Give ONE clean spoken intro (greet once, say you are {name}, "
+                            f"{coding_line}), then ask ONE technical question. "
+                            "Do not stack two greetings. Do not add random filler. "
+                            f"{ask_rule} "
                             "next_action=next_topic. hint_level=0."
                         ),
                         "transcript": "(start)",

@@ -155,6 +155,11 @@ def start(body: StartSessionRequest, db: Session = Depends(get_db)) -> SessionSt
             interviewer_briefing=str(getattr(body, "interviewer_briefing", "") or ""),
             include_coding=bool(getattr(body, "include_coding", True)),
             moodle_interviewer_id=int(getattr(body, "moodle_interviewer_id", 0) or 0),
+            difficulty=str(getattr(body, "difficulty", "") or "intermediate"),
+            pace=str(getattr(body, "pace", "") or "standard"),
+            question_mix=str(getattr(body, "question_mix", "") or "conceptual"),
+            followup_depth=str(getattr(body, "followup_depth", "") or "moderate"),
+            avoid_topics=str(getattr(body, "avoid_topics", "") or ""),
         )
         return SessionStateOut(**view)
     except HTTPException:

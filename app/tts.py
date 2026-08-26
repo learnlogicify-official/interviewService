@@ -21,8 +21,8 @@ def synthesize(text: str) -> dict:
     settings = get_settings()
     key = _api_key()
     clean = " ".join((text or "").split())
-    if len(clean) > 520:
-        clean = clean[:520].rsplit(" ", 1)[0] + "."
+    if len(clean) > 900:
+        clean = clean[:900].rsplit(" ", 1)[0] + "."
     if not clean:
         return {"ok": False, "content_type": "", "audio_base64": "", "error": "empty text"}
     if not key:
