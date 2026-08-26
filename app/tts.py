@@ -49,7 +49,7 @@ def synthesize(text: str) -> dict:
                     "voice": voice,
                     "input": clean,
                     "response_format": "mp3",
-                    "speed": 1.12,
+                    "speed": 1.0,
                 },
             )
             if resp.status_code >= 400:

@@ -16,12 +16,12 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_tts_base_url: str = ""  # default: same as openai_base_url (use api.openai.com for TTS)
-    openai_tts_model: str = "tts-1"
-    openai_tts_voice: str = "alloy"
+    openai_tts_model: str = "tts-1-hd"
+    openai_tts_voice: str = "coral"
     openai_stt_base_url: str = ""
     openai_stt_model: str = "whisper-1"
     openai_realtime_model: str = "gpt-realtime"
-    openai_realtime_voice: str = "alloy"
+    openai_realtime_voice: str = "coral"
     # Prefer realtime WebRTC voice when client requests a token.
     voice_mode: str = "realtime"  # realtime|legacy
     # Gladia live STT — get key at https://app.gladia.io (API host: api.gladia.io)

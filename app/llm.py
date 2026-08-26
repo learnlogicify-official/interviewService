@@ -505,6 +505,88 @@ def analyze_resume(resume_text: str) -> dict[str, Any]:
     return dossier
 
 
+OBSERVER_SYSTEM = """You are a hidden technical observer for a live voice interview.
+You do NOT speak to the candidate. Judge the latest answer only.
+Return JSON only:
+{
+  "depth": "superficial" | "partial" | "solid" | "strong",
+  "score_hint": 0-100,
+  "gaps": ["missing idea 1", "missing idea 2"],
+  "probe": "ONE specific spoken follow-up question the interviewer should ask if probing",
+  "next_action_hint": "followup" | "next_topic",
+  "ack": "short natural ack like Got it. or Understood. (max 6 words)",
+  "notes": "one internal line for the interviewer"
+}
+Rules:
+- If the answer is vague / definition-only / incomplete → depth=superficial or partial, next_action_hint=followup,
+  probe must dig one level deeper (mechanism, trade-off, edge case, complexity, failure mode).
+- Never reveal the optimal solution in probe. Never say "use a hashmap" as the answer.
+- If solid/strong and on-topic → next_action_hint=next_topic; probe can be empty.
+- Keep probe under 40 words, spoken style.
+"""
+
+
+def observe_answer(
+    *,
+    stage: str,
+    role_track: str,
+    topics: list[str],
+    last_question: str,
+    student_message: str,
+    code_excerpt: str = "",
+    difficulty: str = "intermediate",
+) -> dict[str, Any] | None:
+    """Fast hidden analysis that steers the live interviewer toward Chakra-style probes."""
+    if not llm_configured():
+        return None
+    raw = chat(
+        [
+            {"role": "system", "content": OBSERVER_SYSTEM},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "stage": stage,
+                        "role_track": role_track,
+                        "topics": (topics or [])[:8],
+                        "difficulty": difficulty,
+                        "last_interviewer_question": (last_question or "")[:500],
+                        "candidate_just_said": (student_message or "")[:900],
+                        "code_excerpt": (code_excerpt or "")[:1200] or None,
+                    }
+                ),
+            },
+        ],
+        temperature=0.25,
+        max_tokens=220,
+        timeout=12.0,
+    )
+    data = _extract_json(raw or "")
+    if not data:
+        return None
+    depth = str(data.get("depth") or "partial").strip().lower()
+    if depth not in {"superficial", "partial", "solid", "strong"}:
+        depth = "partial"
+    action = str(data.get("next_action_hint") or "followup").strip().lower()
+    if action not in {"followup", "next_topic"}:
+        action = "followup"
+    try:
+        score_hint = float(data.get("score_hint", 50))
+    except Exception:
+        score_hint = 50.0
+    gaps = data.get("gaps") if isinstance(data.get("gaps"), list) else []
+    gaps = [str(g)[:120] for g in gaps[:4] if str(g).strip()]
+    return {
+        "depth": depth,
+        "score_hint": max(0.0, min(100.0, score_hint)),
+        "gaps": gaps,
+        "probe": str(data.get("probe") or "").strip()[:280],
+        "next_action_hint": action,
+        "ack": str(data.get("ack") or "Got it.").strip()[:48],
+        "notes": str(data.get("notes") or "").strip()[:220],
+    }
+
+
 def interviewer_turn(
     *,
     stage: str,
@@ -604,6 +686,20 @@ def interviewer_turn(
             + difficulty
             + "."
         )
+    observer = ctx.get("observer") if isinstance(ctx.get("observer"), dict) else None
+    if observer:
+        extras.append(
+            "TECHNICAL OBSERVER (hidden — MUST STEER THIS TURN):\n"
+            f"depth={observer.get('depth')}; score_hint={observer.get('score_hint')}; "
+            f"next_action_hint={observer.get('next_action_hint')}; "
+            f"gaps={observer.get('gaps')}; notes={observer.get('notes')}.\n"
+            f"Preferred probe: {observer.get('probe') or '(none)'}\n"
+            f"Preferred short ack: {observer.get('ack') or 'Got it.'}\n"
+            "If next_action_hint=followup: reply = short ack + the preferred probe "
+            "(paraphrase OK, keep the same depth of probe). next_action MUST be followup.\n"
+            "If next_action_hint=next_topic: brief ack then invent a NEW on-topic question; "
+            "do not re-ask the same stem."
+        )
     system = system + "\n\nSession profile:\n- " + "\n- ".join(extras)
 
     format_hint = {
@@ -667,6 +763,7 @@ def interviewer_turn(
         "question_mix": question_mix,
         "followup_depth": followup_depth,
         "avoid_topics": avoid_topics or None,
+        "observer": observer,
         "transcript": history,
         "candidate_just_said": (student_message or "")[:800],
         "stage_instructions": {

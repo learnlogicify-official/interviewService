@@ -1183,18 +1183,68 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         _save_state(row, state)
         return _close_qa_then_code(db, row, state)
 
+    # Hidden technical observer → steers adaptive probes (Chakra-style).
+    last_q = ""
+    try:
+        prev = _last_assistant_texts(db, row.id, limit=1)
+        last_q = prev[0] if prev else ""
+    except Exception:
+        last_q = ""
+    observer = None
+    try:
+        observer = llm_client.observe_answer(
+            stage="qa",
+            role_track=row.role_track,
+            topics=topics,
+            last_question=last_q,
+            student_message=answer,
+            code_excerpt=str(state.get("current_code") or "")[:1200],
+            difficulty=str(state.get("difficulty") or "intermediate"),
+        )
+    except Exception:
+        observer = None
+    if observer:
+        state["last_observer"] = observer
+        trail = state.setdefault("observer_trail", [])
+        trail.append({
+            "qa_index": idx,
+            "depth": observer.get("depth"),
+            "score_hint": observer.get("score_hint"),
+            "gaps": observer.get("gaps") or [],
+            "probe": (observer.get("probe") or "")[:160],
+        })
+        state["observer_trail"] = trail[-24:]
+
+    ctx = _llm_context(row, state)
+    if observer:
+        ctx["observer"] = observer
+
     llm_result = llm_client.interviewer_turn(
         stage="qa",
         role_track=row.role_track,
         topics=topics,
         transcript=_recent_transcript(db, row.id),
         student_message=answer,
-        context=_llm_context(row, state),
+        context=ctx,
     )
 
     if llm_result:
-        score = llm_client.clamp_answer_score(answer, float(llm_result["score"]))
+        # Prefer observer score hint when the model is overly generous on thin answers.
+        model_score = float(llm_result["score"])
+        if observer and observer.get("depth") in {"superficial", "partial"}:
+            model_score = min(model_score, float(observer.get("score_hint", model_score)))
+        score = llm_client.clamp_answer_score(answer, model_score)
         action = llm_result["next_action"]
+        if observer and observer.get("next_action_hint") == "followup" and action == "next_topic":
+            # Observer says still shallow — force a probe unless depth budget exhausted.
+            max_fu = int(state.get("max_followups_per_question", 2) or 2)
+            if int(state.get("followup_index", 0) or 0) < max_fu:
+                action = "followup"
+                probe = str(observer.get("probe") or "").strip()
+                ack = str(observer.get("ack") or "Got it.").strip()
+                if probe and "?" in probe:
+                    llm_result["reply"] = f"{ack} {probe}".strip()
+                llm_result["next_action"] = "followup"
         reported_hint = int(llm_result.get("hint_level", hint_now) or hint_now)
 
         # Off-topic / very weak: never advance — force a rephrase follow-up

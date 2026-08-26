@@ -27,9 +27,9 @@ def interviewer_instructions(
 ) -> str:
     first = (student_name or "there").split()[0]
     return (
-        "You are NexInterview, a professional live voice technical interviewer. "
+        "You are NexInterview, a calm professional live voice technical interviewer. "
         f"The candidate's first name is {first}. Role track: {role_track}. Current stage: {stage}. "
-        "Speak in short, natural spoken sentences. Be concise and professional. "
+        "Speak warmly at a natural conversational pace — not rushed, not monotone. "
         "CRITICAL: Do NOT invent interview questions or advance the interview on your own. "
         "Only speak lines that the interview engine asks you to say (via response instructions). "
         "If the candidate interrupts you, stop immediately and listen. "
@@ -74,9 +74,9 @@ def create_client_secret(
                     "transcription": {"model": "gpt-4o-mini-transcribe"},
                     "turn_detection": {
                         "type": "server_vad",
-                        "threshold": 0.5,
-                        "prefix_padding_ms": 300,
-                        "silence_duration_ms": 700,
+                        "threshold": 0.55,
+                        "prefix_padding_ms": 350,
+                        "silence_duration_ms": 2000,
                         "create_response": False,
                         "interrupt_response": True,
                     },
@@ -119,9 +119,9 @@ def create_client_secret(
                             "input_audio_transcription": {"model": "gpt-4o-mini-transcribe"},
                             "turn_detection": {
                                 "type": "server_vad",
-                                "threshold": 0.5,
-                                "prefix_padding_ms": 300,
-                                "silence_duration_ms": 700,
+                                "threshold": 0.55,
+                                "prefix_padding_ms": 350,
+                                "silence_duration_ms": 2000,
                                 "create_response": False,
                             },
                         },
