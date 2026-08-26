@@ -361,16 +361,26 @@ def _elapsed(row: SessionRow) -> int:
     return max(0, int(row.duration_minutes) * 60 - _seconds_remaining(row))
 
 
-def _phase_bounds(row: SessionRow) -> tuple[int, int]:
-    """Return (qa_seconds, wrap_seconds) from 30% / 65% / 5% of the session."""
+def _phase_bounds(row: SessionRow, state: dict[str, Any] | None = None) -> tuple[int, int]:
+    """Return (qa_seconds, wrap_seconds).
+
+    Default ~30% Q&A / ~5% wrap (rest coding). Custom interviewers may set
+    qa_seconds explicitly so a 30-minute screen can be e.g. 10 min technical + coding.
+    """
     settings = get_settings()
     total = max(10, int(row.duration_minutes or 17)) * 60
-    # Load include_coding from state when available — callers that only have row
-    # still get default coding split.
-    qa_share = float(settings.qa_share or 0.30)
+    st = state if isinstance(state, dict) else (_loads(row.state_json, {}) or {})
     wrap_share = float(settings.wrap_share or 0.05)
-    qa = int(settings.qa_seconds) if int(settings.qa_seconds or 0) > 0 else int(total * qa_share)
     wrap = int(settings.wrap_seconds) if int(settings.wrap_seconds or 0) > 0 else max(30, int(total * wrap_share))
+    qa_override = int(st.get("qa_seconds") or 0)
+    if qa_override > 0:
+        # Leave at least 2 minutes for coding (when enabled) + wrap.
+        floor = 60
+        ceiling = max(floor, total - wrap - 120)
+        qa = max(floor, min(ceiling, qa_override))
+    else:
+        qa_share = float(settings.qa_share or 0.30)
+        qa = int(settings.qa_seconds) if int(settings.qa_seconds or 0) > 0 else int(total * qa_share)
     return qa, wrap
 
 
@@ -381,14 +391,14 @@ def _include_coding(state: dict[str, Any]) -> bool:
 def _should_enter_coding(row: SessionRow, state: dict[str, Any]) -> bool:
     if not _include_coding(state):
         return False
-    qa_secs, _wrap = _phase_bounds(row)
+    qa_secs, _wrap = _phase_bounds(row, state)
     # Conceptual-only profiles: stretch Q&A until wrap window.
     return _elapsed(row) >= qa_secs or bool(state.get("coding_after_answer"))
 
 
 def _qa_budget_seconds(row: SessionRow, state: dict[str, Any]) -> int:
     """When coding is off, keep Q&A until the wrap window."""
-    qa, wrap = _phase_bounds(row)
+    qa, wrap = _phase_bounds(row, state)
     if not _include_coding(state):
         total = max(10, int(row.duration_minutes or 17)) * 60
         return max(qa, total - wrap)
@@ -405,8 +415,8 @@ def _awaiting_student_reply(db: Session, row: SessionRow) -> bool:
     return bool(last and last.role == "assistant")
 
 
-def _should_wrap(row: SessionRow) -> bool:
-    _qa, wrap = _phase_bounds(row)
+def _should_wrap(row: SessionRow, state: dict[str, Any] | None = None) -> bool:
+    _qa, wrap = _phase_bounds(row, state)
     return _seconds_remaining(row) <= wrap
 
 
@@ -508,6 +518,7 @@ def start_session(
     question_mix: str = "conceptual",
     followup_depth: str = "moderate",
     avoid_topics: str = "",
+    qa_minutes: int = 0,
 ) -> dict[str, Any]:
     session_id = uuid.uuid4().hex
     resume = _normalize_resume(resume_text)
@@ -515,7 +526,9 @@ def start_session(
     duration_minutes = int(duration_minutes or settings.default_duration_minutes or 17)
     if duration_minutes < 10 or duration_minutes > 45:
         duration_minutes = 17
-    name = (interviewer_name or "NexAI").strip()[:80] or "NexAI"
+    # Spoken identity is always NexAI. Custom profile name is hub/display only.
+    name = "NexAI"
+    profile_label = (interviewer_name or "").strip()[:80]
     style = (interviewer_style or "friendly").strip().lower()
     allowed_styles = {"friendly", "strict", "brief", "socratic", "supportive", "panel"}
     if style not in allowed_styles:
@@ -533,8 +546,8 @@ def start_session(
     if followup_depth not in {"light", "moderate", "deep"}:
         followup_depth = "moderate"
     avoid = " ".join((avoid_topics or "").split())[:500]
-    freeform = " ".join((interviewer_briefing or "").split())[:2500]
-    # Structured custom-interviewer rules FIRST so LLM truncate cannot drop them.
+    freeform = " ".join((interviewer_briefing or "").split())[:3500]
+    # Structured custom-interviewer rules; faculty freeform briefing is highest priority.
     profile_rules = _compose_profile_rules(
         style=style,
         difficulty=difficulty,
@@ -545,20 +558,30 @@ def start_session(
         include_coding=bool(include_coding),
         topics=topics,
     )
-    if profile_rules and freeform:
-        briefing = (profile_rules + "\n\nFACULTY NOTES:\n" + freeform).strip()[:4000]
+    if freeform and profile_rules:
+        briefing = (
+            "FACULTY BRIEFING (HIGHEST PRIORITY — follow these instructions closely):\n"
+            + freeform
+            + "\n\n"
+            + profile_rules
+        ).strip()[:6000]
+    elif freeform:
+        briefing = (
+            "FACULTY BRIEFING (HIGHEST PRIORITY — follow these instructions closely):\n"
+            + freeform
+        ).strip()[:6000]
     elif profile_rules:
-        briefing = profile_rules[:4000]
+        briefing = profile_rules[:6000]
     else:
-        briefing = freeform[:4000]
+        briefing = ""
     resume_only = _is_resume_track(role_track)
     coding_on = bool(include_coding) and not resume_only
     if resume_only:
         style = "strict"
         if not freeform:
-            briefing = (RESUME_BRIEFING + (("\n\n" + profile_rules) if profile_rules else "")).strip()[:4000]
+            briefing = (RESUME_BRIEFING + (("\n\n" + profile_rules) if profile_rules else "")).strip()[:6000]
         else:
-            briefing = (RESUME_BRIEFING + "\n\n" + briefing).strip()[:4000]
+            briefing = (RESUME_BRIEFING + "\n\n" + briefing).strip()[:6000]
         if not topics:
             topics = ["projects", "internships", "ownership", "impact", "stack", "tradeoffs"]
     if not coding_on:
@@ -566,6 +589,11 @@ def start_session(
         moodle_problem_title = ""
     difficulty_ceiling = {"beginner": 1, "intermediate": 2, "advanced": 3}.get(difficulty, 2)
     max_followups = {"light": 1, "moderate": 2, "deep": 3}.get(followup_depth, 2)
+    # Optional explicit Q&A minutes (custom interviewer). 0 = use default share.
+    qa_mins = int(qa_minutes or 0)
+    if qa_mins > 0:
+        qa_mins = max(1, min(duration_minutes - 2, qa_mins))
+    qa_seconds = qa_mins * 60 if qa_mins > 0 else 0
     state = {
         "topics": topics,
         "qa_index": 0,
@@ -607,6 +635,7 @@ def start_session(
         "include_coding": coding_on,
         "resume_only": resume_only,
         "interviewer_name": name,
+        "interviewer_profile_label": profile_label,
         "interviewer_style": style,
         "interviewer_briefing": briefing,
         "moodle_interviewer_id": int(moodle_interviewer_id or 0),
@@ -615,6 +644,8 @@ def start_session(
         "question_mix": question_mix,
         "followup_depth": followup_depth,
         "avoid_topics": avoid,
+        "qa_seconds": qa_seconds,
+        "qa_minutes": qa_mins,
     }
     if len(resume) >= 40:
         try:

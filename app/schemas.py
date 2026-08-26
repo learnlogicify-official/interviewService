@@ -28,6 +28,7 @@ class StartSessionRequest(BaseModel):
     question_mix: str = "conceptual"
     followup_depth: str = "moderate"
     avoid_topics: str = ""
+    qa_minutes: int = 0
     timestamp: int
     signature: str
 

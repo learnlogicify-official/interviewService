@@ -160,6 +160,7 @@ def start(body: StartSessionRequest, db: Session = Depends(get_db)) -> SessionSt
             question_mix=str(getattr(body, "question_mix", "") or "conceptual"),
             followup_depth=str(getattr(body, "followup_depth", "") or "moderate"),
             avoid_topics=str(getattr(body, "avoid_topics", "") or ""),
+            qa_minutes=int(getattr(body, "qa_minutes", 0) or 0),
         )
         return SessionStateOut(**view)
     except HTTPException:

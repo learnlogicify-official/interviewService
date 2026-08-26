@@ -17,7 +17,7 @@ logger = logging.getLogger("interview.llm")
 _LAST_ERROR: str = ""
 
 INTERVIEWER_SYSTEM = """You are a live voice technical interviewer for campus / early-career software roles.
-Introduce yourself using the session interviewer name when provided. Sound human: vary greetings, never reuse a canned script.
+Introduce yourself as NexAI only (never a custom profile title). Sound human: vary greetings, never reuse a canned script.
 Speak in 1–2 short sentences for acknowledgements. For code-snippet / predict-output turns you may use a short multi-line code block, then ONE clear question.
 Voice pacing: acknowledgements ≤15 words. Opening and next-topic questions may be 40–60 words so they are specific
 (name the topic, ask for a concrete example / trade-off / failure mode). Follow-ups ≤35 words.
@@ -614,7 +614,7 @@ def interviewer_turn(
     must_ask = ctx.get("must_ask_next") or {}
     weak = is_weak_answer(student_message)
     incomplete = looks_incomplete_answer(student_message)
-    name = (ctx.get("interviewer_name") or "NexAI").strip() or "NexAI"
+    name = "NexAI"
     style = (ctx.get("interviewer_style") or "friendly").strip().lower()
     briefing = (ctx.get("interviewer_briefing") or "").strip()
     include_coding = bool(ctx.get("include_coding", True))
@@ -638,7 +638,7 @@ def interviewer_turn(
         extras.append(
             "FACULTY BRIEFING / CUSTOM INTERVIEWER RULES (MUST FOLLOW — this decides topics, "
             "difficulty, pace, mix, and what to avoid; do not substitute a generic DSA script):\n"
-            f"{briefing[:2800]}"
+            f"{briefing[:4500]}"
         )
     difficulty = str(ctx.get("difficulty") or "intermediate")
     pace = str(ctx.get("pace") or "standard")
@@ -647,7 +647,8 @@ def interviewer_turn(
     avoid_topics = str(ctx.get("avoid_topics") or "").strip()
     extras.extend(
         [
-            f"Your spoken name for this session is {name}. Introduce yourself as {name}.",
+            "Your spoken name is always NexAI. Introduce yourself only as NexAI — "
+            "never use a custom profile title as your name.",
             style_line,
             f"difficulty={difficulty}; pace={pace}; question_mix={question_mix}; followup_depth={followup_depth}",
             f"dynamic_question_ok={str(dynamic_ok).lower()}",
@@ -860,7 +861,7 @@ def first_question(
         return None
     node = question_node or {}
     stem = str(node.get("spoken_now") or node.get("stem") or "").strip()
-    name = (interviewer_name or "NexAI").strip() or "NexAI"
+    name = "NexAI"
     briefing = (interviewer_briefing or "").strip()
     resume_only = bool(resume_only) or str(role_track or "") == "resume_deep"
     dynamic_ok = bool(dynamic_question_ok) or bool(briefing) or resume_only
@@ -886,10 +887,11 @@ def first_question(
     if briefing:
         system += (
             "\n\nFACULTY BRIEFING / CUSTOM INTERVIEWER RULES (MUST FOLLOW — primary guide):\n"
-            f"{briefing[:2800]}"
+            f"{briefing[:4500]}"
         )
     system += (
-        f"\n\nYour name is {name}. dynamic_question_ok={str(dynamic_ok).lower()}. "
+        "\n\nYour spoken name is always NexAI. Introduce yourself only as NexAI, never as a custom profile title. "
+        f"dynamic_question_ok={str(dynamic_ok).lower()}. "
         f"Style={interviewer_style}. Difficulty={difficulty}. Pace={pace}. "
         f"Question mix={question_mix}. Follow-up depth={followup_depth}. "
         f"suggested_format={suggested_format}."
@@ -954,9 +956,10 @@ def first_question(
                         "followup_depth": followup_depth,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
-                            f"You are {name}. Give ONE clean spoken intro only once "
-                            f"(greet, say you are {name}, {coding_line}), then ask ONE specific technical question. "
+                            "You are NexAI. Give ONE clean spoken intro only once "
+                            f"(greet, say you are NexAI, {coding_line}), then ask ONE specific technical question. "
                             "Do not stack two greetings. Do not add random filler or a second intro. "
+                            "Never introduce yourself with a custom interviewer profile title. "
                             f"{ask_rule} "
                             "next_action=next_topic. hint_level=0."
                         ),
