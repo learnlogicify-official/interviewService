@@ -690,6 +690,8 @@ def start_session(
     greet = greetings[int(uuid.uuid4().int % len(greetings))]
     try:
         opening = (_begin_qa(db, row, state) or "").strip()
+        if opening:
+            opening = _ensure_specific_question(db, row, state, opening)
     except Exception:
         opening = ""
     if opening:
@@ -938,12 +940,172 @@ def _resume_questions_allowed(row: SessionRow, state: dict[str, Any]) -> bool:
     return any(k in briefing for k in ("resume", "cv ", " cv", "their projects", "past projects"))
 
 
+def _topic_locked(row: SessionRow, state: dict[str, Any]) -> bool:
+    """True when a custom / briefed interview must stay inside its configured topics."""
+    if _is_resume_track(row.role_track, state):
+        return False
+    dynamic_ok = (
+        bool(state.get("interviewer_briefing"))
+        or bool(state.get("moodle_interviewer_id"))
+    )
+    return bool(_configured_topics(state)) and dynamic_ok
+
+
 def _focus_topic(state: dict[str, Any]) -> str:
-    """Rotate through the configured topics so every turn stays inside the faculty list."""
+    """Current topic from the faculty list, rotated by the topic cursor."""
     topics = _configured_topics(state)
     if not topics:
         return ""
-    return topics[int(state.get("qa_index", 0) or 0) % len(topics)]
+    cursor = int(state.get("topic_cursor", 0) or 0)
+    return topics[cursor % len(topics)]
+
+
+# Consecutive questions allowed on one configured topic before rotating away.
+MAX_TURNS_PER_TOPIC = 3
+
+
+def _advance_focus_topic(state: dict[str, Any]) -> str:
+    """Move to the next configured topic; returns the new focus topic."""
+    topics = _configured_topics(state)
+    if not topics:
+        state["topic_turns"] = 0
+        return ""
+    current = _focus_topic(state)
+    covered = state.setdefault("covered_topics", [])
+    if current and current not in covered:
+        covered.append(current)
+    state["topic_cursor"] = int(state.get("topic_cursor", 0) or 0) + 1
+    state["topic_turns"] = 0
+    return _focus_topic(state)
+
+
+def _note_topic_turn(state: dict[str, Any]) -> None:
+    """Count questions asked on the current topic and rotate when it is exhausted."""
+    if not _configured_topics(state):
+        return
+    turns = int(state.get("topic_turns", 0) or 0) + 1
+    state["topic_turns"] = turns
+    if turns >= MAX_TURNS_PER_TOPIC:
+        _advance_focus_topic(state)
+
+
+def _move_on_bridge(state: dict[str, Any]) -> str:
+    """
+    Short, non-judgemental bridge used when the engine changes topic.
+
+    Never mentions scoring, weakness, or readiness — that is what made earlier
+    sessions read as rude.
+    """
+    style = str(state.get("interviewer_style") or "friendly").strip().lower()
+    variants = {
+        "friendly": [
+            "No problem — let's try a different angle.",
+            "All good, let's switch things up.",
+            "That's fine — here's something else.",
+        ],
+        "supportive": [
+            "That's completely fine — let's move on.",
+            "No worries at all, next one.",
+        ],
+        "strict": ["Let's move on.", "Next area."],
+        "brief": ["Moving on.", "Next one."],
+        "socratic": ["Let's come at this from another side.", "Different angle then."],
+        "panel": ["Understood — let's change topic.", "Fine, next area."],
+    }.get(style, ["Let's move on to something else.", "Thanks — next area."])
+    idx = int(state.get("bridge_index", 0) or 0)
+    state["bridge_index"] = idx + 1
+    return variants[idx % len(variants)]
+
+
+_GENERIC_SKILL_TAGS = {
+    "self-introduction",
+    "self introduction",
+    "opening",
+    "intro",
+    "introduction",
+}
+
+
+def _evidence_skill(state: dict[str, Any], node: dict[str, Any] | None, extra: str = "") -> str:
+    """Skill tag for the evidence ledger — never leave it stuck on 'self-introduction'."""
+    if node:
+        try:
+            return f"{node['skill'][0]}.{node['skill'][1]}"
+        except Exception:
+            pass
+    tag = str(extra or state.get("current_qa_id") or _focus_topic(state) or "").strip()
+    if tag.lower() in _GENERIC_SKILL_TAGS:
+        tag = _focus_topic(state) or tag
+    return tag[:80]
+
+
+def _ensure_specific_question(
+    db: Session,
+    row: SessionRow,
+    state: dict[str, Any],
+    reply: str,
+) -> str:
+    """
+    Last-line guard: never speak a rude, scored, vague, or off-lock DSA question.
+
+    Does not advance the topic cursor — the engine already chose the topic.
+    """
+    topics = _configured_topics(state)
+    text = llm_client.strip_spoken_meta(reply or "")
+    if (
+        text
+        and not llm_client.is_vague_question(text)
+        and not llm_client.is_off_lock_dsa(text, topics)
+    ):
+        return text
+    generated = None
+    try:
+        generated = llm_client.topic_question(
+            role_track=row.role_track,
+            topics=topics or (state.get("topics") or []),
+            focus_topic=_focus_topic(state),
+            difficulty=str(state.get("difficulty") or "intermediate"),
+            interviewer_style=str(state.get("interviewer_style") or "friendly"),
+            interviewer_briefing=str(state.get("interviewer_briefing") or ""),
+            asked_questions=_asked_question_texts(db, row),
+            transcript=_recent_transcript(db, row.id, limit=6),
+            bridge_hint=_move_on_bridge(state),
+            resume_questions_allowed=_resume_questions_allowed(row, state),
+        )
+    except Exception:
+        generated = None
+    if generated and generated.get("reply"):
+        cand = llm_client.strip_spoken_meta(str(generated["reply"]))
+        if (
+            cand
+            and not llm_client.is_vague_question(cand)
+            and not llm_client.is_off_lock_dsa(cand, topics)
+        ):
+            if generated.get("topic_tag"):
+                state["current_qa_id"] = str(generated["topic_tag"])[:80]
+            elif _focus_topic(state):
+                state["current_qa_id"] = _focus_topic(state)[:80]
+            _save_state(row, state)
+            return cand
+    if _focus_topic(state):
+        state["current_qa_id"] = _focus_topic(state)[:80]
+    stem = _offline_topic_question(state, None)
+    lead = _move_on_bridge(state)
+    _save_state(row, state)
+    return f"{lead} {stem}".strip()
+
+
+def _asked_question_texts(db: Session, row: SessionRow, limit: int = 8) -> list[str]:
+    """Recent interviewer questions, so new questions do not repeat them."""
+    out: list[str] = []
+    try:
+        for text in _last_assistant_texts(db, row.id, limit=limit):
+            clean = " ".join(str(text or "").split())
+            if "?" in clean:
+                out.append(clean[:220])
+    except Exception:
+        return []
+    return list(reversed(out))
 
 
 def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[str, Any]:
@@ -1015,17 +1177,157 @@ def _activate_question(state: dict[str, Any], node: dict[str, Any] | None) -> No
         topics.append(tag)
 
 
+# Concrete offline stems per topic keyword. Used only when the LLM cannot answer —
+# they still have to sound like a real interviewer question, not a template.
+_TOPIC_STEMS: list[tuple[tuple[str, ...], list[str]]] = [
+    (
+        ("java", "jvm", "spring"),
+        [
+            "In Java, you loop over an ArrayList of orders and call remove() on the cancelled ones "
+            "inside that loop. What happens at runtime, and what would you do instead?",
+            "You have a Java class used as a HashMap key and you override equals but not hashCode. "
+            "What breaks when you look values up, and why?",
+        ],
+    ),
+    (
+        ("python",),
+        [
+            "In Python, a function takes an empty list as a default argument and appends to it. "
+            "Call it three times — what do you see, and why?",
+            "You need to strip duplicates from a 2 million row CSV in Python without blowing memory. "
+            "What do you reach for, and where does it get expensive?",
+        ],
+    ),
+    (
+        ("oop", "object oriented", "object-oriented", "design principle", "solid"),
+        [
+            "You have a PaymentProcessor class that handles cards, wallets, and refunds in one file. "
+            "How would you break it up, and what specifically improves?",
+            "Give me one case from your own code where inheritance was the wrong call and composition "
+            "would have been better. What went wrong?",
+        ],
+    ),
+    (
+        ("database", "sql", "postgres", "mysql", "query"),
+        [
+            "A report query on a 5 million row orders table takes 40 seconds. Walk me through the first "
+            "two things you check, and what you would change.",
+            "You add an index and the query gets slower. Give me one concrete reason that happens.",
+        ],
+    ),
+    (
+        ("data structure", "algorithm", "dsa", "stack", "queue", "tree", "graph"),
+        [
+            "Your array-backed queue has 100 slots. After 100 enqueues and 60 dequeues an enqueue fails "
+            "even though 60 slots are free. What is going on, and how do you fix it?",
+            "You are matching brackets in a 50 000 character file. Which structure do you use, and what "
+            "input makes a naive version fail?",
+        ],
+    ),
+    (
+        ("web", "react", "frontend", "javascript", "api", "rest", "node"),
+        [
+            "A user double-clicks Submit and the order is created twice. Where do you fix that, and why "
+            "there rather than the button?",
+            "Your list page refetches everything after each edit and feels sluggish. What would you change "
+            "first, and what is the trade-off?",
+        ],
+    ),
+    (
+        ("system design", "architecture", "scalab", "microservice", "cloud", "devops"),
+        [
+            "One service writes to the database and another reads it two seconds later and sees stale data. "
+            "How would you handle that, and what do you give up?",
+            "Your service is fine at 100 requests a second and falls over at 500. What do you measure first, "
+            "and what is your first change?",
+        ],
+    ),
+    (
+        ("testing", "quality", "debug"),
+        [
+            "A test passes locally and fails in CI about one run in five. How do you track that down?",
+            "You have 20 minutes to test a new discount-code feature. What do you actually test, and what "
+            "do you deliberately skip?",
+        ],
+    ),
+]
+
+
 def _offline_topic_question(state: dict[str, Any], node: dict[str, Any] | None) -> str:
     """Fallback question when the LLM is unavailable — stay on the configured topics."""
     focus = _focus_topic(state)
+    variant = int(state.get("offline_q_index", 0) or 0)
+    state["offline_q_index"] = variant + 1
     if focus:
+        low = focus.lower()
+        for keys, stems in _TOPIC_STEMS:
+            if any(k in low for k in keys):
+                return stems[variant % len(stems)]
         return (
-            f"Let's start with {focus}. Walk me through how you'd approach it in a real project, "
-            "and call out one trade-off you'd have to make."
+            f"Staying on {focus}: describe one specific situation where you used it, the decision you "
+            "had to make, and what nearly went wrong."
         )
     if node and node.get("stem"):
         return str(node["stem"])
-    return "Tell me about a challenging technical problem you solved recently."
+    return (
+        "Tell me about one technical problem you fixed recently — what was actually broken, "
+        "and how did you find it?"
+    )
+
+
+def _next_topic_turn(
+    db: Session,
+    row: SessionRow,
+    state: dict[str, Any],
+    *,
+    bridge: str = "",
+) -> str:
+    """
+    Change topic with a real, specific question.
+
+    The engine decides to move on in several places (weak answer, exhausted
+    follow-up budget, declined question). Every one of those used to speak a
+    canned "let's move to the next topic" line, so this is the single path that
+    turns that decision into an actual interview question.
+    """
+    lead = (bridge or _move_on_bridge(state)).strip()
+    focus = _advance_focus_topic(state)
+    generated = None
+    try:
+        generated = llm_client.topic_question(
+            role_track=row.role_track,
+            topics=_configured_topics(state) or (state.get("topics") or []),
+            focus_topic=focus,
+            difficulty=str(state.get("difficulty") or "intermediate"),
+            interviewer_style=str(state.get("interviewer_style") or "friendly"),
+            interviewer_briefing=str(state.get("interviewer_briefing") or ""),
+            asked_questions=_asked_question_texts(db, row),
+            transcript=_recent_transcript(db, row.id, limit=6),
+            bridge_hint=lead,
+            resume_questions_allowed=_resume_questions_allowed(row, state),
+        )
+    except Exception:
+        generated = None
+
+    state["current_question_id"] = ""
+    state["followup_index"] = 0
+    state["current_hint_level"] = 0
+    _note_topic_turn(state)
+    if generated and generated.get("reply"):
+        if generated.get("topic_tag"):
+            state["current_qa_id"] = str(generated["topic_tag"])[:80]
+        elif focus:
+            state["current_qa_id"] = focus[:80]
+        _save_state(row, state)
+        return str(generated["reply"]).strip()
+
+    if focus:
+        state["current_qa_id"] = focus[:80]
+    question = _offline_topic_question(state, None)
+    _save_state(row, state)
+    if lead and not lead.endswith((".", "!", "?")):
+        lead += "."
+    return f"{lead} {question}".strip()
 
 
 def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
@@ -1098,10 +1400,16 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
             # LLM invented the opener — keep skill tag soft, clear rigid bank lock.
             state["current_question_id"] = ""
             if dynamic.get("topic_tag"):
-                state["current_qa_id"] = str(dynamic["topic_tag"])[:80]
+                tag = str(dynamic["topic_tag"])[:80]
+                if tag.lower() in _GENERIC_SKILL_TAGS:
+                    tag = _focus_topic(state) or tag
+                state["current_qa_id"] = tag
+            elif _focus_topic(state):
+                state["current_qa_id"] = _focus_topic(state)[:80]
         state["llm_mode"] = True
         if resume_only:
             state["resume_plan_index"] = int(state.get("resume_plan_index") or 0) + 1
+        _note_topic_turn(state)
         _save_state(row, state)
         return dynamic["reply"]
 
@@ -1145,12 +1453,66 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     graph = state.get("skill_graph") or skill_graph.default_graph(row.role_track)
     qid = state.get("current_question_id") or ""
     node = question_graph.get_node(qid)
-    skill_tag = (
-        f"{node['skill'][0]}.{node['skill'][1]}"
-        if node
-        else (state.get("current_qa_id") or "")
-    )
+    skill_tag = _evidence_skill(state, node)
     hint_now = int(state.get("current_hint_level", 0) or 0)
+
+    # The candidate is objecting to the QUESTION, not declining the topic.
+    # Runs before the no-knowledge gate ("I don't know what you mean by that question"
+    # used to score 0 and trigger a canned move-on).
+    if llm_client.is_unclear_question_response(answer):
+        repairs = int(state.get("respecify_count", 0) or 0)
+        state["respecify_count"] = repairs + 1
+        last_q = ""
+        try:
+            prev = _last_assistant_texts(db, row.id, limit=1)
+            last_q = prev[0] if prev else ""
+        except Exception:
+            last_q = ""
+        evidence_ledger.record(
+            state,
+            stage="qa",
+            dimension="conceptual",
+            score=0.0,
+            skill=skill_tag,
+            question_id=qid,
+            hint_level=int(state.get("current_hint_level", 0) or 0),
+            note="Candidate found the question unclear — re-specified",
+            source="gate",
+            elapsed=_elapsed(row),
+        )
+        # Two failed attempts at one idea: change topic rather than argue.
+        if repairs >= 2:
+            return _next_topic_turn(
+                db,
+                row,
+                state,
+                bridge="Fair enough — let me ask something clearer.",
+            )
+        fixed = None
+        try:
+            fixed = llm_client.respecify_question(
+                last_question=last_q,
+                candidate_reply=answer,
+                topics=_configured_topics(state) or topics,
+                focus_topic=_focus_topic(state),
+                difficulty=str(state.get("difficulty") or "intermediate"),
+                interviewer_style=str(state.get("interviewer_style") or "friendly"),
+                interviewer_briefing=str(state.get("interviewer_briefing") or ""),
+                asked_questions=_asked_question_texts(db, row),
+            )
+        except Exception:
+            fixed = None
+        if fixed:
+            state["current_hint_level"] = evidence_ledger.bump_hint(hint_now, reason="followup")
+            state["followup_index"] = int(state.get("followup_index", 0) or 0) + 1
+            _save_state(row, state)
+            return fixed
+        return _next_topic_turn(
+            db,
+            row,
+            state,
+            bridge="That's on me — let me make it concrete.",
+        )
 
     # Explicit "I don't know" / not aware — score exactly 0, mark skill weak, move on.
     # Must run before the weak-answer gate (short "idk" would otherwise get soft credit).
@@ -1187,7 +1549,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             _save_state(row, state)
             return _close_qa_then_code(db, row, state)
 
-        nxt = question_graph.pick_next(
+        # Topic-locked custom interviews never fall back to the DSA bank — that is
+        # how sessions drifted into Big-O / hash-map stems that were never configured.
+        nxt = None if _topic_locked(row, state) else question_graph.pick_next(
             role_track=row.role_track,
             graph=state["skill_graph"],
             asked_ids=list(state.get("asked_question_ids") or []),
@@ -1199,15 +1563,8 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             _activate_question(state, nxt)
             spoken = question_graph.spoken_prompt(nxt, hint_level=0)
             _save_state(row, state)
-            return (
-                "That's okay — we'll mark this topic as weak and move on. "
-                f"{spoken}"
-            )
-        _save_state(row, state)
-        return (
-            "That's okay — we'll note you weren't ready on that topic and keep going. "
-            "Take your next question seriously when you can."
-        )
+            return f"{_move_on_bridge(state)} {spoken}".strip()
+        return _next_topic_turn(db, row, state)
 
     if llm_client.is_weak_answer(answer):
         # Soft H1 clarify without advancing the topic — rephrase the same question.
@@ -1270,6 +1627,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             student_message=answer,
             code_excerpt=str(state.get("current_code") or "")[:1200],
             difficulty=str(state.get("difficulty") or "intermediate"),
+            asked_questions=_asked_question_texts(db, row),
+            probes_on_topic=int(state.get("followup_index", 0) or 0),
+            interviewer_style=str(state.get("interviewer_style") or "friendly"),
         )
     except Exception:
         observer = None
@@ -1286,6 +1646,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         state["observer_trail"] = trail[-24:]
 
     ctx = _llm_context(row, state)
+    ctx["asked_questions"] = _asked_question_texts(db, row)
     if observer:
         ctx["observer"] = observer
 
@@ -1311,7 +1672,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             if int(state.get("followup_index", 0) or 0) < max_fu:
                 action = "followup"
                 probe = str(observer.get("probe") or "").strip()
-                ack = str(observer.get("ack") or "Got it.").strip()
+                ack = str(observer.get("ack") or "").strip()
+                if not ack or re.match(r"(?i)^(got it|understood)\.?$", ack):
+                    ack = llm_client.default_ack(str(state.get("interviewer_style") or "friendly"))
                 if probe and "?" in probe:
                     llm_result["reply"] = f"{ack} {probe}".strip()
                 llm_result["next_action"] = "followup"
@@ -1335,16 +1698,20 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                 action = "followup"
             else:
                 action = "next_topic"
-                llm_result["reply"] = "Thanks — let's move to the next topic."
+                # Bridge only — the real question is generated below so the
+                # candidate never hears a bare "let's move on".
+                llm_result["reply"] = _move_on_bridge(state)
                 llm_result["next_action"] = "next_topic"
+                state["force_fresh_question"] = True
 
         # Never advance on weak LLM scores that re-ask.
         if action == "followup" and score < 55:
             if fu_count >= max_fu:
                 # Depth budget used — accept score and move topic instead of looping.
                 action = "next_topic"
-                llm_result["reply"] = "Thanks — let's move to the next topic."
+                llm_result["reply"] = _move_on_bridge(state)
                 llm_result["next_action"] = "next_topic"
+                state["force_fresh_question"] = True
             else:
                 new_hint = evidence_ledger.bump_hint(
                     max(hint_now, reported_hint),
@@ -1383,8 +1750,16 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                     if "?" not in reply:
                         lead = reply.rstrip() or "Let me rephrase."
                         reply = f"{lead} {stem}".strip()
+                if reply and (
+                    llm_client.is_vague_question(reply)
+                    or llm_client.is_off_lock_dsa(reply, _configured_topics(state))
+                ):
+                    # A generic probe wastes the turn — change topic with a real question.
+                    return _next_topic_turn(db, row, state)
                 if not reply:
                     reply = "I didn't catch a clear answer — could you rephrase that in one sentence?"
+                if llm_result.get("topic_tag"):
+                    state["current_qa_id"] = str(llm_result["topic_tag"])[:80]
                 _save_state(row, state)
                 return reply
 
@@ -1438,7 +1813,23 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id")) or resume_only
         # Custom / briefed interviews with a topic list never touch the DSA bank —
         # that is what pulled sessions into hash-map / complexity questions.
-        topic_locked = bool(_configured_topics(state)) and dynamic_ok and not resume_only
+        topic_locked = _topic_locked(row, state)
+        force_fresh = bool(state.pop("force_fresh_question", False))
+        model_reply_raw = (llm_result.get("reply") or "").strip()
+        if force_fresh or (
+            action == "next_topic"
+            and model_reply_raw
+            and (
+                llm_client.is_vague_question(model_reply_raw)
+                or llm_client.is_off_lock_dsa(model_reply_raw, _configured_topics(state))
+            )
+        ):
+            # The engine (not the model) decided to change topic, or the model's
+            # question was too generic to speak — generate a real one.
+            bridge = model_reply_raw if force_fresh else ""
+            return _next_topic_turn(db, row, state, bridge=bridge)
+        if action == "next_topic":
+            _note_topic_turn(state)
         nxt = None if (resume_only or topic_locked) else question_graph.pick_next(
             role_track=row.role_track,
             graph=state["skill_graph"],
@@ -1483,10 +1874,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
 
         _save_state(row, state)
         reply = (llm_result.get("reply") or "").strip()
-        if topic_locked and "?" not in reply:
-            # Keep the round moving on a configured topic instead of trailing off.
-            ack = reply.rstrip(" .") + ". " if reply else ""
-            return (ack + _offline_topic_question(state, None)).strip()
+        if "?" not in reply:
+            # Never trail off without a question — ask a real one on the next topic.
+            return _next_topic_turn(db, row, state, bridge=reply)
         return reply
 
     if llm_client.llm_configured():
@@ -1533,12 +1923,16 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         score_0_100=score,
         evidence=(answer or "")[:160],
     )
-    feedback = f"Thanks — noted ({score:.0f}/100)."
+    feedback = _move_on_bridge(state)
 
     if _should_enter_coding(row, state):
         state["coding_after_answer"] = False
         _save_state(row, state)
         return _close_qa_then_code(db, row, state)
+
+    if _topic_locked(row, state):
+        _save_state(row, state)
+        return _ensure_specific_question(db, row, state, feedback)
 
     nxt = question_graph.pick_next(
         role_track=row.role_track,
@@ -1840,8 +2234,7 @@ def _handle_explain(db: Session, row: SessionRow, state: dict[str, Any], answer:
     state["awaiting"] = "code"
     _save_state(row, state)
     return (
-        f"Got it ({score:.0f}/100 for explanation clarity). "
-        "Continue coding — run tests when you think you're ready. "
+        "Thanks — keep going in the editor. Run tests when you think you're ready. "
         "Say done if you want to finish the interview."
     )
 
@@ -1943,11 +2336,13 @@ def handle_message(
             text.lower(),
         )
         if ready:
-            reply = _begin_qa(db, row, state)
+            reply = _ensure_specific_question(db, row, state, _begin_qa(db, row, state))
         else:
             reply = "Just say yes when you're ready to begin."
     elif row.stage == "qa":
-        reply = _next_qa_or_coding(db, row, state, text)
+        reply = _ensure_specific_question(
+            db, row, state, _next_qa_or_coding(db, row, state, text)
+        )
     elif row.stage == "idea":
         reply = _handle_idea(db, row, state, text)
     elif row.stage == "explain":

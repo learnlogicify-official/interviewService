@@ -22,8 +22,33 @@ Speak in 1–2 short sentences for acknowledgements. For code-snippet / predict-
 Voice pacing: acknowledgements ≤15 words. Opening and next-topic questions may be 40–60 words so they are specific
 (name the topic, ask for a concrete example / trade-off / failure mode). Follow-ups ≤35 words.
 One short acknowledgement then ONE question — never monologue, lecture, or stack multiple questions.
-Never scold, shame, or lecture about "fuller answers" — stay calm and specific.
 No markdown headings, no bullet lists, no "as an AI".
+
+TONE (applies to EVERY turn, including weak answers and topic changes):
+- Hold the configured tone for the whole session. A friendly interviewer stays friendly at minute 25,
+  even after three bad answers. Never drift into blunt, clipped, or dismissive phrasing.
+- Never scold, shame, grade aloud, or lecture ("fuller answers", "take this seriously",
+  "we'll mark this topic as weak", "you weren't ready"). Scores are private — never say them.
+- When you move on after a weak answer: one short neutral-positive bridge ("No problem, let's switch."),
+  then the next question. Never announce that they failed the topic.
+- If the candidate says your question was unclear or does not make sense: own it in three or four words
+  ("Fair — let me make it concrete."), then ask a fully re-specified version. Never argue or repeat the
+  same vague wording.
+
+QUESTION QUALITY (a vague question is a failed turn):
+- Every question must be CONCRETE and self-contained: name the topic AND anchor it to something specific —
+  a small scenario, real inputs/numbers, a named pair of options, an error/behaviour to explain, or a
+  decision they must justify. The candidate should never have to guess what you are asking.
+- NEVER ask these shapes: "How would you use X in a project?", "How would you use X in a small project?",
+  "Can you explain how X is implemented?", "Walk me through how you'd approach it", "Tell me about X",
+  "What are the key operations of X?", "Explain the difference between X and Y" with no scenario,
+  or any bare textbook-definition question. They are too generic for an interview.
+- Do not ask for a definition of something the candidate already defined correctly. Move the angle
+  forward: mechanism, failure mode, trade-off with a named alternative, or a concrete design choice.
+- Do not re-ask a question already in the transcript or in already_asked_questions, and do not ask a
+  thin variation of one. Each turn must open new ground.
+- Stay answerable in 20–60 seconds of speech. No multi-part questions.
+- A named topic alone is NOT a question. "Let's talk about Java" must be followed by a specific ask.
 Shape (engine times this; you follow the stage):
 - Conceptual / applied Q&A first. When this round closes, do not ask another technical question.
 - If include_coding is true: later one coding problem; editor stays locked until approach is solid.
@@ -61,6 +86,17 @@ Rules:
   Do not award partial credit for admitting ignorance. next_action=followup or next_topic is fine,
   but the score stays near zero.
 - Faculty briefing / custom interviewer rules are the highest-priority topic guide when present — follow them closely.
+
+Calibration examples (shape only — always match the configured topics):
+BAD: "How would you use Java in a small project? Any trade-offs?"
+GOOD: "In Java, you loop over an ArrayList of orders and call remove() on the cancelled ones inside the loop.
+What happens at runtime, and what would you do instead?"
+BAD: "Can you explain how a queue is implemented in programming?"
+GOOD: "Your array-backed queue holds 100 slots. After 100 enqueues and 60 dequeues, an enqueue fails even
+though 60 slots are free. What is going on, and how do you fix it?"
+BAD: "Explain the difference between a stack and a queue."
+GOOD: "You are processing a build system's pending tasks and need the oldest task first. Stack or queue,
+and what breaks if you pick the other one?"
 
 Always respond with a single JSON object only (no markdown fences):
 {
@@ -135,11 +171,170 @@ def looks_incomplete_answer(text: str) -> bool:
     return False
 
 
+# The candidate is objecting to the QUESTION, not admitting they don't know the topic.
+# These must never score 0 — the interviewer owes them a concrete re-specification.
+UNCLEAR_QUESTION_RE = re.compile(
+    r"(?i)("
+    r"(?:did\s*n[o']?t|didn'?t|not)\s+(?:really\s+|quite\s+|fully\s+)?"
+    r"(?:get|catch|follow|understand|understood)\s+(?:your|the|that|this)\s*(?:question|point|ask)|"
+    r"i\s+(?:really\s+)?(?:didn'?t|did\s+not)\s+get\s+(?:your|the)?\s*question|"
+    r"(?:i\s+)?don'?t\s+(?:really\s+|quite\s+)?understand(?:\s+really)?(?:\s+(?:your|the|that|this|by))|"
+    r"(?:i\s+)?don'?t\s+understand\s+really|"
+    r"(?:your|that|the|this)\s+question\s+(?:itself\s+)?(?:is|was|sounds|seems|makes)"
+    r"\s*(?:n['o]?t)?\s*(?:absurd|vague|unclear|confusing|weird|generic|no\s+sense|not\s+clear)|"
+    r"question\s+itself\s+is\s+absurd|"
+    r"(?:doesn'?t|does\s+not)\s+make\s+(?:any\s+)?sense|"
+    r"what\s+do\s+you\s+mean\s+by|"
+    r"what\s+this\s+meant|"
+    r"can\s+you\s+(?:please\s+)?(?:be\s+more\s+specific|rephrase|clarify)|"
+    r"(?:could|can)\s+you\s+repeat\s+(?:the|that)\s+question|"
+    r"didn'?t\s+get\s+(?:your|the)\s+question"
+    r")"
+)
+
+# Question shapes that are too generic to speak in a real interview.
+# Match even without a '?' — the old offline template never used one.
+VAGUE_QUESTION_RE = re.compile(
+    r"(?i)("
+    r"how\s+would\s+you\s+use\s+\w[\w\s]{0,40}\s+in\s+a\s+(?:small\s+|simple\s+|real\s+)?project|"
+    r"can\s+you\s+explain\s+how\s+\w[\w\s]{0,40}\s+is\s+implemented|"
+    r"how\s+(?:is|would\s+you\s+implement)\s+\w[\w\s]{0,40}"
+    r"\s+(?:in\s+programming|using\s+an\s+array)|"
+    r"walk\s+me\s+through\s+how\s+you'?d?\s+approach\s+it|"
+    r"approach\s+it\s+in\s+a\s+real\s+project|"
+    r"what\s+are\s+the\s+key\s+operations|"
+    r"(?:explain|describe|tell\s+me)\s+(?:the\s+)?(?:difference|differences)\s+between|"
+    r"tell\s+me\s+about\s+\w[\w\s]{0,24}$|"
+    r"explain\s+big-?\s*o|"
+    r"let'?s\s+start\s+with\s+.{0,90}walk\s+me\s+through|"
+    r"can\s+you\s+describe\s+how\s+you\s+would\s+implement|"
+    r"how\s+do\s+you\s+handle\s+overflow\s+in\s+this"
+    r")"
+)
+
+RUDE_SPOKEN_RE = re.compile(
+    r"(?i)("
+    r"we(?:'ll| will) mark this topic as weak|"
+    r"you weren'?t ready|"
+    r"take this (?:more )?seriously|"
+    r"need a fuller answer|"
+    r"that(?:'s| is) a weak (?:answer|topic)|"
+    r"i(?:'m| am) marking (?:this|that)|"
+    r"noted\s*\(\s*\d|"
+    r"got it\s*\(\s*\d"
+    r")"
+)
+
+SCORE_SPOKEN_RE = re.compile(r"\(\s*\d+(?:\.\d+)?\s*/\s*100\s*\)")
+
+DSA_DRIFT_RE = re.compile(
+    r"(?i)\b("
+    r"big-?\s*o|time complexity|space complexity|"
+    r"hash\s*-?maps?|hashmap|"
+    r"difference between (?:a )?stack and (?:a )?queue|"
+    r"stack and (?:a )?queue|"
+    r"enqueue|dequeue|"
+    r"array-backed queue|array-based queue|"
+    r"implement(?:ed)? (?:a |the )?queue|"
+    r"o\(\s*n\b"
+    r")\b"
+)
+
+_DSA_TOPIC_KEYS = (
+    "dsa",
+    "data structure",
+    "algorithm",
+    "complexity",
+    "big-o",
+    "big o",
+    "hash",
+    "stack",
+    "queue",
+    "linked list",
+    "binary tree",
+    "graph",
+    "recursion",
+    "dynamic programming",
+)
+
+
+def is_unclear_question_response(text: str) -> bool:
+    """True when the candidate is saying the interviewer's question was unclear/absurd."""
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return False
+    return bool(UNCLEAR_QUESTION_RE.search(clean))
+
+
+def is_vague_question(text: str, *, min_words: int = 0) -> bool:
+    """
+    True when a generated interviewer question is too generic to speak.
+
+    min_words guards against thin stems; keep it 0 for follow-up probes, where a
+    short "why does that happen?" is a legitimate deepening question.
+    Banned shapes match even without a '?' — the old offline template never used one.
+    """
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return False
+    if VAGUE_QUESTION_RE.search(clean):
+        return True
+    if "?" not in clean:
+        return False
+    # Only judge the question sentence itself, not the acknowledgement before it.
+    parts = [p.strip() for p in re.split(r"(?<=[.!?])\s+", clean) if "?" in p]
+    target = parts[-1] if parts else clean
+    if VAGUE_QUESTION_RE.search(target):
+        return True
+    if min_words > 0:
+        words = re.findall(r"[A-Za-z0-9_]+", target)
+        return len(words) < min_words
+    return False
+
+
+def is_off_lock_dsa(text: str, allowed_topics: list[str] | None) -> bool:
+    """True when the spoken question drifted into generic DSA off the configured list."""
+    topics = [str(t).lower() for t in (allowed_topics or []) if str(t).strip()]
+    if not topics:
+        return False
+    blob = " ".join(topics)
+    if any(k in blob for k in _DSA_TOPIC_KEYS):
+        return False
+    return bool(DSA_DRIFT_RE.search(text or ""))
+
+
+def strip_spoken_meta(text: str) -> str:
+    """Drop rude grading lines and spoken scores. Never let those reach the mic."""
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return ""
+    parts = re.split(r"(?<=[.!?])\s+", clean)
+    kept: list[str] = []
+    for part in parts:
+        piece = SCORE_SPOKEN_RE.sub("", part).strip(" -—")
+        if not piece or RUDE_SPOKEN_RE.search(piece):
+            continue
+        kept.append(piece)
+    return " ".join(kept).strip()
+
+
+def default_ack(style: str = "friendly") -> str:
+    """Short spoken acknowledgement that matches the configured interviewer tone."""
+    key = (style or "friendly").strip().lower()
+    if key in {"friendly", "supportive"}:
+        return "Thanks —"
+    if key == "socratic":
+        return "Okay —"
+    return "Got it."
+
+
 def is_no_knowledge_answer(text: str) -> bool:
     """
     True when the candidate explicitly declines / admits they cannot answer.
     These must score exactly 0 — no partial credit.
     """
+    if is_unclear_question_response(text):
+        return False
     clean = " ".join((text or "").split()).strip()
     if not clean:
         return True
@@ -514,7 +709,7 @@ Return JSON only:
   "gaps": ["missing idea 1", "missing idea 2"],
   "probe": "ONE specific spoken follow-up question the interviewer should ask if probing",
   "next_action_hint": "followup" | "next_topic",
-  "ack": "short natural ack like Got it. or Understood. (max 6 words)",
+  "ack": "short warm ack like Thanks — or Nice. Never Got it. or Understood. (max 6 words)",
   "notes": "one internal line for the interviewer"
 }
 Rules:
@@ -523,6 +718,15 @@ Rules:
 - Never reveal the optimal solution in probe. Never say "use a hashmap" as the answer.
 - If solid/strong and on-topic → next_action_hint=next_topic; probe can be empty.
 - Keep probe under 40 words, spoken style.
+- PROBE QUALITY — the probe is spoken verbatim, so a vague probe ruins the interview:
+  * It must build on THEIR actual words and add a concrete anchor: real inputs/numbers, a named
+    alternative, a failure to explain, or a decision to justify.
+  * NEVER produce: "Can you explain how X is implemented?", "How would you use X in a project?",
+    "What are the key operations of X?", "Explain the difference between X and Y", or any bare
+    definition request. Those are automatically wrong.
+  * Never repeat or thinly reword anything in already_asked_questions.
+  * If you cannot form a specific probe, return probe="" and next_action_hint="next_topic".
+- After two probes on the same idea, prefer next_action_hint=next_topic instead of drilling further.
 """
 
 
@@ -535,6 +739,9 @@ def observe_answer(
     student_message: str,
     code_excerpt: str = "",
     difficulty: str = "intermediate",
+    asked_questions: list[str] | None = None,
+    probes_on_topic: int = 0,
+    interviewer_style: str = "friendly",
 ) -> dict[str, Any] | None:
     """Fast hidden analysis that steers the live interviewer toward Chakra-style probes."""
     if not llm_configured():
@@ -553,6 +760,10 @@ def observe_answer(
                         "last_interviewer_question": (last_question or "")[:500],
                         "candidate_just_said": (student_message or "")[:900],
                         "code_excerpt": (code_excerpt or "")[:1200] or None,
+                        "already_asked_questions": [
+                            str(q)[:200] for q in (asked_questions or [])[-8:]
+                        ],
+                        "probes_already_on_this_idea": int(probes_on_topic or 0),
                     }
                 ),
             },
@@ -576,13 +787,18 @@ def observe_answer(
         score_hint = 50.0
     gaps = data.get("gaps") if isinstance(data.get("gaps"), list) else []
     gaps = [str(g)[:120] for g in gaps[:4] if str(g).strip()]
+    probe = str(data.get("probe") or "").strip()[:280]
+    if probe and is_vague_question(probe):
+        # A generic probe is worse than no probe — let the interviewer turn craft
+        # its own follow-up under the question-quality rules.
+        probe = ""
     return {
         "depth": depth,
         "score_hint": max(0.0, min(100.0, score_hint)),
         "gaps": gaps,
-        "probe": str(data.get("probe") or "").strip()[:280],
+        "probe": probe,
         "next_action_hint": action,
-        "ack": str(data.get("ack") or "Got it.").strip()[:48],
+        "ack": str(data.get("ack") or default_ack(interviewer_style)).strip()[:48],
         "notes": str(data.get("notes") or "").strip()[:220],
     }
 
@@ -714,7 +930,7 @@ def interviewer_turn(
             f"next_action_hint={observer.get('next_action_hint')}; "
             f"gaps={observer.get('gaps')}; notes={observer.get('notes')}.\n"
             f"Preferred probe: {observer.get('probe') or '(none)'}\n"
-            f"Preferred short ack: {observer.get('ack') or 'Got it.'}\n"
+            f"Preferred short ack: {observer.get('ack') or default_ack(style)}\n"
             "If next_action_hint=followup: reply = short ack + the preferred probe "
             "(paraphrase OK, keep the same depth of probe). next_action MUST be followup.\n"
             "If next_action_hint=next_topic: brief ack then invent a NEW on-topic question; "
@@ -774,6 +990,9 @@ def interviewer_turn(
         "must_ask_next": must_ask or None,
         "allowed_topics": allowed_topics or None,
         "focus_topic": focus_topic or None,
+        "already_asked_questions": [
+            str(q)[:220] for q in (ctx.get("asked_questions") or [])[-8:]
+        ],
         "candidate_answer_looks_weak": weak,
         "candidate_answer_looks_incomplete": incomplete,
         "skill_graph_summary": ctx.get("skill_graph_summary"),
@@ -853,11 +1072,21 @@ def interviewer_turn(
         hint_level = int(ctx.get("current_hint_level", 0) or 0)
     hint_level = max(0, min(3, hint_level))  # model may not emit H4
 
+    reply = strip_spoken_meta(str(data["reply"]).strip())
+    if not reply:
+        return None
+    allowed_topics = [str(t).strip() for t in (ctx.get("allowed_topics") or []) if str(t).strip()]
+    if is_vague_question(reply) or is_off_lock_dsa(reply, allowed_topics):
+        # Orchestrator will replace with a concrete on-topic question.
+        action = "next_topic"
+    tag = str(data.get("topic_tag") or "").strip()
+    if tag.lower() in {"self-introduction", "opening", "intro", "self introduction"}:
+        tag = str(ctx.get("focus_topic") or "")[:80]
     return {
-        "reply": str(data["reply"]).strip(),
+        "reply": reply,
         "score": score,
         "next_action": action,
-        "topic_tag": str(data.get("topic_tag") or ""),
+        "topic_tag": tag,
         "hint_level": hint_level,
     }
 
@@ -1028,8 +1257,12 @@ def first_question(
         if raw and not data:
             _set_error(f"Could not parse opening JSON: {(raw or '')[:200]}")
         return None
-    tag = str(data.get("topic_tag") or node.get("skill") or node.get("question_id") or "opening")
-    reply = str(data["reply"]).strip()
+    tag = str(data.get("topic_tag") or node.get("skill") or node.get("question_id") or "").strip()
+    if tag.lower() in {"self-introduction", "opening", "intro", "self introduction"}:
+        tag = focus_topic or (topic_list[0] if topic_list else tag)
+    reply = strip_spoken_meta(str(data["reply"]).strip())
+    if not reply or is_vague_question(reply, min_words=8) or is_off_lock_dsa(reply, topic_list):
+        return None
     if resume_only and must_ask_next and must_ask_next.get("question"):
         planned = str(must_ask_next.get("question") or "").strip()
         if planned and "?" not in reply:
@@ -1038,10 +1271,206 @@ def first_question(
         "reply": reply,
         "score": 0,
         "next_action": "next_topic",
-        "topic_tag": tag,
+        "topic_tag": tag or focus_topic or "opening",
         "hint_level": 0,
         "question_id": "" if dynamic_ok else (node.get("question_id") or ""),
     }
+
+
+_STYLE_TONE = {
+    "friendly": "warm and encouraging, still rigorous",
+    "strict": "crisp and demanding, never harsh or mocking",
+    "brief": "concise and businesslike, still polite",
+    "socratic": "curious and Socratic, never lecturing",
+    "supportive": "calm and supportive",
+    "panel": "professional hiring-bar, evidence-seeking",
+}
+
+
+def _quality_rules(topic_list: list[str], focus_topic: str, style: str) -> str:
+    tone = _STYLE_TONE.get((style or "friendly").lower(), "professional and clear")
+    lines = [
+        f"Tone: {tone}. Hold this tone even when the candidate struggles.",
+        "The question must be CONCRETE: name the topic and anchor it to a specific scenario, "
+        "real inputs/numbers, a named alternative to compare, or an observed behaviour to explain.",
+        "BANNED shapes: 'how would you use X in a project', 'can you explain how X is implemented', "
+        "'walk me through how you'd approach it', 'what are the key operations', bare "
+        "'difference between X and Y', bare 'tell me about X', or any textbook-definition request.",
+        "One question only, answerable in 20-60 seconds of speech, max 60 words.",
+        "Never repeat or thinly reword a question in already_asked_questions.",
+    ]
+    if topic_list:
+        lines.append(
+            "TOPIC LOCK (HARD): the question must sit inside — " + ", ".join(topic_list)
+            + ". Do NOT ask about Big-O, complexity, hash maps, or other DSA topics unless listed."
+        )
+    if focus_topic:
+        lines.append(f"Ask about this topic: {focus_topic}. Name it naturally in the question.")
+    return "\n- ".join(lines)
+
+
+def topic_question(
+    *,
+    role_track: str,
+    topics: list[str],
+    focus_topic: str = "",
+    difficulty: str = "intermediate",
+    interviewer_style: str = "friendly",
+    interviewer_briefing: str = "",
+    asked_questions: list[str] | None = None,
+    transcript: list[dict[str, str]] | None = None,
+    bridge_hint: str = "",
+    resume_questions_allowed: bool = True,
+) -> dict[str, Any] | None:
+    """
+    Generate ONE specific next-topic question.
+
+    Used whenever the engine (not the model) decides to change topic, so the
+    candidate never hears a bare "let's move on" with no real question.
+    """
+    if not llm_configured():
+        return None
+    topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
+    focus = str(focus_topic or "").strip() or (topic_list[0] if topic_list else "")
+    system = (
+        INTERVIEWER_SYSTEM
+        + "\n\nThis call produces ONE next-topic question only.\n- "
+        + _quality_rules(topic_list, focus, interviewer_style)
+    )
+    if interviewer_briefing:
+        system += (
+            "\n\nFACULTY BRIEFING / CUSTOM INTERVIEWER RULES (primary guide):\n"
+            f"{interviewer_briefing[:3500]}"
+        )
+    if not resume_questions_allowed:
+        system += (
+            "\n\nRESUME IS OFF-LIMITS: do not ask about their resume, CV, listed projects, "
+            "internships, or past companies."
+        )
+    history = [
+        ("Interviewer" if t.get("role") == "assistant" else "Candidate")
+        + ": "
+        + str(t.get("content", ""))[:240]
+        for t in (transcript or [])[-6:]
+    ]
+    raw = chat(
+        [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "stage": "qa",
+                        "role_track": role_track,
+                        "allowed_topics": topic_list or None,
+                        "focus_topic": focus or None,
+                        "difficulty": difficulty,
+                        "already_asked_questions": [
+                            str(q)[:220] for q in (asked_questions or [])[-8:]
+                        ],
+                        "transcript_tail": history,
+                        "stage_instructions": (
+                            "The previous topic is finished. Say a SHORT natural bridge "
+                            + (f"(something like: {bridge_hint}) " if bridge_hint else "")
+                            + "of at most 8 words, then ask ONE new concrete question. "
+                            "Never say the candidate failed, never mention scores or grading. "
+                            "next_action=next_topic. hint_level=0."
+                        ),
+                    }
+                ),
+            },
+        ],
+        temperature=0.7,
+        max_tokens=260,
+        timeout=20.0,
+    )
+    data = _extract_json(raw or "")
+    reply = strip_spoken_meta(str((data or {}).get("reply") or "").strip())
+    if (
+        not reply
+        or "?" not in reply
+        or is_vague_question(reply, min_words=8)
+        or is_off_lock_dsa(reply, topic_list)
+    ):
+        return None
+    return {
+        "reply": reply,
+        "topic_tag": str((data or {}).get("topic_tag") or focus or "")[:80],
+    }
+
+
+def respecify_question(
+    *,
+    last_question: str,
+    candidate_reply: str,
+    topics: list[str],
+    focus_topic: str = "",
+    difficulty: str = "intermediate",
+    interviewer_style: str = "friendly",
+    interviewer_briefing: str = "",
+    asked_questions: list[str] | None = None,
+) -> str | None:
+    """
+    Rewrite the last question concretely after the candidate said it was unclear.
+
+    This is the repair path for "I didn't get your question" / "that question is absurd".
+    """
+    if not llm_configured():
+        return None
+    topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
+    focus = str(focus_topic or "").strip() or (topic_list[0] if topic_list else "")
+    system = (
+        INTERVIEWER_SYSTEM
+        + "\n\nThis call REPAIRS one unclear question.\n- "
+        + _quality_rules(topic_list, focus, interviewer_style)
+    )
+    if interviewer_briefing:
+        system += (
+            "\n\nFACULTY BRIEFING / CUSTOM INTERVIEWER RULES (primary guide):\n"
+            f"{interviewer_briefing[:2500]}"
+        )
+    raw = chat(
+        [
+            {"role": "system", "content": system},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "stage": "qa",
+                        "your_previous_question": (last_question or "")[:600],
+                        "candidate_objection": (candidate_reply or "")[:400],
+                        "allowed_topics": topic_list or None,
+                        "focus_topic": focus or None,
+                        "difficulty": difficulty,
+                        "already_asked_questions": [
+                            str(q)[:220] for q in (asked_questions or [])[-6:]
+                        ],
+                        "stage_instructions": (
+                            "The candidate says your previous question was unclear or did not make "
+                            "sense — they are right. Own it in at most five words, then ask the SAME "
+                            "competency as a fully concrete question: give a tiny scenario with real "
+                            "inputs or a named choice they must justify. Do not defend the old wording, "
+                            "do not shorten it into something vaguer, do not change topic, do not say "
+                            "anything about scoring. next_action=followup. hint_level=1."
+                        ),
+                    }
+                ),
+            },
+        ],
+        temperature=0.6,
+        max_tokens=240,
+        timeout=20.0,
+    )
+    data = _extract_json(raw or "")
+    reply = strip_spoken_meta(str((data or {}).get("reply") or "").strip())
+    if (
+        not reply
+        or "?" not in reply
+        or is_vague_question(reply, min_words=8)
+        or is_off_lock_dsa(reply, topic_list)
+    ):
+        return None
+    return reply
 
 
 def wrap_speech(
