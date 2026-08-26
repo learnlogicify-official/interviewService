@@ -926,6 +926,26 @@ def _note_voice_and_claims(state: dict[str, Any], answer: str, duration_sec: flo
         state["claims"] = bag[-20:]
 
 
+def _configured_topics(state: dict[str, Any]) -> list[str]:
+    return [str(t).strip() for t in (state.get("topics") or []) if str(t).strip()][:12]
+
+
+def _resume_questions_allowed(row: SessionRow, state: dict[str, Any]) -> bool:
+    """Resume-anchored questions only on the resume track or when faculty asked for them."""
+    if _is_resume_track(row.role_track, state):
+        return True
+    briefing = (state.get("interviewer_briefing") or "").lower()
+    return any(k in briefing for k in ("resume", "cv ", " cv", "their projects", "past projects"))
+
+
+def _focus_topic(state: dict[str, Any]) -> str:
+    """Rotate through the configured topics so every turn stays inside the faculty list."""
+    topics = _configured_topics(state)
+    if not topics:
+        return ""
+    return topics[int(state.get("qa_index", 0) or 0) % len(topics)]
+
+
 def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[str, Any]:
     graph = state.get("skill_graph") or skill_graph.default_graph(row.role_track)
     qid = state.get("current_question_id") or ""
@@ -938,13 +958,21 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
         int(state.get("qa_index", 0) or 0),
         briefing,
     )
+    resume_ok = _resume_questions_allowed(row, state)
+    topics_cfg = _configured_topics(state)
+    # Custom / briefed interviews: hide the DSA skill graph so the model cannot drift
+    # into hash-map / complexity questions that were never configured.
+    graph_summary = None if (dynamic_ok and not resume_only and topics_cfg) else skill_graph.summarize_for_llm(graph)
     ctx = {
         "seconds_remaining": _seconds_remaining(row),
         "qa_index": state.get("qa_index", 0),
         "asked_topics": state.get("asked_topics", []),
-        "resume_text": state.get("resume_text") or "",
+        "resume_text": (state.get("resume_text") or "") if resume_ok else "",
+        "resume_questions_allowed": resume_ok,
+        "allowed_topics": topics_cfg,
+        "focus_topic": _focus_topic(state),
         "moodle_problem_id": state.get("moodle_problem_id"),
-        "skill_graph_summary": skill_graph.summarize_for_llm(graph),
+        "skill_graph_summary": graph_summary,
         "claims": state.get("claims") or [],
         "voice_metrics_latest": (state.get("voice_metrics") or {}).get("latest"),
         "current_hint_level": hint,
@@ -959,8 +987,8 @@ def _llm_context(row: SessionRow, state: dict[str, Any], **extra: Any) -> dict[s
         "dynamic_question_ok": dynamic_ok,
         "suggested_format": suggested,
         "resume_only": resume_only,
-        "resume_dossier": state.get("resume_dossier") or {},
-        "must_ask_next": _next_resume_item(state),
+        "resume_dossier": (state.get("resume_dossier") or {}) if resume_ok else {},
+        "must_ask_next": _next_resume_item(state) if resume_ok else None,
         "difficulty": state.get("difficulty") or "intermediate",
         "pace": state.get("pace") or "standard",
         "question_mix": state.get("question_mix") or "conceptual",
@@ -985,6 +1013,19 @@ def _activate_question(state: dict[str, Any], node: dict[str, Any] | None) -> No
     tag = f"{node['skill'][0]}.{node['skill'][1]}"
     if tag not in topics:
         topics.append(tag)
+
+
+def _offline_topic_question(state: dict[str, Any], node: dict[str, Any] | None) -> str:
+    """Fallback question when the LLM is unavailable — stay on the configured topics."""
+    focus = _focus_topic(state)
+    if focus:
+        return (
+            f"Let's start with {focus}. Walk me through how you'd approach it in a real project, "
+            "and call out one trade-off you'd have to make."
+        )
+    if node and node.get("stem"):
+        return str(node["stem"])
+    return "Tell me about a challenging technical problem you solved recently."
 
 
 def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
@@ -1027,10 +1068,11 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
             _save_state(row, state)
             return f"Hi {first}, I'm {name}. I read your resume. {planned}"
 
+    resume_ok = _resume_questions_allowed(row, state)
     dynamic = llm_client.first_question(
         role_track=row.role_track,
         topics=topics,
-        resume_text=state.get("resume_text") or "",
+        resume_text=(state.get("resume_text") or "") if resume_ok else "",
         question_node=node_ctx,
         interviewer_name=str(state.get("interviewer_name") or "NexAI"),
         interviewer_style=str(state.get("interviewer_style") or "friendly"),
@@ -1038,14 +1080,16 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
         include_coding=_include_coding(state),
         suggested_format=suggested,
         resume_only=resume_only,
-        resume_dossier=state.get("resume_dossier") or {},
-        must_ask_next=_next_resume_item(state),
+        resume_dossier=(state.get("resume_dossier") or {}) if resume_ok else {},
+        must_ask_next=_next_resume_item(state) if resume_ok else None,
         dynamic_question_ok=dynamic_ok,
         difficulty=str(state.get("difficulty") or "intermediate"),
         pace=str(state.get("pace") or "standard"),
         question_mix=str(state.get("question_mix") or "conceptual"),
         followup_depth=str(state.get("followup_depth") or "moderate"),
         avoid_topics=str(state.get("avoid_topics") or ""),
+        focus_topic=_focus_topic(state),
+        resume_questions_allowed=resume_ok,
     )
     if dynamic:
         if dynamic.get("question_id"):
@@ -1079,8 +1123,7 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
                 "Thanks for the resume. Walk me through the most technically demanding project on it — "
                 "your role, the hardest bug, and how you measured success."
             )
-        stem = (node or {}).get("stem") or "Tell me about a challenging technical problem you solved recently."
-        return f"Let's begin. {stem}"
+        return f"Let's begin. {_offline_topic_question(state, node)}"
 
     # Offline/dev fallback: speak the curated stem directly.
     state["llm_mode"] = False
@@ -1093,11 +1136,7 @@ def _begin_qa(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
             "Walk me through the most technically demanding project on your resume — "
             "your role, the hardest bug, and how you measured success."
         )
-    stem = (node or {}).get("stem") or "Tell me about a challenging technical problem you solved recently."
-    return (
-        f"First question: {stem} "
-        "Give a clear structured answer."
-    )
+    return f"First question: {_offline_topic_question(state, node)} Give a clear structured answer."
 
 
 def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
@@ -1397,7 +1436,10 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         briefing = state.get("interviewer_briefing") or ""
         resume_only = _is_resume_track(row.role_track, state)
         dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id")) or resume_only
-        nxt = None if resume_only else question_graph.pick_next(
+        # Custom / briefed interviews with a topic list never touch the DSA bank —
+        # that is what pulled sessions into hash-map / complexity questions.
+        topic_locked = bool(_configured_topics(state)) and dynamic_ok and not resume_only
+        nxt = None if (resume_only or topic_locked) else question_graph.pick_next(
             role_track=row.role_track,
             graph=state["skill_graph"],
             asked_ids=list(state.get("asked_question_ids") or []),
@@ -1440,7 +1482,12 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             return out
 
         _save_state(row, state)
-        return llm_result["reply"]
+        reply = (llm_result.get("reply") or "").strip()
+        if topic_locked and "?" not in reply:
+            # Keep the round moving on a configured topic instead of trailing off.
+            ack = reply.rstrip(" .") + ". " if reply else ""
+            return (ack + _offline_topic_question(state, None)).strip()
+        return reply
 
     if llm_client.llm_configured():
         err = llm_client.last_error() or "LLM call failed"

@@ -687,6 +687,25 @@ def interviewer_turn(
             + difficulty
             + "."
         )
+    allowed_topics = [str(t).strip() for t in (ctx.get("allowed_topics") or []) if str(t).strip()]
+    focus_topic = str(ctx.get("focus_topic") or "").strip()
+    if allowed_topics and not resume_only:
+        extras.append(
+            "TOPIC LOCK (HARD CONSTRAINT): every question must sit inside this list — "
+            + ", ".join(allowed_topics)
+            + ". Never ask about a topic outside the list. Specifically: do NOT ask about time/space "
+            "complexity, Big-O, hash maps, arrays, or other DSA topics unless they appear in the list."
+        )
+        if focus_topic:
+            extras.append(
+                f"FOCUS TOPIC FOR A next_topic QUESTION: {focus_topic}. "
+                "Name it explicitly in the question. (Follow-ups stay on the previous topic.)"
+            )
+    if not bool(ctx.get("resume_questions_allowed", True)) and not resume_only:
+        extras.append(
+            "RESUME IS OFF-LIMITS: do not ask about their resume, CV, listed projects, internships, "
+            "or past companies. Ask only from the topic list above."
+        )
     observer = ctx.get("observer") if isinstance(ctx.get("observer"), dict) else None
     if observer:
         extras.append(
@@ -722,7 +741,13 @@ def interviewer_turn(
 
     qa_instructions = (
         "Follow the faculty briefing for WHAT to ask. "
-        f"This turn's format hint: {format_hint} "
+        + (
+            f"A next_topic question MUST be about focus_topic ({focus_topic}) and must stay inside "
+            "allowed_topics. Never substitute complexity/hash-map/DSA topics that are not listed. "
+            if allowed_topics and focus_topic
+            else ""
+        )
+        + f"This turn's format hint: {format_hint} "
         "If dynamic_question_ok is true, invent a NEW question matching briefing+topics "
         "(do not reuse stems from the transcript) — UNLESS the answer is weak/incomplete/off-topic. "
         "If candidate_answer_looks_weak OR candidate_answer_looks_incomplete is true, "
@@ -747,6 +772,8 @@ def interviewer_turn(
         "resume_excerpt": resume[:2500] or None,
         "resume_dossier": _compact_dossier(dossier if isinstance(dossier, dict) else None),
         "must_ask_next": must_ask or None,
+        "allowed_topics": allowed_topics or None,
+        "focus_topic": focus_topic or None,
         "candidate_answer_looks_weak": weak,
         "candidate_answer_looks_incomplete": incomplete,
         "skill_graph_summary": ctx.get("skill_graph_summary"),
@@ -855,6 +882,8 @@ def first_question(
     question_mix: str = "conceptual",
     followup_depth: str = "moderate",
     avoid_topics: str = "",
+    focus_topic: str = "",
+    resume_questions_allowed: bool = True,
 ) -> dict[str, Any] | None:
     """Generate the opening conceptual question (anchored to question graph when provided)."""
     if not llm_configured():
@@ -898,6 +927,22 @@ def first_question(
     )
     if avoid_topics:
         system += f" Do NOT ask about: {avoid_topics[:400]}."
+    topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
+    focus_topic = str(focus_topic or "").strip() or (topic_list[0] if topic_list else "")
+    if topic_list and not resume_only:
+        system += (
+            "\n\nTOPIC LOCK (HARD CONSTRAINT): the opening question must sit inside this list — "
+            + ", ".join(topic_list)
+            + ". Do NOT ask about time/space complexity, Big-O, hash maps, or other DSA topics "
+            "unless they appear in the list."
+        )
+        if focus_topic:
+            system += f" Open on this topic: {focus_topic}. Name it in the question."
+    if not resume_questions_allowed and not resume_only:
+        system += (
+            " RESUME IS OFF-LIMITS: do not ask about their resume, CV, listed projects, internships, "
+            "or past companies."
+        )
     if resume_only:
         system += (
             " RESUME MODE: You already analyzed their resume. The first question MUST name "
@@ -919,8 +964,12 @@ def first_question(
         ask_rule = (
             "Follow the faculty briefing and custom interviewer rules for topics and emphasis. "
             f"{format_hint} "
-            "Pick ONE focus topic from the topics list (or briefing). Name it in the question. "
-            "Ask for a concrete example, trade-off, or failure mode matching difficulty="
+            + (
+                f"Open on this topic: {focus_topic}. Name it in the question. "
+                if focus_topic
+                else "Pick ONE focus topic from the topics list (or briefing). Name it in the question. "
+            )
+            + "Ask for a concrete example, trade-off, or failure mode matching difficulty="
             f"{difficulty}. "
             "Do NOT default to generic hash-map / Big-O / sorted-array unless those topics are listed. "
             "Do not use bank stems."
@@ -942,6 +991,8 @@ def first_question(
                         "stage": "qa",
                         "role_track": role_track,
                         "topics": topics,
+                        "allowed_topics": topic_list or None,
+                        "focus_topic": focus_topic or None,
                         "resume_excerpt": (resume_text or "")[:2500] or None,
                         "resume_dossier": _compact_dossier(resume_dossier),
                         "must_ask_next": must_ask_next or None,
