@@ -304,13 +304,38 @@ def _reask_current_question(
     """
     Brief acknowledge + rephrase the same question.
     Used when STT is empty/weak or the answer is incomplete.
+    After a few loops on the same stem, move on so candidates are not stuck.
     """
+    count = int(state.get("same_question_reasks", 0) or 0) + 1
+    state["same_question_reasks"] = count
     state["current_hint_level"] = evidence_ledger.bump_hint(
         int(state.get("current_hint_level", 0) or 0),
         reason="followup",
     )
     state["followup_index"] = int(state.get("followup_index", 0) or 0) + 1
+
+    if count >= 3:
+        state["same_question_reasks"] = 0
+        state["current_hint_level"] = 0
+        state["followup_index"] = 0
+        if state.get("resume_plan"):
+            state["resume_plan_index"] = int(state.get("resume_plan_index") or 0) + 1
+        nxt = _next_resume_item(state)
+        if nxt and str(nxt.get("question") or "").strip():
+            q = llm_client._repair_resume_question(
+                str(nxt.get("question") or ""),
+                str(nxt.get("anchor") or ""),
+            )
+            return f"No problem — let's try a different angle. {q}".strip()
+        return (
+            "No problem — let's try a different angle. "
+            "Can you describe a specific challenge you faced while working on a project "
+            "and how you resolved it?"
+        )
+
     stem = _current_qa_stem(state, hint_bump=0)
+    if stem:
+        stem = llm_client._repair_resume_question(stem, str((_next_resume_item(state) or {}).get("anchor") or ""))
     if reason == "empty":
         lead = "I didn't catch that clearly."
     elif reason == "weak":
@@ -320,7 +345,6 @@ def _reask_current_question(
     else:
         lead = "Let me ask that again more simply."
     if stem:
-        # Avoid "Question: Question:" style doubles if stem already has a lead-in.
         return f"{lead} {stem}".strip()
     return f"{lead} Could you answer the last question again in your own words?"
 
@@ -1167,6 +1191,7 @@ def _activate_question(state: dict[str, Any], node: dict[str, Any] | None) -> No
     state["current_question_id"] = node["id"]
     state["current_hint_level"] = 0
     state["followup_index"] = 0
+    state["same_question_reasks"] = 0
     state["current_qa_id"] = f"{node['skill'][0]}.{node['skill'][1]}"
     ids = state.setdefault("asked_question_ids", [])
     if node["id"] not in ids:
@@ -1884,7 +1909,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         _save_state(row, state)
         return (
             "Thanks — I briefly lost the AI connection mid-question. "
-            f"({err[:120]}) Please continue your last point, or say done to wrap up."
+            "Please continue your last point, or say done to wrap up."
         )
 
     # Heuristic fallback only without API key.

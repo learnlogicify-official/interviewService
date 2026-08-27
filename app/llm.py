@@ -304,10 +304,37 @@ def is_off_lock_dsa(text: str, allowed_topics: list[str] | None) -> bool:
 
 
 def strip_spoken_meta(text: str) -> str:
-    """Drop rude grading lines and spoken scores. Never let those reach the mic."""
+    """Drop rude grading lines, spoken scores, and leaked API errors. Never let those reach the mic."""
     clean = " ".join((text or "").split()).strip()
     if not clean:
         return ""
+    # Never speak raw OpenAI / HTTP failure blobs mid-interview.
+    clean = re.sub(
+        r"(?is)\(\s*HTTP\s*\d{3}[^)]*\)",
+        "",
+        clean,
+    )
+    clean = re.sub(
+        r"(?is)\bhttps?://\S*(?:openai|api)\S*",
+        "",
+        clean,
+    )
+    clean = re.sub(
+        r"(?is)\{\s*\"error\"[\s\S]{0,400}",
+        "",
+        clean,
+    )
+    clean = re.sub(
+        r"(?i)\byou have no credits remain\w*\b[^.!?]*[.!]?",
+        "",
+        clean,
+    )
+    clean = re.sub(
+        r"(?i)\brate limit reached\b[^.!?]*[.!]?",
+        "",
+        clean,
+    )
+    clean = " ".join(clean.split()).strip()
     parts = re.split(r"(?<=[.!?])\s+", clean)
     kept: list[str] = []
     for part in parts:
@@ -315,7 +342,14 @@ def strip_spoken_meta(text: str) -> str:
         if not piece or RUDE_SPOKEN_RE.search(piece):
             continue
         kept.append(piece)
-    return " ".join(kept).strip()
+    out = " ".join(kept).strip()
+    if re.search(
+        r"(?i)(\bon\s+\w[\w ]{0,40},\s+what did you personally own|\bused it\b.*\bnearly went wrong\b|"
+        r"\bstaying on self[- ]introduction\b)",
+        out,
+    ):
+        out = _repair_resume_question(out)
+    return out
 
 
 def default_ack(style: str = "friendly") -> str:
@@ -484,9 +518,21 @@ def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_token
             resp = client.post(url, headers=headers, json={**payload_base, "response_format": {"type": "json_object"}})
             if resp.status_code >= 400:
                 body1 = resp.text[:300]
-                resp = client.post(url, headers=headers, json=payload_base)
+                # Quiet retry on rate-limit / transient overload before failing the turn.
+                if resp.status_code in {429, 500, 502, 503}:
+                    import time
+                    time.sleep(1.6 if resp.status_code == 429 else 0.8)
+                    resp = client.post(
+                        url,
+                        headers=headers,
+                        json={**payload_base, "response_format": {"type": "json_object"}},
+                    )
                 if resp.status_code >= 400:
-                    _set_error(f"HTTP {resp.status_code} from {url}: {resp.text[:300] or body1}")
+                    resp = client.post(url, headers=headers, json=payload_base)
+                if resp.status_code >= 400:
+                    # Keep diagnostics for /health — never put raw bodies into spoken turns.
+                    _set_error(f"HTTP {resp.status_code} from LLM provider")
+                    logger.warning("LLM HTTP %s: %s", resp.status_code, (resp.text[:300] or body1))
                     return None
             data = resp.json()
             content = (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
@@ -554,6 +600,100 @@ def _is_human_resume_line(ln: str) -> bool:
     return True
 
 
+_LEADING_PROJECT_VERBS = re.compile(
+    r"^(?:i\s+)?(?:have\s+)?(?:also\s+)?"
+    r"(?:developed|built|designed|implemented|created|worked\s+on|led|engineered|"
+    r"contributed\s+to|made|wrote|coding|project|application|platform)\s*[:\-]?\s*",
+    re.I,
+)
+_STOP_TITLE_WORDS = {
+    "the", "a", "an", "and", "or", "of", "for", "to", "in", "on", "with", "using",
+    "from", "my", "our", "this", "that", "into", "over", "under", "via",
+}
+
+
+def _project_title_from_line(ln: str) -> str:
+    """
+    Pull a short project title from a resume bullet.
+
+    Avoids spoken questions like "On Developed, …" or "On Driven Architecture Platform, …"
+    when the line is a long sentence starting with a verb.
+    """
+    s = re.sub(r"^[\-\*\u2022]+\s*", "", (ln or "").strip())
+    s = _LEADING_PROJECT_VERBS.sub("", s).strip(" :-–—")
+    quoted = re.search(r"[\"'“]([^\"'”]{3,60})[\"'”]", s)
+    if quoted:
+        return quoted.group(1).strip()
+    # "Title — description" / "Title: description"
+    headed = re.match(
+        r"^([A-Za-z][A-Za-z0-9+][\w ./\-+#]{1,50}?)(?:\s*[\-–—:|]\s+|\s+\(|$)",
+        s,
+    )
+    if headed:
+        title = headed.group(1).strip(" .")
+        words = title.split()
+        if 1 <= len(words) <= 8 and title.lower() not in {
+            "developed", "built", "project", "application", "platform", "system",
+        }:
+            return title
+    words = [
+        w for w in re.findall(r"[A-Za-z][A-Za-z0-9+.#]*", s)
+        if w.lower() not in _STOP_TITLE_WORDS
+    ]
+    if not words:
+        return "your project"
+    title = " ".join(words[:5])
+    if title.lower() in {"developed", "built", "platform", "application", "system", "project"}:
+        return "your project"
+    return title
+
+
+def _repair_resume_question(question: str, anchor: str = "") -> str:
+    """Rewrite broken resume probes so candidates hear a clear, named ask."""
+    q = " ".join((question or "").split()).strip()
+    if not q:
+        return q
+    anchor_title = _project_title_from_line(anchor) if anchor else ""
+    if anchor_title.lower() in {"", "your project"}:
+        anchor_title = ""
+
+    # "On Developed, what did you personally own…" / truncated mid-phrase titles
+    m = re.match(r"(?i)^on\s+(.+?),\s*(what did you personally own.+)$", q)
+    if m:
+        raw_name, rest = m.group(1).strip(), m.group(2).strip()
+        name = anchor_title or _project_title_from_line(raw_name)
+        if name.lower() in {"developed", "built", "your project"} or len(name.split()) == 1 and len(name) < 6:
+            return (
+                "Pick one project from your resume. What did you personally own end to end, "
+                "and what broke or nearly broke when real users or real data hit it?"
+            )
+        rest = rest[0].lower() + rest[1:] if rest else rest
+        return f"For your {name} project, {rest}"
+
+    # "…where you used it" with no skill/project referent
+    if re.search(r"(?i)\bused it\b", q) and not re.search(
+        r"(?i)\b(?:java|python|react|kafka|sql|node|spring|docker|aws|[\w+]{4,})\b.{0,40}\bused it\b",
+        q,
+    ):
+        if anchor_title:
+            return (
+                f"Your resume mentions {anchor_title}. Give one concrete situation where you used it, "
+                "the decision you made, and what nearly went wrong."
+            )
+        return (
+            "Pick one skill or project from your resume. Give a concrete situation where you used it, "
+            "the decision you made, and what nearly went wrong."
+        )
+
+    # "Staying on self-introduction: … used it" style mashups
+    if re.search(r"(?i)\bself[- ]introduction\b", q) and re.search(r"(?i)\bused it\b", q):
+        return (
+            "Introduce yourself briefly, then describe one specific situation from your resume: "
+            "the decision you had to make, and what nearly went wrong."
+        )
+    return q
+
+
 def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
     lines = [re.sub(r"^[\-\*\u2022]+\s*", "", ln).strip() for ln in (resume_text or "").splitlines()]
     lines = [ln for ln in lines if _is_human_resume_line(ln)]
@@ -574,12 +714,16 @@ def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
             r"(?i)\b(project|intern|developed|built|engineer|implemented|led|designed|application|platform)\b",
             ln,
         ):
+            title = _project_title_from_line(ln)
             projects.append({
-                "name": ln[:90],
+                "name": title[:90],
                 "stack": [],
                 "claim": ln[:280],
                 "hard_questions": [
-                    f"On {ln[:60]}, what did you personally own versus the team, and what broke in production?"
+                    _repair_resume_question(
+                        f"On {title[:60]}, what did you personally own versus the team, and what broke in production?",
+                        title,
+                    )
                 ],
             })
             if len(projects) >= 6:
@@ -590,18 +734,22 @@ def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
             "question": (p.get("hard_questions") or [""])[0],
         })
     for sk in skills[:6]:
+        sk_name = str(sk.get("name") or "").strip()
+        if len(sk_name) < 2:
+            continue
         plan.append({
-            "anchor": str(sk.get("name") or "this skill"),
+            "anchor": sk_name,
             "question": (
-                f"Your resume lists {sk.get('name')}. Give a concrete example from your work where you used it, "
+                f"Your resume lists {sk_name}. Give a concrete example from your work where you used it, "
                 "including a trade-off you made."
             ),
         })
     if not plan and lines:
+        title = _project_title_from_line(lines[0])
         plan.append({
-            "anchor": lines[0][:80],
+            "anchor": title[:80],
             "question": (
-                f"On {lines[0][:70]}, walk me through the hardest technical decision you made, "
+                f"On {title[:70]}, walk me through the hardest technical decision you made, "
                 "what you owned, and how you measured the result."
             ),
         })
@@ -613,12 +761,18 @@ def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
                 "your role, the hardest bug, and how you measured success."
             ),
         })
+    # Final pass: repair any leftover broken stems.
+    cleaned_plan: list[dict[str, str]] = []
+    for item in plan:
+        q = _repair_resume_question(str(item.get("question") or ""), str(item.get("anchor") or ""))
+        if q:
+            cleaned_plan.append({"anchor": str(item.get("anchor") or "")[:120], "question": q[:400]})
     return {
         "summary": (lines[0][:180] if lines else "Resume on file."),
         "projects": projects,
         "internships": [],
         "skills": skills,
-        "question_plan": plan[:12],
+        "question_plan": cleaned_plan[:12],
         "source": "heuristic",
     }
 
@@ -646,6 +800,12 @@ def _ensure_question_plan(dossier: dict[str, Any]) -> list[dict[str, str]]:
     seen: set[str] = set()
     out: list[dict[str, str]] = []
     for item in plan:
+        item["question"] = _repair_resume_question(
+            str(item.get("question") or ""),
+            str(item.get("anchor") or ""),
+        )
+        if not item["question"]:
+            continue
         key = re.sub(r"\s+", " ", item["question"].lower())[:160]
         if key in seen:
             continue
