@@ -144,7 +144,7 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
             {
                 "stage": t.get("stage"),
                 "role": t.get("role"),
-                "preview": (t.get("content") or "")[:200],
+                "preview": (t.get("content") or ""),
             }
         )
     # Enrich timeline tail with scored evidence markers.
@@ -156,7 +156,7 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
                 "preview": (
                     f"{e.get('dimension')} {e.get('score')}/100 · "
                     f"{e.get('hint_label')} · {e.get('skill') or e.get('question_id')}"
-                )[:200],
+                ),
                 "score": e.get("score"),
                 "hint_level": e.get("hint_level"),
             }
@@ -199,7 +199,7 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
         "no_knowledge_count": no_knowledge,
         "substantive_answers": substantive,
         "next_steps": next_steps,
-        "timeline": timeline[-50:],
+        "timeline": timeline,
         "problem_ids": state.get("used_problems", []),
         "flags": state.get("flags", []),
         "asked_question_ids": list(state.get("asked_question_ids") or []),
