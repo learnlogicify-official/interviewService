@@ -343,6 +343,12 @@ def strip_spoken_meta(text: str) -> str:
             continue
         kept.append(piece)
     out = " ".join(kept).strip()
+    # Mid-session turns must not re-introduce NexAI ("Hi, I'm NexAI…").
+    out = re.sub(
+        r"(?i)^(hi|hey|hello|welcome)[,!]?\s+(?:there[,!]?\s+)?i(?:'m| am)\s+nexai\b[^.!?]*[.!]?\s*",
+        "",
+        out,
+    ).strip()
     if re.search(
         r"(?i)(\bon\s+\w[\w ]{0,40},\s+what did you personally own|\bused it\b.*\bnearly went wrong\b|"
         r"\bstaying on self[- ]introduction\b)",

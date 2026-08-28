@@ -20,7 +20,7 @@ from app import voice_metrics
 from app.config import get_settings
 from app.models import CodingSnapshotRow, SessionRow, TurnRow
 from app.problems import get_problem, pick_problem, public_problem
-from app.report import build_report
+from app.report import build_report, idea_approach_explain_proxy
 from app.runner import evaluate_code
 
 
@@ -161,12 +161,23 @@ def _compose_profile_rules(
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()]
     if topic_list:
         parts.append("Focus topics (priority order): " + ", ".join(topic_list[:12]) + ".")
+        parts.append(
+            "Coverage rule: work through the focus topics before coding. "
+            "Do not jump to coding while major listed areas (for example project deep-dive, "
+            "Java/OOP, DSA, DBMS/SQL, OS, or networks) are still untouched — ask at least one "
+            "concrete question in each listed area when time allows."
+        )
     if avoid_topics:
         parts.append("Do NOT ask about: " + avoid_topics.strip()[:400] + ".")
     parts.append(
         "Invent fresh questions aligned to these rules. Do not default to generic hash-map / Big-O openers "
         "unless topics or briefing explicitly include them."
     )
+    if include_coding:
+        parts.append(
+            "Do not set next_action=move_to_coding until the spoken technical round has covered "
+            "most focus topics or the engine closes Q&A on time. Prefer next_topic / followup."
+        )
     return "\n".join(parts)
 
 
@@ -388,8 +399,8 @@ def _elapsed(row: SessionRow) -> int:
 def _phase_bounds(row: SessionRow, state: dict[str, Any] | None = None) -> tuple[int, int]:
     """Return (qa_seconds, wrap_seconds).
 
-    Default ~30% Q&A / ~5% wrap (rest coding). Custom interviewers may set
-    qa_seconds explicitly so a 30-minute screen can be e.g. 10 min technical + coding.
+    Default ~50% Q&A / ~5% wrap (rest coding), so a 30-minute screen gets ~15 min
+    spoken technical before coding. Custom interviewers may set qa_seconds explicitly.
     """
     settings = get_settings()
     total = max(10, int(row.duration_minutes or 17)) * 60
@@ -403,8 +414,12 @@ def _phase_bounds(row: SessionRow, state: dict[str, Any] | None = None) -> tuple
         ceiling = max(floor, total - wrap - 120)
         qa = max(floor, min(ceiling, qa_override))
     else:
-        qa_share = float(settings.qa_share or 0.30)
+        qa_share = float(settings.qa_share or 0.50)
         qa = int(settings.qa_seconds) if int(settings.qa_seconds or 0) > 0 else int(total * qa_share)
+        # Floor: at least half the session (capped so coding+wrap still fit).
+        half = int(total * 0.50)
+        ceiling = max(60, total - wrap - 120)
+        qa = max(qa, min(half, ceiling))
     return qa, wrap
 
 
@@ -833,6 +848,8 @@ def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> d
         # Never invent conceptual credit when no scored Q&A happened.
         state["score_conceptual"] = float(state.get("score_conceptual") or 0)
 
+    _resolve_pending_explain(state, row)
+
     report = build_report(state, turns)
     row.status = "completed"
     row.stage = "done"
@@ -957,11 +974,43 @@ def _configured_topics(state: dict[str, Any]) -> list[str]:
 
 
 def _resume_questions_allowed(row: SessionRow, state: dict[str, Any]) -> bool:
-    """Resume-anchored questions only on the resume track or when faculty asked for them."""
+    """Resume-anchored questions when the candidate supplied a CV or faculty asked for them."""
     if _is_resume_track(row.role_track, state):
+        return True
+    resume = (state.get("resume_text") or "").strip()
+    if len(resume) >= 80 or state.get("resume_plan"):
         return True
     briefing = (state.get("interviewer_briefing") or "").lower()
     return any(k in briefing for k in ("resume", "cv ", " cv", "their projects", "past projects"))
+
+
+def _resume_plan_quota(state: dict[str, Any]) -> int:
+    """How many resume-plan items to weave into a mixed (non-resume-only) interview."""
+    plan = list(state.get("resume_plan") or [])
+    if not plan:
+        return 0
+    return min(max(3, len(plan)), 6)
+
+
+def _take_planned_resume_question(state: dict[str, Any]) -> str | None:
+    """
+    Pull the next resume-plan question when the candidate uploaded a CV.
+
+    Used on technical tracks so projects/internships are grilled, not only generic topics.
+    """
+    plan = list(state.get("resume_plan") or [])
+    if not plan:
+        return None
+    idx = int(state.get("resume_plan_index") or 0)
+    if idx >= len(plan) or idx >= _resume_plan_quota(state):
+        return None
+    item = plan[idx]
+    state["resume_plan_index"] = idx + 1
+    q = str(item.get("question") or "").strip()
+    if not q:
+        return None
+    anchor = str(item.get("anchor") or "")
+    return llm_client._repair_resume_question(q, anchor)
 
 
 def _topic_locked(row: SessionRow, state: dict[str, Any]) -> bool:
@@ -1338,6 +1387,7 @@ def _next_topic_turn(
     state["followup_index"] = 0
     state["current_hint_level"] = 0
     _note_topic_turn(state)
+    resume_only = _is_resume_track(row.role_track, state)
     if generated and generated.get("reply"):
         if generated.get("topic_tag"):
             state["current_qa_id"] = str(generated["topic_tag"])[:80]
@@ -1345,6 +1395,14 @@ def _next_topic_turn(
             state["current_qa_id"] = focus[:80]
         _save_state(row, state)
         return str(generated["reply"]).strip()
+
+    if not resume_only and _resume_questions_allowed(row, state):
+        planned = _take_planned_resume_question(state)
+        if planned:
+            _save_state(row, state)
+            if lead and not lead.endswith((".", "!", "?")):
+                lead += "."
+            return f"{lead} {planned}".strip() if lead else planned
 
     if focus:
         state["current_qa_id"] = focus[:80]
@@ -1796,8 +1854,10 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
         _apply_score_communication(state, answer, score)
         state["qa_index"] = idx + 1
-        if _is_resume_track(row.role_track, state) and action != "followup":
-            state["resume_plan_index"] = int(state.get("resume_plan_index") or 0) + 1
+        if _resume_questions_allowed(row, state) and action != "followup":
+            # Resume-only tracks advance every turn; mixed tracks use _take_planned_resume_question.
+            if _is_resume_track(row.role_track, state):
+                state["resume_plan_index"] = int(state.get("resume_plan_index") or 0) + 1
         state["llm_mode"] = True
         state["difficulty_ceiling"] = question_graph.adjust_difficulty_ceiling(
             int(state.get("difficulty_ceiling", 2) or 2),
@@ -1825,6 +1885,13 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         )
 
         force_coding = _should_enter_coding(row, state)
+        # Custom briefings often ask for SQL / Java / DBMS before coding — do not let the
+        # model skip the spoken round early while QA time remains.
+        if action == "move_to_coding" and not force_coding:
+            qa_budget = _qa_budget_seconds(row, state)
+            if _elapsed(row) < int(0.85 * qa_budget):
+                action = "next_topic"
+                state["force_fresh_question"] = True
         if force_coding or action == "move_to_coding":
             state["coding_after_answer"] = False
             _save_state(row, state)
@@ -1855,6 +1922,11 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             return _next_topic_turn(db, row, state, bridge=bridge)
         if action == "next_topic":
             _note_topic_turn(state)
+            if not resume_only and _resume_questions_allowed(row, state):
+                planned = _take_planned_resume_question(state)
+                if planned:
+                    _save_state(row, state)
+                    return planned
         nxt = None if (resume_only or topic_locked) else question_graph.pick_next(
             role_track=row.role_track,
             graph=state["skill_graph"],
@@ -2152,6 +2224,35 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
     return result["feedback"] + " Reply with a clearer plan (structure + complexity + edges)."
 
 
+def _resolve_pending_explain(state: dict[str, Any], row: SessionRow | None = None) -> None:
+    """Credit pre-coding approach narration when a live explain prompt was left unanswered."""
+    if not state.get("explain_pending"):
+        return
+    state["explain_pending"] = False
+    if float(state.get("score_explain", 0) or 0) > 0:
+        return
+    proxy = idea_approach_explain_proxy(state)
+    if proxy <= 0:
+        return
+    credit = round(min(75.0, proxy * 0.82), 1)
+    state["score_explain"] = max(float(state.get("score_explain", 0) or 0), credit)
+    evidence_ledger.record(
+        state,
+        stage="explain",
+        dimension="explanation",
+        score=credit,
+        skill="coding.explanation",
+        question_id=str(state.get("moodle_problem_id") or state.get("current_problem_id") or "explain"),
+        hint_level=0,
+        note="Approach narration credited (live code walkthrough unanswered)",
+        source="idea_carryover",
+        elapsed=_elapsed(row) if row is not None else 0,
+    )
+    if row is not None:
+        row.stage = "code"
+        state["awaiting"] = "code"
+
+
 def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: str) -> str | None:
     if row.stage != "code":
         return None
@@ -2173,6 +2274,7 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
         return None
     state["explain_excerpt"] = excerpt
     state["explain_count"] = int(state.get("explain_count", 0)) + 1
+    state["explain_pending"] = True
     state["interrupt_code_len"] = len(code)
     state["last_interrupt_elapsed"] = _elapsed(row)
     state["awaiting"] = "explain"
@@ -2202,6 +2304,7 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
 
 
 def _handle_explain(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
+    state["explain_pending"] = False
     excerpt = state.get("explain_excerpt", "")
     llm_result = llm_client.interviewer_turn(
         stage="explain",
@@ -2371,7 +2474,11 @@ def handle_message(
     elif row.stage == "idea":
         reply = _handle_idea(db, row, state, text)
     elif row.stage == "explain":
-        reply = _handle_explain(db, row, state, text)
+        if re.search(r"\b(skip|pass|move on|next)\b", text.lower()):
+            _resolve_pending_explain(state, row)
+            reply = "No problem — keep coding and run tests when you are ready."
+        else:
+            reply = _handle_explain(db, row, state, text)
     elif row.stage == "code":
         llm_result = llm_client.interviewer_turn(
             stage="code",
@@ -2567,6 +2674,25 @@ def handle_coding_result(
     ratio = passed / max(1, total)
     pid = int(problem_id or state.get("moodle_problem_id") or 0)
 
+    if all_passed and total > 0 and state.get("explain_pending") and row.stage != "explain":
+        _resolve_pending_explain(state, row)
+        state.pop("explain_submit_nudge", None)
+
+    if all_passed and total > 0 and state.get("explain_pending") and row.stage == "explain":
+        if not state.get("explain_submit_nudge"):
+            state["explain_submit_nudge"] = True
+            _save_state(row, state)
+            spoken = (
+                "Before we continue — please answer my last question about your code out loud. "
+                "Say skip if you want to move on."
+            )
+            _add_turn(db, row.id, "explain", "assistant", spoken, {"explain_nudge": True})
+            db.commit()
+            db.refresh(row)
+            return session_view(db, row)
+        _resolve_pending_explain(state, row)
+        state.pop("explain_submit_nudge", None)
+
     if all_passed and total > 0:
         state["score_coding"] = max(float(state.get("score_coding", 0) or 0), 85.0 + min(15.0, ratio * 15))
         state["problems_solved_count"] = int(state.get("problems_solved_count", 0) or 0) + 1
@@ -2668,6 +2794,8 @@ def assign_moodle_problem(
     state["idea_attempts"] = 0
     state["explain_count"] = 0
     state["idea_hint_level"] = 0
+    state["explain_pending"] = False
+    state.pop("explain_submit_nudge", None)
     state["awaiting"] = "idea"
     row.stage = "idea"
     _save_state(row, state)

@@ -11,6 +11,14 @@ TRACK_SKILLS: dict[str, dict[str, Any]] = {
         "dsa": {"label": "DSA", "children": {"arrays": 0.5, "hashmap": 0.5, "stacks": 0.5, "complexity": 0.5}},
         "oop": {"label": "OOP", "children": {"encapsulation": 0.5, "polymorphism": 0.5}},
         "sql": {"label": "SQL", "children": {"indexes": 0.5, "joins": 0.5}},
+        "projects": {
+            "label": "Projects & experience",
+            "children": {"architecture": 0.5, "debugging": 0.5, "tradeoffs": 0.5},
+        },
+        "systems": {
+            "label": "Systems",
+            "children": {"caching": 0.5, "queues": 0.5, "concurrency": 0.5},
+        },
         "coding": {"label": "Coding", "children": {"correctness": 0.5, "edge_cases": 0.5, "style": 0.5}},
         "communication": {"label": "Communication", "children": {"clarity": 0.5, "structure": 0.5}},
     },
@@ -18,6 +26,10 @@ TRACK_SKILLS: dict[str, dict[str, Any]] = {
         "javascript": {"label": "JavaScript", "children": {"closures": 0.5, "async": 0.5, "dom": 0.5}},
         "react": {"label": "React", "children": {"hooks": 0.5, "state": 0.5, "perf": 0.5}},
         "css": {"label": "CSS", "children": {"layout": 0.5, "responsive": 0.5}},
+        "projects": {
+            "label": "Projects & experience",
+            "children": {"architecture": 0.5, "debugging": 0.5, "tradeoffs": 0.5},
+        },
         "coding": {"label": "Coding", "children": {"correctness": 0.5, "edge_cases": 0.5}},
         "communication": {"label": "Communication", "children": {"clarity": 0.5, "structure": 0.5}},
     },
@@ -25,6 +37,10 @@ TRACK_SKILLS: dict[str, dict[str, Any]] = {
         "apis": {"label": "APIs", "children": {"rest": 0.5, "auth": 0.5, "idempotency": 0.5}},
         "databases": {"label": "Databases", "children": {"sql": 0.5, "indexes": 0.5, "transactions": 0.5}},
         "systems": {"label": "Systems", "children": {"caching": 0.5, "queues": 0.5, "scalability": 0.5}},
+        "projects": {
+            "label": "Projects & experience",
+            "children": {"architecture": 0.5, "debugging": 0.5, "tradeoffs": 0.5},
+        },
         "coding": {"label": "Coding", "children": {"correctness": 0.5, "edge_cases": 0.5}},
         "communication": {"label": "Communication", "children": {"clarity": 0.5, "structure": 0.5}},
     },
@@ -32,6 +48,10 @@ TRACK_SKILLS: dict[str, dict[str, Any]] = {
         "ml": {"label": "ML", "children": {"supervised": 0.5, "eval": 0.5, "overfitting": 0.5}},
         "llm": {"label": "LLMs", "children": {"prompting": 0.5, "rag": 0.5, "safety": 0.5}},
         "python": {"label": "Python", "children": {"numpy": 0.5, "data": 0.5}},
+        "projects": {
+            "label": "Projects & experience",
+            "children": {"architecture": 0.5, "debugging": 0.5, "tradeoffs": 0.5},
+        },
         "coding": {"label": "Coding", "children": {"correctness": 0.5, "edge_cases": 0.5}},
         "communication": {"label": "Communication", "children": {"clarity": 0.5, "structure": 0.5}},
     },
@@ -49,6 +69,11 @@ TOPIC_ALIASES: dict[str, tuple[str, str]] = {
     "hash map": ("dsa", "hashmap"),
     "arrays": ("dsa", "arrays"),
     "array": ("dsa", "arrays"),
+    "inversion": ("dsa", "arrays"),
+    "merge sort": ("dsa", "complexity"),
+    "mergesort": ("dsa", "complexity"),
+    "circular": ("dsa", "arrays"),
+    "queue": ("dsa", "stacks"),
     "stack": ("dsa", "stacks"),
     "stacks": ("dsa", "stacks"),
     "complexity": ("dsa", "complexity"),
@@ -56,6 +81,11 @@ TOPIC_ALIASES: dict[str, tuple[str, str]] = {
     "oop": ("oop", "encapsulation"),
     "encapsulation": ("oop", "encapsulation"),
     "polymorphism": ("oop", "polymorphism"),
+    "abstract": ("oop", "polymorphism"),
+    "interface": ("oop", "polymorphism"),
+    "inheritance": ("oop", "polymorphism"),
+    "java": ("oop", "encapsulation"),
+    "class": ("oop", "encapsulation"),
     "sql": ("sql", "joins"),
     "index": ("sql", "indexes"),
     "indexes": ("sql", "indexes"),
@@ -68,6 +98,21 @@ TOPIC_ALIASES: dict[str, tuple[str, str]] = {
     "auth": ("apis", "auth"),
     "cache": ("systems", "caching"),
     "caching": ("systems", "caching"),
+    "redis": ("systems", "caching"),
+    "sidekiq": ("systems", "queues"),
+    "worker": ("systems", "queues"),
+    "workers": ("systems", "queues"),
+    "concurrency": ("systems", "concurrency"),
+    "concurrent": ("systems", "concurrency"),
+    "compile": ("systems", "concurrency"),
+    "compilation": ("systems", "concurrency"),
+    "load": ("systems", "concurrency"),
+    "lms": ("projects", "architecture"),
+    "project": ("projects", "architecture"),
+    "projects": ("projects", "architecture"),
+    "resume": ("projects", "architecture"),
+    "internship": ("projects", "tradeoffs"),
+    "franchise": ("projects", "tradeoffs"),
     "rag": ("llm", "rag"),
     "llm": ("llm", "prompting"),
 }
@@ -88,6 +133,23 @@ def default_graph(role_track: str) -> dict[str, Any]:
 
 def _clamp(v: float) -> float:
     return max(0.0, min(1.0, float(v)))
+
+
+def _fallback_skill(graph: dict[str, Any]) -> tuple[str, str]:
+    """Route unknown tags to a topic bucket — never the communication clarity leaf."""
+    for parent, child in (
+        ("projects", "architecture"),
+        ("stack", "depth"),
+        ("systems", "concurrency"),
+        ("dsa", "complexity"),
+        ("oop", "encapsulation"),
+    ):
+        if parent in graph and child in (graph[parent].get("children") or {}):
+            return parent, child
+    parent = "communication" if "communication" in graph else next(iter(graph))
+    kids = graph[parent].get("children") or {}
+    child = "structure" if "structure" in kids else next(iter(kids), "clarity")
+    return parent, child
 
 
 def update_skill(
@@ -111,6 +173,8 @@ def update_skill(
     if parent is None:
         # Try direct parent/child names.
         for p, node in graph.items():
+            if str(p).startswith("_"):
+                continue
             if p in tag:
                 parent = p
                 kids = list(node.get("children", {}).keys())
@@ -121,9 +185,9 @@ def update_skill(
                         break
                 break
     if parent is None or parent not in graph:
-        # Park unknown topics under communication/clarity for tracking.
-        parent = "communication" if "communication" in graph else next(iter(graph))
-        child = next(iter(graph[parent]["children"]))
+        parent, child = _fallback_skill(graph)
+    elif child not in (graph.get(parent, {}).get("children") or {}):
+        parent, child = _fallback_skill(graph)
 
     kids = graph[parent].setdefault("children", {})
     if child not in kids:

@@ -32,8 +32,8 @@ class Settings(BaseSettings):
     default_duration_minutes: int = 17
     cors_origins: str = "*"
     # Share of the session: technical Q&A / coding / spoken wrap.
-    qa_share: float = 0.30
-    coding_share: float = 0.65
+    qa_share: float = 0.50
+    coding_share: float = 0.45
     wrap_share: float = 0.05
     qa_seconds: int = 0  # 0 = derive from qa_share * duration
     coding_seconds: int = 0

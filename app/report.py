@@ -24,11 +24,44 @@ def recommendation_label(score: float) -> str:
     return "not_ready"
 
 
+def idea_approach_explain_proxy(state: dict[str, Any]) -> float:
+    """
+    Pre-coding approach narrations (idea stage) partially reflect explanation ability.
+    Uses evidence rows rather than the peak score_idea alone.
+    """
+    rows = [
+        float(e.get("score", 0) or 0)
+        for e in (state.get("evidence") or [])
+        if e.get("stage") == "idea" and e.get("dimension") == "problem_solving"
+    ]
+    if not rows:
+        return 0.0
+    best = max(rows)
+    avg = sum(rows) / len(rows)
+    return best * 0.6 + avg * 0.4
+
+
+def blend_explanation_score(state: dict[str, Any]) -> float:
+    """
+    Combine live code walkthrough (explain stage) with pre-coding approach narration.
+    Avoids a harsh zero when the candidate explained clearly before coding.
+    """
+    explicit = float(state.get("score_explain", 0) or 0)
+    idea_proxy = idea_approach_explain_proxy(state)
+    if explicit > 0 and idea_proxy > 0:
+        return round(explicit * 0.55 + idea_proxy * 0.45, 1)
+    if explicit > 0:
+        return round(explicit, 1)
+    if idea_proxy > 0:
+        return round(min(80.0, idea_proxy * 0.88), 1)
+    return 0.0
+
+
 def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str, Any]:
     conceptual = float(state.get("score_conceptual", 0))
     problem_solving = float(state.get("score_idea", 0))
     coding = float(state.get("score_coding", 0))
-    explanation = float(state.get("score_explain", 0))
+    explanation = blend_explanation_score(state)
     communication = float(state.get("score_communication", 0))
 
     hint_meta = evidence_ledger.hint_summary(state)
@@ -109,6 +142,20 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
                 "label": node.get("label", parent),
                 "children": kids_out,
             }
+
+    # Drop misleading communication/clarity when other topic skills were tested.
+    comm = skill_confidence.get("communication", {})
+    comm_kids = comm.get("children") or {}
+    if (
+        comm_kids.get("clarity", 1.0) < 0.2
+        and len(touched) > 1
+        and any(k for k in touched if not k.startswith("communication."))
+    ):
+        comm_kids.pop("clarity", None)
+        if comm_kids:
+            skill_confidence["communication"] = {**comm, "children": comm_kids}
+        else:
+            skill_confidence.pop("communication", None)
 
     next_steps = []
     if not substantive:
