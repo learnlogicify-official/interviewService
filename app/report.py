@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from app import evidence as evidence_ledger
@@ -187,11 +188,16 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
     for t in turns:
         if t.get("role") not in {"assistant", "student"}:
             continue
+        preview = (t.get("content") or "").strip()
+        if re.search(r"(?i)^\s*hidden\s+coach\b", preview):
+            continue
+        if not preview:
+            continue
         timeline.append(
             {
                 "stage": t.get("stage"),
                 "role": t.get("role"),
-                "preview": (t.get("content") or ""),
+                "preview": preview,
             }
         )
     # Enrich timeline tail with scored evidence markers.

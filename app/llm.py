@@ -112,6 +112,24 @@ FILLER_RE = re.compile(
     re.I,
 )
 
+PHANTOM_STT_RE = re.compile(
+    r"(?i)("
+    r"thank you for watching|thanks for watching|"
+    r"like,?\s*comment\s*(and|&)?\s*subscribe|"
+    r"don'?t forget to like|smash that like|"
+    r"please subscribe|thanks for listening|"
+    r"see you in the next"
+    r")"
+)
+
+
+def is_phantom_transcript(text: str) -> bool:
+    """True for YouTube-style STT hallucinations on silence."""
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return False
+    return bool(PHANTOM_STT_RE.search(clean))
+
 # Admissions of ignorance / no technical substance (still long enough to pass weak-gate).
 NO_KNOWLEDGE_RE = re.compile(
     r"(?i)\b("
@@ -1040,7 +1058,8 @@ def score_turn(
     if not cue:
         cue = f"Stay on: {topic_tag}." if topic_tag else "Probe one level deeper, then one short question."
     return {
-        "reply": cue,
+        "reply": "",
+        "cue": cue,
         "score": max(0.0, min(100.0, score)),
         "next_action": action,
         "topic_tag": topic_tag,

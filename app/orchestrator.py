@@ -524,6 +524,7 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
             if row.stage in {"idea", "code", "explain", "wrap"}
             else str(state.get("current_qa_id") or "")[:80]
         ),
+        "realtime_cue": str(state.get("realtime_cue") or "")[:180],
         "voice_metrics": state.get("voice_metrics") or {},
         "turns": [
             {
@@ -1743,11 +1744,6 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         # (unless follow-up depth budget is exhausted → move on).
         max_fu = int(state.get("max_followups_per_question", 2) or 2)
         fu_count = int(state.get("followup_index", 0) or 0)
-        dynamic_ok = (
-            bool(state.get("interviewer_briefing"))
-            or bool(state.get("moodle_interviewer_id"))
-            or _is_resume_track(row.role_track, state)
-        )
         if action != "followup" and (
             score < 40
             or llm_client.looks_incomplete_answer(answer)
@@ -1757,9 +1753,6 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                 action = "followup"
             else:
                 action = "next_topic"
-                # Bridge only — the real question is generated below so the
-                # candidate never hears a bare "let's move on".
-                llm_result["reply"] = _move_on_bridge(state)
                 llm_result["next_action"] = "next_topic"
                 state["force_fresh_question"] = True
 
@@ -1768,7 +1761,6 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             if fu_count >= max_fu:
                 # Depth budget used — accept score and move topic instead of looping.
                 action = "next_topic"
-                llm_result["reply"] = _move_on_bridge(state)
                 llm_result["next_action"] = "next_topic"
                 state["force_fresh_question"] = True
             else:
@@ -1797,30 +1789,11 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                     source="llm",
                     elapsed=_elapsed(row),
                 )
-                reply = (llm_result.get("reply") or "").strip()
-                # Bank-stem injection only for non-custom bank mode — custom / briefing
-                # interviews must stay on the LLM (and faculty rules), not DSA stems.
-                if (not dynamic_ok) and node and new_hint >= 1:
-                    stem = question_graph.spoken_prompt(
-                        node,
-                        hint_level=new_hint,
-                        followup_index=int(state.get("followup_index", 0) or 0),
-                    )
-                    if "?" not in reply:
-                        lead = reply.rstrip() or "Let me rephrase."
-                        reply = f"{lead} {stem}".strip()
-                if reply and (
-                    llm_client.is_vague_question(reply)
-                    or llm_client.is_off_lock_dsa(reply, _configured_topics(state))
-                ):
-                    # A generic probe wastes the turn — change topic with a real question.
-                    return _next_topic_turn(db, row, state)
-                if not reply:
-                    reply = "I didn't catch a clear answer — could you rephrase that in one sentence?"
                 if llm_result.get("topic_tag"):
                     state["current_qa_id"] = str(llm_result["topic_tag"])[:80]
+                # Realtime invents the spoken follow-up — never store coach cues or bank stems.
                 _save_state(row, state)
-                return reply
+                return ""
 
         if action == "next_topic":
             state["followup_index"] = 0
@@ -1875,90 +1848,22 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             # right as the problem statement appears.
             return _close_qa_then_code(db, row, state)
 
-        # Advance along the curated graph (weakest-skill policy).
-        briefing = state.get("interviewer_briefing") or ""
-        resume_only = _is_resume_track(row.role_track, state)
-        dynamic_ok = bool(briefing) or bool(state.get("moodle_interviewer_id")) or resume_only
-        # Custom / briefed interviews with a topic list never touch the DSA bank —
-        # that is what pulled sessions into hash-map / complexity questions.
-        topic_locked = _topic_locked(row, state)
-        force_fresh = bool(state.pop("force_fresh_question", False))
-        model_reply_raw = (llm_result.get("reply") or "").strip()
-        if force_fresh or (
-            action == "next_topic"
-            and model_reply_raw
-            and (
-                llm_client.is_vague_question(model_reply_raw)
-                or llm_client.is_off_lock_dsa(model_reply_raw, _configured_topics(state))
-            )
-        ):
-            # The engine (not the model) decided to change topic, or the model's
-            # question was too generic to speak — generate a real one.
-            bridge = model_reply_raw if force_fresh else ""
-            return _next_topic_turn(db, row, state, bridge=bridge)
+        # Realtime owns spoken Q&A. Persist scores only — never a coach note or extra stem.
+        if llm_result.get("topic_tag"):
+            tag = str(llm_result["topic_tag"])[:80]
+            if tag.lower() not in _GENERIC_SKILL_TAGS:
+                state["current_qa_id"] = tag
         if action == "next_topic":
             _note_topic_turn(state)
-            if not resume_only and _resume_questions_allowed(row, state):
-                planned = _take_planned_resume_question(state)
-                if planned:
-                    _save_state(row, state)
-                    return planned
-        nxt = None if (resume_only or topic_locked) else question_graph.pick_next(
-            role_track=row.role_track,
-            graph=state["skill_graph"],
-            asked_ids=list(state.get("asked_question_ids") or []),
-            difficulty_ceiling=int(state.get("difficulty_ceiling", 2) or 2),
-            topics=topics,
-            briefing=briefing,
-            # Soft bank hint only; do not force snippet nodes every turn.
-            prefer_format=None,
-        )
-        model_reply = (llm_result.get("reply") or "").strip()
-        # With a faculty briefing / custom interviewer, trust the LLM's next question
-        # so sessions aren't locked to the same bank stems. Do not activate a bank
-        # node we are not going to speak — that caused the next turn to re-ask it.
-        if dynamic_ok and model_reply and "?" in model_reply:
-            if llm_result.get("topic_tag"):
-                state["current_qa_id"] = str(llm_result["topic_tag"])[:80]
-            state["current_question_id"] = ""
-            _save_state(row, state)
-            return model_reply
-        if nxt:
-            spoken = question_graph.spoken_prompt(nxt, hint_level=0)
-            if model_reply and _is_similar_q(model_reply, spoken):
-                _activate_question(state, nxt)
-                _save_state(row, state)
-                return spoken
-            if "?" in model_reply and len(model_reply) < 280:
-                _activate_question(state, nxt)
-                _save_state(row, state)
-                return model_reply
-            _activate_question(state, nxt)
-            bridge = model_reply.split("?")[0].strip() if model_reply else "Thanks."
-            if "?" in (model_reply or ""):
-                # Model already asked something — don't also speak the bank stem.
-                out = model_reply
-            else:
-                if bridge and not bridge.endswith((".", "!", "?")):
-                    bridge += "."
-                out = f"{bridge} {spoken}".strip()
-            _save_state(row, state)
-            return out
-
+            cue = str(llm_result.get("cue") or "").strip()
+            if cue:
+                state["realtime_cue"] = cue[:180]
         _save_state(row, state)
-        reply = (llm_result.get("reply") or "").strip()
-        if "?" not in reply:
-            # Never trail off without a question — ask a real one on the next topic.
-            return _next_topic_turn(db, row, state, bridge=reply)
-        return reply
+        return ""
 
     if llm_client.llm_configured():
-        err = llm_client.last_error() or "LLM call failed"
         _save_state(row, state)
-        return (
-            "Thanks — I briefly lost the AI connection mid-question. "
-            "Please continue your last point, or say done to wrap up."
-        )
+        return ""
 
     # Heuristic fallback only without API key.
     keywords = list((node or {}).get("keywords") or [])
@@ -2003,31 +1908,8 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         _save_state(row, state)
         return _close_qa_then_code(db, row, state)
 
-    if _topic_locked(row, state):
-        _save_state(row, state)
-        return _ensure_specific_question(db, row, state, feedback)
-
-    nxt = question_graph.pick_next(
-        role_track=row.role_track,
-        graph=state["skill_graph"],
-        asked_ids=list(state.get("asked_question_ids") or []),
-        difficulty_ceiling=int(state.get("difficulty_ceiling", 2) or 2),
-        topics=state.get("topics") or _loads(row.topics_json, []),
-        briefing=state.get("interviewer_briefing") or "",
-    )
-    if nxt:
-        _activate_question(state, nxt)
-        _save_state(row, state)
-        return feedback + f"\n\nNext question:\n\n**{nxt['stem']}**"
-
-    used = set(state.get("asked_topics", []))
-    bank_nxt = next((item for item in evaluator.TECH_BANK if item["id"] not in used), None)
-    if not bank_nxt:
-        bank_nxt = evaluator.TECH_BANK[state["qa_index"] % len(evaluator.TECH_BANK)]
-    state["current_qa_id"] = bank_nxt["id"]
-    state.setdefault("asked_topics", []).append(bank_nxt["id"])
     _save_state(row, state)
-    return feedback + f"\n\nNext question:\n\n**{bank_nxt['question']}**"
+    return ""
 
 
 def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
@@ -2098,7 +1980,31 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     )
 
 
+_SOLUTION_ASK_RE = re.compile(
+    r"(?i)\b(solution|give me the (answer|code)|tell me the (answer|solution)|explain the question|"
+    r"what is the (problem|question)|which model|chatgpt)\b"
+)
+_APPROACH_HINTS = (
+    "array", "index", "loop", "complex", "o(n)", "hash", "edge", "length",
+    "mid", "sort", "scan", "pointer", "sum", "prefix",
+)
+
+
+def _looks_like_coding_approach(text: str) -> bool:
+    blob = (text or "").lower()
+    words = re.findall(r"[a-z0-9]+", blob)
+    if len(words) < 18:
+        return False
+    hits = sum(1 for k in _APPROACH_HINTS if k in blob)
+    return hits >= 2
+
+
 def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
+    if _SOLUTION_ASK_RE.search(answer or ""):
+        return (
+            "I will not give the solution or read the problem aloud — it is on your screen. "
+            "Walk me through your approach: data structure, main steps, time complexity, and one edge case."
+        )
     if llm_client.is_weak_answer(answer, min_words=8):
         return (
             "Give me a clearer plan first — data structure, main steps, time complexity, and one edge case. "
@@ -2108,7 +2014,8 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
     problem = None
     if state.get("current_problem_id"):
         problem = get_problem(state["current_problem_id"])
-    state["idea_attempts"] = int(state.get("idea_attempts", 0)) + 1
+    if _looks_like_coding_approach(answer):
+        state["idea_attempts"] = int(state.get("idea_attempts", 0)) + 1
 
     llm_result = llm_client.interviewer_turn(
         stage="idea",
@@ -2131,7 +2038,11 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
     if llm_result:
         state["score_idea"] = max(float(state.get("score_idea", 0)), float(llm_result["score"]))
         action = llm_result["next_action"]
-        unlock = action == "unlock_editor"
+        unlock = (
+            action == "unlock_editor"
+            and _looks_like_coding_approach(answer)
+            and float(llm_result["score"]) >= 55.0
+        )
         idea_hint = evidence_ledger.bump_hint(
             int(state.get("idea_hint_level", 0) or 0),
             reason="probe_idea" if not unlock else "followup",
@@ -2150,34 +2061,49 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             source="llm",
             elapsed=_elapsed(row),
         )
-        # Don't unlock just because they tried twice — only if NexAI is satisfied,
-        # or the coding window is almost gone.
-        if not unlock and int(state.get("idea_attempts", 0)) >= 1 and _seconds_remaining(row) <= (
-            int(get_settings().wrap_seconds or 120) + 180
+        # Only force-unlock near wrap after several real approach attempts.
+        if not unlock and int(state.get("idea_attempts", 0)) >= 3 and _seconds_remaining(row) <= (
+            int(get_settings().wrap_seconds or 120) + 90
         ):
-            unlock = True
-        if not unlock and int(state.get("idea_attempts", 0)) >= 5:
+            unlock = _looks_like_coding_approach(answer)
+        if not unlock and int(state.get("idea_attempts", 0)) >= 5 and _looks_like_coding_approach(answer):
             unlock = True
             state["idea_hint_level"] = 3
         if unlock:
             row.stage = "code"
             state["awaiting"] = "code"
+            state["editor_just_unlocked"] = True
             _save_state(row, state)
             return (
-                llm_result["reply"]
-                + "\n\nEditor unlocked. Implement in the NexPractice IDE and run tests when ready. "
+                "Your plan is solid enough — the editor is unlocked. "
+                "Implement in the NexPractice IDE and run tests when ready. "
                 "I can see your editor and may ask about your logic — I will not give the solution."
             )
         _save_state(row, state)
-        return llm_result["reply"]
+        # Realtime owns the spoken probe during duplex; keep a short engine note for the report only
+        # when it is a real question (not a lecture).
+        spoken = str(llm_result.get("reply") or "").strip()
+        if spoken and "?" in spoken and "hidden coach" not in spoken.lower():
+            return spoken
+        return (
+            "Keep going on the approach — data structure, main steps, time complexity, and one edge case. "
+            "I unlock the editor once that plan is clear."
+        )
 
     if not problem:
+        if not _looks_like_coding_approach(answer):
+            _save_state(row, state)
+            return (
+                "The problem is on your screen — I will not read it. "
+                "Give me the data structure, main steps, time complexity, and one edge case first."
+            )
         row.stage = "code"
         state["awaiting"] = "code"
         state["score_idea"] = max(float(state.get("score_idea", 0)), 55.0)
+        state["editor_just_unlocked"] = True
         _save_state(row, state)
         return (
-            "Solid enough — editor unlocked. Implement in NexPractice and run tests when ready. "
+            "Solid enough — the editor is unlocked. Implement in NexPractice and run tests when ready. "
             "I may interrupt you to explain a piece of logic."
         )
 
@@ -2187,6 +2113,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
     if unlock:
         row.stage = "code"
         state["awaiting"] = "code"
+        state["editor_just_unlocked"] = True
         _save_state(row, state)
         note = (
             result["feedback"]
@@ -2195,7 +2122,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
         )
         return (
             f"{note}\n\n"
-            "Editor unlocked. Implement in the NexPractice IDE and run tests when ready. "
+            "The editor is unlocked. Implement in the NexPractice IDE and run tests when ready. "
             "I may ask about the code you write — I will not give the solution."
         )
     _save_state(row, state)
@@ -2361,6 +2288,8 @@ def handle_message(
         return session_view(db, row)
 
     text = (message or "").strip()
+    if llm_client.is_phantom_transcript(text):
+        return session_view(db, row)
     if not text:
         state = _state(row)
         if row.stage in {"qa", "idea"}:
@@ -2414,7 +2343,7 @@ def handle_message(
         _note_voice_and_claims(state, text, duration_sec)
         _add_turn(db, row.id, row.stage, "student", text, {"weak": True, "voice": state.get("voice_metrics", {}).get("latest")})
         if row.stage == "qa":
-            reply = _reask_current_question(state, reason="weak")
+            reply = ""
         else:
             reply = (
                 "That came through incomplete. "
@@ -2424,7 +2353,8 @@ def handle_message(
                 int(state.get("idea_hint_level", 0) or 0),
                 reason="followup",
             )
-        _add_turn(db, row.id, row.stage, "assistant", reply)
+        if reply:
+            _add_turn(db, row.id, row.stage, "assistant", reply)
         _save_state(row, state)
         db.commit()
         db.refresh(row)
@@ -2505,6 +2435,9 @@ def handle_message(
         cleaned = _reask_current_question(state, reason="unclear") if row.stage in {"qa", "idea"} else (
             "Thanks — stay with that last question and go a bit deeper."
         )
+    # Never persist scorer coach notes as spoken interviewer turns.
+    if cleaned and re.search(r"(?i)^\s*hidden\s+coach\b", cleaned):
+        cleaned = ""
     if cleaned:
         handoff = bool(state.pop("coding_handoff", None))
         _add_turn(
