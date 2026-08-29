@@ -65,18 +65,37 @@ def llm_ping() -> dict:
 @router.post("/realtime/token")
 def realtime_token(body: RealtimeTokenRequest, db: Session = Depends(get_db)) -> dict:
     """Mint ephemeral OpenAI Realtime client secret for browser WebRTC."""
+    import json
+
     from app import realtime as realtime_mod
 
     verify_signature(["realtime_token", body.session_id], body.signature, body.timestamp)
     row = orch.get_session(db, body.session_id)
     if not row:
         raise HTTPException(status_code=404, detail="Session not found")
+    state: dict = {}
+    topics: list = []
+    try:
+        state = json.loads(row.state_json or "{}") or {}
+    except Exception:
+        state = {}
+    try:
+        topics = json.loads(row.topics_json or "[]") or []
+    except Exception:
+        topics = []
+    if isinstance(state.get("topics"), list) and state.get("topics"):
+        topics = [str(t) for t in state["topics"] if str(t).strip()]
     return realtime_mod.create_client_secret(
         session_id=row.id,
         student_name=row.student_name,
         role_track=row.role_track,
         stage=row.stage,
         moodle_user_id=row.moodle_user_id,
+        topics=topics,
+        briefing=str(state.get("interviewer_briefing") or ""),
+        include_coding=bool(state.get("include_coding", True)),
+        style=str(state.get("interviewer_style") or "friendly"),
+        duration_minutes=int(row.duration_minutes or 17),
     )
 
 
