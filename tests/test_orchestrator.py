@@ -146,6 +146,46 @@ def test_nexai_timed_flow_and_editor_lock():
         db.close()
 
 
+def test_coding_handoff_not_replaced_on_java_topics():
+    """Coding cutover text mentions data structures; do not rewrite it as another Java stem."""
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=4,
+            moodle_cm_id=0,
+            moodle_instance_id=0,
+            student_name="Ravi",
+            role_track="sde_intern",
+            duration_minutes=30,
+            topics=["java", "dbms"],
+            moodle_problem_id=7,
+            moodle_problem_title="Two Sum",
+        )
+        sid = view["session_id"]
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "yes")
+        assert view["stage"] == "qa"
+        row = _rewind(db, orch.get_session(db, sid), 1000)
+        view = orch.handle_message(
+            db,
+            row,
+            "In Java, ArrayList remove during a for-each throws ConcurrentModificationException. "
+            "Use an Iterator.remove or collect indices and delete after the loop. "
+            "DBMS transactions need isolation so dirty reads do not leak uncommitted rows.",
+        )
+        assert view["stage"] == "idea"
+        assert view["ui"]["show_editor"] is True
+        last = [t for t in view["turns"] if t["role"] == "assistant"][-1]
+        spoken = last["content"].lower()
+        assert "wraps the technical" in spoken or "move to coding" in spoken
+        assert last.get("meta", {}).get("coding_handoff") is True
+        assert "next question" not in spoken
+    finally:
+        db.close()
+
+
 def test_end_asks_permission():
     init_db()
     db = SessionLocal()

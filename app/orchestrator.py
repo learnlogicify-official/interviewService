@@ -519,7 +519,11 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
             "overall": row.overall_score,
         },
         "skill_graph": {k: v for k, v in (state.get("skill_graph") or {}).items() if not str(k).startswith("_")},
-        "qa_topic": str(state.get("current_qa_id") or "")[:80],
+        "qa_topic": (
+            ""
+            if row.stage in {"idea", "code", "explain", "wrap"}
+            else str(state.get("current_qa_id") or "")[:80]
+        ),
         "voice_metrics": state.get("voice_metrics") or {},
         "turns": [
             {
@@ -883,7 +887,9 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
                 db.refresh(row)
             return session_view(db, row)
         spoken = _close_qa_then_code(db, row, state)
-        _add_turn(db, row.id, row.stage, "assistant", spoken)
+        state.pop("coding_handoff", None)
+        _save_state(row, state)
+        _add_turn(db, row.id, row.stage, "assistant", spoken, {"coding_handoff": True})
         db.commit()
         db.refresh(row)
         return session_view(db, row)
@@ -1124,6 +1130,10 @@ def _ensure_specific_question(
 
     Does not advance the topic cursor — the engine already chose the topic.
     """
+    # Coding / wrap lines mention data structures on purpose. Replacing them with
+    # another Java/DBMS stem is how the voice kept Q&A going after the IDE opened.
+    if row.stage in {"idea", "code", "explain", "wrap"} or state.get("coding_handoff"):
+        return llm_client.strip_spoken_meta(reply or "") or (reply or "")
     topics = _configured_topics(state)
     text = llm_client.strip_spoken_meta(reply or "")
     if (
@@ -1701,66 +1711,31 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         last_q = prev[0] if prev else ""
     except Exception:
         last_q = ""
-    observer = None
-    try:
-        observer = llm_client.observe_answer(
-            stage="qa",
-            role_track=row.role_track,
-            topics=topics,
-            last_question=last_q,
-            student_message=answer,
-            code_excerpt=str(state.get("current_code") or "")[:1200],
-            difficulty=str(state.get("difficulty") or "intermediate"),
-            asked_questions=_asked_question_texts(db, row),
-            probes_on_topic=int(state.get("followup_index", 0) or 0),
-            interviewer_style=str(state.get("interviewer_style") or "friendly"),
-        )
-    except Exception:
-        observer = None
-    if observer:
-        state["last_observer"] = observer
-        trail = state.setdefault("observer_trail", [])
-        trail.append({
-            "qa_index": idx,
-            "depth": observer.get("depth"),
-            "score_hint": observer.get("score_hint"),
-            "gaps": observer.get("gaps") or [],
-            "probe": (observer.get("probe") or "")[:160],
-        })
-        state["observer_trail"] = trail[-24:]
 
-    ctx = _llm_context(row, state)
-    ctx["asked_questions"] = _asked_question_texts(db, row)
-    if observer:
-        ctx["observer"] = observer
-
-    llm_result = llm_client.interviewer_turn(
+    llm_result = llm_client.score_turn(
         stage="qa",
         role_track=row.role_track,
         topics=topics,
-        transcript=_recent_transcript(db, row.id),
+        last_question=last_q,
         student_message=answer,
-        context=ctx,
+        asked_questions=_asked_question_texts(db, row),
+        briefing=str(state.get("interviewer_briefing") or ""),
+        current_topic=str(state.get("current_qa_id") or _focus_topic(state) or ""),
+        include_coding=_include_coding(state),
+        probes_on_topic=int(state.get("followup_index", 0) or 0),
     )
 
     if llm_result:
-        # Prefer observer score hint when the model is overly generous on thin answers.
+        # Thin answers should not look stronger than they are.
         model_score = float(llm_result["score"])
-        if observer and observer.get("depth") in {"superficial", "partial"}:
-            model_score = min(model_score, float(observer.get("score_hint", model_score)))
+        if llm_result.get("depth") == "superficial":
+            model_score = min(model_score, 45.0)
         score = llm_client.clamp_answer_score(answer, model_score)
         action = llm_result["next_action"]
-        if observer and observer.get("next_action_hint") == "followup" and action == "next_topic":
-            # Observer says still shallow — force a probe unless depth budget exhausted.
+        if llm_result.get("depth") in {"superficial", "partial"} and action == "next_topic":
             max_fu = int(state.get("max_followups_per_question", 2) or 2)
             if int(state.get("followup_index", 0) or 0) < max_fu:
                 action = "followup"
-                probe = str(observer.get("probe") or "").strip()
-                ack = str(observer.get("ack") or "").strip()
-                if not ack or re.match(r"(?i)^(got it|understood)\.?$", ack):
-                    ack = llm_client.default_ack(str(state.get("interviewer_style") or "friendly"))
-                if probe and "?" in probe:
-                    llm_result["reply"] = f"{ack} {probe}".strip()
                 llm_result["next_action"] = "followup"
         reported_hint = int(llm_result.get("hint_level", hint_now) or hint_now)
 
@@ -2061,6 +2036,8 @@ def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     if not _include_coding(state):
         return _begin_wrap_no_coding(db, row, state)
     coding = _start_coding_round(db, row, state)
+    state["coding_handoff"] = True
+    _save_state(row, state)
     return (
         "Thanks — that wraps the technical questions. "
         + coding
@@ -2469,9 +2446,9 @@ def handle_message(
         else:
             reply = "Just say yes when you're ready to begin."
     elif row.stage == "qa":
-        reply = _ensure_specific_question(
-            db, row, state, _next_qa_or_coding(db, row, state, text)
-        )
+        reply = _next_qa_or_coding(db, row, state, text)
+        if row.stage == "qa" and "?" in (reply or ""):
+            reply = _ensure_specific_question(db, row, state, reply)
     elif row.stage == "idea":
         reply = _handle_idea(db, row, state, text)
     elif row.stage == "explain":
@@ -2529,7 +2506,17 @@ def handle_message(
             "Thanks — stay with that last question and go a bit deeper."
         )
     if cleaned:
-        _add_turn(db, row.id, row.stage, "assistant", cleaned)
+        handoff = bool(state.pop("coding_handoff", None))
+        _add_turn(
+            db,
+            row.id,
+            row.stage,
+            "assistant",
+            cleaned,
+            {"coding_handoff": True} if handoff else None,
+        )
+    else:
+        state.pop("coding_handoff", None)
     _save_state(row, state)
     db.commit()
     db.refresh(row)

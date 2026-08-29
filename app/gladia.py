@@ -51,7 +51,7 @@ def create_live_session(
     if not key:
         return {"ok": False, "error": "GLADIA_API_KEY missing", "url": "", "id": ""}
 
-    lang = language_code(language)
+    lang = "en"
     payload: dict[str, Any] = {
         "model": "solaria-1",
         "encoding": "wav/pcm",

@@ -50,9 +50,7 @@ def transcribe(audio_base64: str, *, filename: str = "audio.webm", language: str
             tmp_path = Path(tmp.name)
         try:
             with httpx.Client(timeout=90.0) as client:
-                data = {"model": model}
-                if language:
-                    data["language"] = language.split("-")[0]
+                data = {"model": model, "language": (language.split("-")[0] if language else "en") or "en"}
                 files = {"file": (f"speech{suffix}", tmp_path.read_bytes(), "application/octet-stream")}
                 resp = client.post(
                     url,

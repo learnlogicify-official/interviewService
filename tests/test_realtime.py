@@ -16,10 +16,12 @@ def test_instructions_include_topics_and_duplex_role():
         resume_dossier={"projects": [{"name": "CampusPay"}], "skills": ["React"]},
     )
     assert "Priya" in text
+    assert "never invent another name" in text.lower()
     assert "javascript" in text
     assert "accessibility" in text.lower() or "Focus on accessibility" in text
     assert "NexAI" in text
     assert "CampusPay" in text
+    assert "English" in text
     assert "invent" in text.lower()
     assert "Do NOT invent" not in text
 
@@ -45,3 +47,31 @@ def test_coach_note_is_not_a_script():
     assert "Stay on: java" in note
     wrap = coach_note("Thanks for your time today.", wrap=True)
     assert wrap.startswith("WRAP:")
+    coding = coach_note(
+        "Thanks — that wraps the technical questions. Let's move to coding.",
+        topic="java",
+    )
+    assert "CODING ROUND" in coding
+    assert "invent" not in coding.lower()
+    assert "Stay on: java" not in coding
+
+
+def test_coding_stage_instructions_stop_qa():
+    text = interviewer_instructions(
+        student_name="Priya Sharma",
+        role_track="sde_intern",
+        stage="idea",
+        topics=["java", "dbms"],
+    )
+    assert "PROBLEM SOLVING" in text
+    assert "technical Q&A round is OVER" in text
+    assert "ArrayList" not in text
+
+
+def test_scorer_prompt_is_compact():
+    from app.llm import SCORER_SYSTEM, score_turn
+
+    assert "JSON only" in SCORER_SYSTEM
+    assert "do NOT write a question" in SCORER_SYSTEM
+    assert len(SCORER_SYSTEM) < 1600
+    assert callable(score_turn)

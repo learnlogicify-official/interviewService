@@ -23,6 +23,7 @@ Voice pacing: acknowledgements ≤12 words. Questions 12–28 spoken words — o
 Talk like a sharp human on a video call, not a written exam. Contractions. Vary bridges.
 Ask as if you just thought of the scenario ("Say you're…", "Quick one —", "Imagine…").
 One short acknowledgement then ONE question — never monologue, lecture, or stack multiple questions.
+LANGUAGE: English only for every spoken line, caption, and reply. Never Tamil, Hindi, Chinese, or any other language.
 No markdown headings, no bullet lists, no "as an AI".
 
 TONE (applies to EVERY turn, including weak answers and topic changes):
@@ -522,19 +523,18 @@ def chat(messages: list[dict[str, str]], *, temperature: float = 0.55, max_token
             resp = client.post(url, headers=headers, json={**payload_base, "response_format": {"type": "json_object"}})
             if resp.status_code >= 400:
                 body1 = resp.text[:300]
-                # Quiet retry on rate-limit / transient overload before failing the turn.
-                if resp.status_code in {429, 500, 502, 503}:
+                # One retry: rate-limit keeps JSON mode; other 4xx fall back once without it.
+                if resp.status_code in {429, 502, 503}:
                     import time
-                    time.sleep(1.6 if resp.status_code == 429 else 0.8)
+                    time.sleep(1.2 if resp.status_code == 429 else 0.4)
                     resp = client.post(
                         url,
                         headers=headers,
                         json={**payload_base, "response_format": {"type": "json_object"}},
                     )
-                if resp.status_code >= 400:
+                elif resp.status_code in {400, 422}:
                     resp = client.post(url, headers=headers, json=payload_base)
                 if resp.status_code >= 400:
-                    # Keep diagnostics for /health — never put raw bodies into spoken turns.
                     _set_error(f"HTTP {resp.status_code} from LLM provider")
                     logger.warning("LLM HTTP %s: %s", resp.status_code, (resp.text[:300] or body1))
                     return None
@@ -967,6 +967,88 @@ def observe_answer(
     }
 
 
+SCORER_SYSTEM = """You score a live technical-interview answer. You do NOT interview and you do NOT write a question.
+Return JSON only:
+{"score":0-100,"next_action":"followup|next_topic|move_to_coding","topic_tag":"short topic","depth":"superficial|partial|solid|strong","cue":"hidden coach: stay on X or switch to Y"}
+Rules:
+- score honestly; thin or off-topic answers ≤40.
+- followup if they were shallow and the same topic still has room.
+- next_topic if the answer was solid or two probes already happened.
+- move_to_coding only when coding_enabled is true AND they are clearly ready to leave conceptual Q&A.
+- cue is a coach note for the voice model — never a question to read aloud, never a score.
+- Stay on faculty_topics. English only. Max 24 words in cue.
+"""
+
+
+def score_turn(
+    *,
+    stage: str,
+    role_track: str,
+    topics: list[str],
+    last_question: str,
+    student_message: str,
+    asked_questions: list[str] | None = None,
+    briefing: str = "",
+    current_topic: str = "",
+    include_coding: bool = True,
+    probes_on_topic: int = 0,
+) -> dict[str, Any] | None:
+    """One cheap JSON call: score + next_action + topic cue. Realtime speaks the question."""
+    if not llm_configured():
+        return None
+    topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:8]
+    raw = chat(
+        [
+            {"role": "system", "content": SCORER_SYSTEM},
+            {
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "stage": stage,
+                        "role_track": role_track,
+                        "coding_enabled": bool(include_coding),
+                        "faculty_topics": topic_list,
+                        "current_topic": (current_topic or "")[:80],
+                        "faculty_briefing": " ".join((briefing or "").split())[:400],
+                        "last_interviewer_question": (last_question or "")[:280],
+                        "candidate_just_said": (student_message or "")[:700],
+                        "already_asked": [str(q)[:120] for q in (asked_questions or [])[-6:]],
+                        "probes_already_on_this_idea": int(probes_on_topic or 0),
+                    }
+                ),
+            },
+        ],
+        temperature=0.2,
+        max_tokens=160,
+        timeout=10.0,
+    )
+    data = _extract_json(raw or "")
+    if not data:
+        return None
+    action = str(data.get("next_action") or "followup").strip().lower()
+    if action not in {"followup", "next_topic", "move_to_coding"}:
+        action = "followup"
+    depth = str(data.get("depth") or "partial").strip().lower()
+    if depth not in {"superficial", "partial", "solid", "strong"}:
+        depth = "partial"
+    try:
+        score = float(data.get("score", 50))
+    except Exception:
+        score = 50.0
+    topic_tag = str(data.get("topic_tag") or current_topic or (topic_list[0] if topic_list else "")).strip()[:80]
+    cue = " ".join(str(data.get("cue") or "").split())[:180]
+    if not cue:
+        cue = f"Stay on: {topic_tag}." if topic_tag else "Probe one level deeper, then one short question."
+    return {
+        "reply": cue,
+        "score": max(0.0, min(100.0, score)),
+        "next_action": action,
+        "topic_tag": topic_tag,
+        "hint_level": 0,
+        "depth": depth,
+    }
+
+
 def interviewer_turn(
     *,
     stage: str,
@@ -989,7 +1071,7 @@ def interviewer_turn(
     history = "\n".join(history_lines) if history_lines else "(interview just started)"
 
     asked = ctx.get("asked_topics") or []
-    resume = (ctx.get("resume_text") or "")[:8000]
+    resume = (ctx.get("resume_text") or "")[:500]
     dossier = ctx.get("resume_dossier") or {}
     must_ask = ctx.get("must_ask_next") or {}
     weak = is_weak_answer(student_message)
