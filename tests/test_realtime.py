@@ -24,16 +24,15 @@ def test_instructions_include_topics_and_duplex_role():
     assert "Do NOT invent" not in text
 
 
-def test_turn_detection_semantic():
+def test_turn_detection_server_vad():
     td = _turn_detection(create_response=False)
-    assert td["type"] == "semantic_vad"
-    assert td["eagerness"] == "medium"
+    assert td["type"] == "server_vad"
+    assert td["silence_duration_ms"] == 700
     assert td["create_response"] is False
     assert td["interrupt_response"] is True
-    fallback = _turn_detection(create_response=True, semantic=False)
-    assert fallback["type"] == "server_vad"
-    assert fallback["silence_duration_ms"] == 700
-    assert fallback["create_response"] is True
+    semantic = _turn_detection(create_response=True, semantic=True)
+    assert semantic["type"] == "semantic_vad"
+    assert semantic["create_response"] is True
 
 
 def test_coach_note_is_not_a_script():

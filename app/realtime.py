@@ -140,7 +140,7 @@ def interviewer_instructions(
     )
 
 
-def _turn_detection(*, create_response: bool, semantic: bool = True) -> dict[str, Any]:
+def _turn_detection(*, create_response: bool, semantic: bool = False) -> dict[str, Any]:
     if semantic:
         return {
             "type": "semantic_vad",
