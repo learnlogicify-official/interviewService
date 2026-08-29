@@ -55,7 +55,11 @@ def _resume_context(dossier: dict[str, Any] | None) -> str:
         bits.append("Skills: " + ", ".join(skills))
     if not bits:
         return ""
-    return "CANDIDATE RESUME (ground questions here when relevant): " + " ".join(bits)[:900]
+    return (
+        "CANDIDATE RESUME — you MUST spend at least three questions on these exact items "
+        "(their project, internship, or stack), asking what they built, owned, and what broke: "
+        + " ".join(bits)[:900]
+    )
 
 
 def coach_note(engine_reply: str = "", *, topic: str = "", wrap: bool = False) -> str:
@@ -376,6 +380,7 @@ def create_client_secret(
                             "duplex": True,
                             "transcribe": transcribe,
                             "truncation": trunc,
+                            "instructions": instructions,
                             "error": "",
                             "api": "realtime/sessions",
                         }
@@ -398,6 +403,7 @@ def create_client_secret(
                 "duplex": True,
                 "transcribe": transcribe,
                 "truncation": trunc,
+                "instructions": instructions,
                 "error": "",
                 "api": "realtime/client_secrets",
             }

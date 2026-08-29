@@ -38,9 +38,13 @@ END_EXACT = {
     "end interview",
 }
 END_PHRASE_RE = re.compile(
-    r"\b((i (want to|wanna|would like to) (end|stop|finish))|"
-    r"(end|stop|finish) (the )?(interview|session)|"
-    r"wrap up( the interview)?)\b",
+    r"\b((i (want to|wanna|would like to|think we (can|should)) (end|stop|finish|wrap))|"
+    r"(can|could|shall|should|may) we (please )?(end|stop|finish|wrap)|"
+    r"(let'?s|lets) (just )?(end|stop|finish|wrap)|"
+    r"(end|stop|finish) (the )?(interview|session|round)|"
+    r"wrap (up|it up|this up)( the interview)?|"
+    r"that'?s (it|all) (for|from) me|"
+    r"i'?m done( here| with this| for today)?)\b",
     re.I,
 )
 YES_RE = re.compile(r"\b(yes|yeah|yep|yup|sure|confirm|please do|go ahead|end it|that's fine|ok)\b", re.I)
@@ -51,7 +55,8 @@ def _is_end_intent(text: str) -> bool:
     t = " ".join((text or "").lower().split()).strip()
     if t in END_EXACT:
         return True
-    if len(t.split()) <= 10 and END_PHRASE_RE.search(t):
+    # Spoken requests run long ("okay I think we can wrap up the interview now, thanks").
+    if len(t.split()) <= 24 and END_PHRASE_RE.search(t):
         return True
     return False
 
@@ -524,7 +529,8 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
             if row.stage in {"idea", "code", "explain", "wrap"}
             else str(state.get("current_qa_id") or "")[:80]
         ),
-        "realtime_cue": str(state.get("realtime_cue") or "")[:180],
+        "realtime_cue": str(state.get("realtime_cue") or "")[:300],
+        "awaiting_end_confirm": bool(state.get("awaiting_end_confirm")),
         "voice_metrics": state.get("voice_metrics") or {},
         "turns": [
             {
@@ -897,6 +903,26 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
         db.commit()
         db.refresh(row)
         return session_view(db, row)
+    if row.stage == "idea":
+        if state.get("idea_started_elapsed") is None:
+            state["idea_started_elapsed"] = _elapsed(row)
+            _save_state(row, state)
+            db.commit()
+            db.refresh(row)
+        elif _idea_seconds(row, state) >= IDEA_STAGE_MAX_SECONDS:
+            # The approach probe must never hold the editor hostage, even if transcripts
+            # never reached the engine.
+            state["score_idea"] = max(float(state.get("score_idea", 0)), 45.0)
+            spoken = _unlock_editor(
+                row,
+                state,
+                "Let's get you coding — the editor is unlocked. Implement in NexPractice and run "
+                "tests when ready. I'll ask about your logic as you go.",
+            )
+            _add_turn(db, row.id, row.stage, "assistant", spoken, {"coding_handoff": True})
+            db.commit()
+            db.refresh(row)
+            return session_view(db, row)
     if _expire_if_needed(db, row):
         db.refresh(row)
         return session_view(db, row)
@@ -1859,8 +1885,20 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         if action == "next_topic":
             _note_topic_turn(state)
             cue = str(llm_result.get("cue") or "").strip()
+            # Realtime invents the spoken question, so a resume item only gets asked if it
+            # rides along as a cue. Without this the uploaded CV is never touched in duplex.
+            if _resume_questions_allowed(row, state) and not _is_resume_track(row.role_track, state):
+                planned = _take_planned_resume_question(state)
+                if planned:
+                    cue = "Ask about their resume next, in your own words: " + planned
+            elif _is_resume_track(row.role_track, state):
+                plan = list(state.get("resume_plan") or [])
+                idx = int(state.get("resume_plan_index") or 0)
+                planned = str(plan[idx].get("question") or "").strip() if 0 <= idx < len(plan) else ""
+                if planned:
+                    cue = "Ask about their resume next, in your own words: " + planned
             if cue:
-                state["realtime_cue"] = cue[:180]
+                state["realtime_cue"] = cue[:300]
         _save_state(row, state)
         return ""
 
@@ -1959,6 +1997,7 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
         row.stage = "idea"
         state["idea_attempts"] = 0
         state["explain_count"] = 0
+        state["idea_started_elapsed"] = _elapsed(row)
         _save_state(row, state)
         return (
             f"Let's move to coding. Open {title} on your screen — the editor stays locked for now. "
@@ -1974,6 +2013,7 @@ def _start_coding_round(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     state["current_code"] = problem.get("starter_code", "")
     state["awaiting"] = "idea"
     row.stage = "idea"
+    state["idea_started_elapsed"] = _elapsed(row)
     _save_state(row, state)
     return (
         f"Let's move to coding. The problem on your screen is {problem['title']}. "
@@ -2002,13 +2042,53 @@ def _looks_like_coding_approach(text: str) -> bool:
     return hits >= 2
 
 
+_READY_TO_CODE_RE = re.compile(
+    r"(?i)\b(unlock (the )?editor|let me (start |just )?(code|coding|implement|write)|"
+    r"i'?m ready to (code|start|implement)|can i (start |begin )?(code|coding|implement)|"
+    r"(let'?s|lets) (code|start coding)|start coding|open the editor)\b"
+)
+# Max wall-clock the approach discussion may consume before the editor opens anyway.
+IDEA_STAGE_MAX_SECONDS = 210
+
+
+def _idea_seconds(row: SessionRow, state: dict[str, Any]) -> int:
+    started = state.get("idea_started_elapsed")
+    if started is None:
+        return 0
+    return max(0, _elapsed(row) - int(started or 0))
+
+
+def _substantive_idea_answer(text: str) -> bool:
+    return len(re.findall(r"[a-z0-9]+", (text or "").lower())) >= 10
+
+
+def _unlock_editor(row: SessionRow, state: dict[str, Any], note: str) -> str:
+    row.stage = "code"
+    state["awaiting"] = "code"
+    state["editor_just_unlocked"] = True
+    _save_state(row, state)
+    return note
+
+
 def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
+    idea_secs = _idea_seconds(row, state)
+    attempts = int(state.get("idea_attempts", 0) or 0)
     if _SOLUTION_ASK_RE.search(answer or ""):
         return (
             "I will not give the solution or read the problem aloud — it is on your screen. "
             "Walk me through your approach: data structure, main steps, time complexity, and one edge case."
         )
     if llm_client.is_weak_answer(answer, min_words=8):
+        # Never loop forever on the approach — open the editor and judge the code instead.
+        if idea_secs >= IDEA_STAGE_MAX_SECONDS or attempts >= 2:
+            state["score_idea"] = max(float(state.get("score_idea", 0)), 45.0)
+            state["idea_hint_level"] = 3
+            return _unlock_editor(
+                row,
+                state,
+                "Let's not spend more time on the plan — the editor is unlocked. "
+                "Start implementing in NexPractice and I'll ask about your logic as you go.",
+            )
         return (
             "Give me a clearer plan first — data structure, main steps, time complexity, and one edge case. "
             "Then I will unlock the editor."
@@ -2017,8 +2097,24 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
     problem = None
     if state.get("current_problem_id"):
         problem = get_problem(state["current_problem_id"])
-    if _looks_like_coding_approach(answer):
-        state["idea_attempts"] = int(state.get("idea_attempts", 0)) + 1
+    if _substantive_idea_answer(answer):
+        state["idea_attempts"] = attempts = attempts + 1
+    if _READY_TO_CODE_RE.search(answer or "") and (attempts >= 1 or idea_secs >= 60):
+        state["score_idea"] = max(float(state.get("score_idea", 0)), 50.0)
+        return _unlock_editor(
+            row,
+            state,
+            "Alright — the editor is unlocked. Implement in NexPractice and run tests when ready. "
+            "I can see your code and may ask why you chose that approach.",
+        )
+    if idea_secs >= IDEA_STAGE_MAX_SECONDS:
+        state["score_idea"] = max(float(state.get("score_idea", 0)), 50.0)
+        return _unlock_editor(
+            row,
+            state,
+            "That's enough on the plan — the editor is unlocked. Implement in NexPractice and run "
+            "tests when ready. I'll ask about your logic while you code.",
+        )
 
     llm_result = llm_client.interviewer_turn(
         stage="idea",
@@ -2041,11 +2137,12 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
     if llm_result:
         state["score_idea"] = max(float(state.get("score_idea", 0)), float(llm_result["score"]))
         action = llm_result["next_action"]
-        unlock = (
-            action == "unlock_editor"
-            and _looks_like_coding_approach(answer)
-            and float(llm_result["score"]) >= 55.0
+        score_now = float(llm_result["score"])
+        unlock = action == "unlock_editor" and score_now >= 50.0 and (
+            _looks_like_coding_approach(answer) or attempts >= 2
         )
+        if not unlock and _looks_like_coding_approach(answer) and score_now >= 60.0:
+            unlock = True
         idea_hint = evidence_ledger.bump_hint(
             int(state.get("idea_hint_level", 0) or 0),
             reason="probe_idea" if not unlock else "followup",
@@ -2064,23 +2161,22 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             source="llm",
             elapsed=_elapsed(row),
         )
-        # Only force-unlock near wrap after several real approach attempts.
-        if not unlock and int(state.get("idea_attempts", 0)) >= 3 and _seconds_remaining(row) <= (
-            int(get_settings().wrap_seconds or 120) + 90
+        # Hard stops so the approach probe can never become an endless loop.
+        if not unlock and attempts >= 2 and _seconds_remaining(row) <= (
+            int(get_settings().wrap_seconds or 120) + 120
         ):
-            unlock = _looks_like_coding_approach(answer)
-        if not unlock and int(state.get("idea_attempts", 0)) >= 5 and _looks_like_coding_approach(answer):
+            unlock = True
+            state["idea_hint_level"] = 3
+        if not unlock and attempts >= 3:
             unlock = True
             state["idea_hint_level"] = 3
         if unlock:
-            row.stage = "code"
-            state["awaiting"] = "code"
-            state["editor_just_unlocked"] = True
-            _save_state(row, state)
-            return (
-                "Your plan is solid enough — the editor is unlocked. "
+            return _unlock_editor(
+                row,
+                state,
+                "Your plan is good enough to start — the editor is unlocked. "
                 "Implement in the NexPractice IDE and run tests when ready. "
-                "I can see your editor and may ask about your logic — I will not give the solution."
+                "I can see your editor and may ask about your logic — I will not give the solution.",
             )
         _save_state(row, state)
         # Realtime owns the spoken probe during duplex; keep a short engine note for the report only
@@ -2112,7 +2208,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
 
     result = evaluator.score_idea(answer, problem)
     state["score_idea"] = max(float(state.get("score_idea", 0)), result["score"])
-    unlock = result["accepted"] or int(state.get("idea_attempts", 0)) >= 5
+    unlock = result["accepted"] or attempts >= 3
     if unlock:
         row.stage = "code"
         state["awaiting"] = "code"
@@ -2722,6 +2818,7 @@ def assign_moodle_problem(
     state.pop("explain_submit_nudge", None)
     state["awaiting"] = "idea"
     row.stage = "idea"
+    state["idea_started_elapsed"] = _elapsed(row)
     _save_state(row, state)
     spoken = (
         f"Nice work — all tests passed. Next problem: {title}. "
