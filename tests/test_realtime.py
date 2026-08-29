@@ -23,6 +23,6 @@ def test_instructions_include_topics_and_duplex_role():
 
 
 def test_turn_detection_duplex():
-    td = _turn_detection(create_response=True)
-    assert td["create_response"] is True
+    td = _turn_detection(create_response=False)
+    assert td["create_response"] is False
     assert td["interrupt_response"] is True

@@ -122,8 +122,9 @@ def create_client_secret(
         style=style,
         duration_minutes=duration_minutes,
     )
-    # Duplex ChatGPT-like: Realtime replies when the candidate stops talking.
-    create_response = True
+    # Auto-reply is turned on by the browser after the engine opening line,
+    # so the minted session does not greet by itself (two voices).
+    create_response = False
 
     payload = {
         "session": {
