@@ -16,12 +16,18 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4o-mini"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_tts_base_url: str = ""  # default: same as openai_base_url (use api.openai.com for TTS)
-    openai_tts_model: str = "tts-1-hd"
+    openai_tts_model: str = "tts-1"
     openai_tts_voice: str = "coral"
     openai_stt_base_url: str = ""
     openai_stt_model: str = "whisper-1"
-    openai_realtime_model: str = "gpt-realtime"
+    # Mini Realtime ~3x cheaper on audio than full gpt-realtime / gpt-realtime-2.1.
+    openai_realtime_model: str = "gpt-realtime-2.1-mini"
     openai_realtime_voice: str = "coral"
+    # Billed separately from speech2speech — keep off; score via Whisper /stt instead.
+    openai_realtime_transcribe: bool = False
+    # Truncation keeps late-session turns from exploding input token cost.
+    openai_realtime_post_instructions_tokens: int = 4000
+    openai_realtime_retention_ratio: float = 0.8
     # Prefer realtime WebRTC voice when client requests a token.
     voice_mode: str = "realtime"  # realtime|legacy
     # Gladia live STT — get key at https://app.gladia.io (API host: api.gladia.io)

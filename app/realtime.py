@@ -209,6 +209,30 @@ def _transcription() -> dict[str, Any]:
     return {"model": "gpt-4o-mini-transcribe", "language": "en"}
 
 
+def _truncation() -> dict[str, Any]:
+    settings = get_settings()
+    ratio = float(settings.openai_realtime_retention_ratio or 0.8)
+    ratio = max(0.5, min(1.0, ratio))
+    post = int(settings.openai_realtime_post_instructions_tokens or 4000)
+    post = max(1500, min(28000, post))
+    return {
+        "type": "retention_ratio",
+        "retention_ratio": ratio,
+        "token_limits": {"post_instructions": post},
+    }
+
+
+def _audio_input(*, create_response: bool, semantic: bool = False) -> dict[str, Any]:
+    """Build audio.input — transcription omitted unless explicitly enabled (extra $)."""
+    settings = get_settings()
+    out: dict[str, Any] = {
+        "turn_detection": _turn_detection(create_response=create_response, semantic=semantic),
+    }
+    if bool(settings.openai_realtime_transcribe):
+        out["transcription"] = _transcription()
+    return out
+
+
 def _turn_detection(*, create_response: bool, semantic: bool = False) -> dict[str, Any]:
     if semantic:
         return {
@@ -250,7 +274,7 @@ def create_client_secret(
     if not key:
         return {"ok": False, "value": "", "expires_at": 0, "model": "", "error": "OPENAI_API_KEY missing"}
 
-    model = settings.openai_realtime_model or "gpt-realtime"
+    model = settings.openai_realtime_model or "gpt-realtime-2.1-mini"
     voice = settings.openai_realtime_voice or "coral"
     base = (settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
     url = f"{base}/realtime/client_secrets"
@@ -268,17 +292,17 @@ def create_client_secret(
     # Auto-reply is turned on by the browser after Realtime greets.
     # Mint with it off so the session does not speak before the data channel is ready.
     create_response = False
+    trunc = _truncation()
+    transcribe = bool(settings.openai_realtime_transcribe)
 
     payload = {
         "session": {
             "type": "realtime",
             "model": model,
             "instructions": instructions,
+            "truncation": trunc,
             "audio": {
-                "input": {
-                    "transcription": _transcription(),
-                    "turn_detection": _turn_detection(create_response=create_response),
-                },
+                "input": _audio_input(create_response=create_response),
                 "output": {"voice": voice},
             },
         }
@@ -300,7 +324,7 @@ def create_client_secret(
                 _set_error(err)
                 # Fallback older shape if GA body rejected.
                 if resp.status_code in {400, 404, 422}:
-                    payload["session"]["audio"]["input"]["turn_detection"] = _turn_detection(
+                    payload["session"]["audio"]["input"] = _audio_input(
                         create_response=create_response, semantic=False
                     )
                     retry = client.post(
@@ -315,21 +339,23 @@ def create_client_secret(
                     if retry.status_code < 400:
                         resp = retry
                     else:
+                        legacy_session: dict[str, Any] = {
+                            "model": model,
+                            "voice": voice,
+                            "instructions": instructions,
+                            "turn_detection": _turn_detection(
+                                create_response=create_response, semantic=False
+                            ),
+                        }
+                        if transcribe:
+                            legacy_session["input_audio_transcription"] = _transcription()
                         alt = client.post(
                             f"{base}/realtime/sessions",
                             headers={
                                 "Authorization": f"Bearer {key}",
                                 "Content-Type": "application/json",
                             },
-                            json={
-                                "model": model,
-                                "voice": voice,
-                                "instructions": instructions,
-                                "input_audio_transcription": _transcription(),
-                                "turn_detection": _turn_detection(
-                                    create_response=create_response, semantic=False
-                                ),
-                            },
+                            json=legacy_session,
                         )
                         if alt.status_code >= 400:
                             err2 = f"HTTP {alt.status_code}: {alt.text[:400]}"
@@ -348,6 +374,8 @@ def create_client_secret(
                             "model": model,
                             "voice": voice,
                             "duplex": True,
+                            "transcribe": transcribe,
+                            "truncation": trunc,
                             "error": "",
                             "api": "realtime/sessions",
                         }
@@ -368,6 +396,8 @@ def create_client_secret(
                 "model": model,
                 "voice": voice,
                 "duplex": True,
+                "transcribe": transcribe,
+                "truncation": trunc,
                 "error": "",
                 "api": "realtime/client_secrets",
             }

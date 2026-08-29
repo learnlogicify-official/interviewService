@@ -50,6 +50,7 @@ def health() -> dict:
         "stt_provider": settings.stt_provider,
         "gladia_configured": gladia_configured(),
         "realtime_model": settings.openai_realtime_model if llm_configured() else None,
+        "realtime_transcribe": bool(settings.openai_realtime_transcribe) if llm_configured() else False,
         "voice_mode": settings.voice_mode,
     }
 
