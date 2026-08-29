@@ -519,6 +519,7 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
             "overall": row.overall_score,
         },
         "skill_graph": {k: v for k, v in (state.get("skill_graph") or {}).items() if not str(k).startswith("_")},
+        "qa_topic": str(state.get("current_qa_id") or "")[:80],
         "voice_metrics": state.get("voice_metrics") or {},
         "turns": [
             {

@@ -85,6 +85,9 @@ def realtime_token(body: RealtimeTokenRequest, db: Session = Depends(get_db)) ->
         topics = []
     if isinstance(state.get("topics"), list) and state.get("topics"):
         topics = [str(t) for t in state["topics"] if str(t).strip()]
+    from app.llm import _compact_dossier
+
+    dossier = state.get("resume_dossier") if isinstance(state.get("resume_dossier"), dict) else {}
     return realtime_mod.create_client_secret(
         session_id=row.id,
         student_name=row.student_name,
@@ -96,6 +99,7 @@ def realtime_token(body: RealtimeTokenRequest, db: Session = Depends(get_db)) ->
         include_coding=bool(state.get("include_coding", True)),
         style=str(state.get("interviewer_style") or "friendly"),
         duration_minutes=int(row.duration_minutes or 17),
+        resume_dossier=_compact_dossier(dossier),
     )
 
 
