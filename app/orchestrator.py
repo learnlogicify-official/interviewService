@@ -18,6 +18,7 @@ from app import question_graph
 from app import skills as skill_graph
 from app import voice_metrics
 from app.config import get_settings
+from app import duplex_score
 from app.models import CodingSnapshotRow, SessionRow, TurnRow
 from app.problems import get_problem, pick_problem, public_problem
 from app.report import build_report, idea_approach_explain_proxy
@@ -62,11 +63,11 @@ def _is_end_intent(text: str) -> bool:
 
 
 def _is_yes(text: str) -> bool:
-    return bool(YES_RE.search(text or ""))
+    return duplex_score.is_confirm_yes(text) or bool(YES_RE.search(text or ""))
 
 
 def _is_no(text: str) -> bool:
-    return bool(NO_RE.search(text or ""))
+    return duplex_score.is_confirm_no(text) or bool(NO_RE.search(text or ""))
 
 
 def _now() -> datetime:
@@ -531,6 +532,8 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
         ),
         "realtime_cue": str(state.get("realtime_cue") or "")[:300],
         "awaiting_end_confirm": bool(state.get("awaiting_end_confirm")),
+        "coding_just_passed": bool(state.get("coding_just_passed")),
+        "explain_excerpt": str(state.get("explain_excerpt") or "")[:400],
         "voice_metrics": state.get("voice_metrics") or {},
         "turns": [
             {
@@ -861,6 +864,10 @@ def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> d
         state["score_conceptual"] = float(state.get("score_conceptual") or 0)
 
     _resolve_pending_explain(state, row)
+    # Duplex-native: rebuild floats from evidence before the report weights them.
+    duplex_score.recompute_scores(state)
+    duplex_score.clear_utterance_buffer(state)
+    state["awaiting_end_confirm"] = False
 
     report = build_report(state, turns)
     row.status = "completed"
@@ -873,6 +880,47 @@ def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> d
 
     summary = _spoken_wrap_text(row, state)
     _add_turn(db, row.id, "done", "assistant", summary, {"report": True, "spoken_wrap": True})
+    db.commit()
+    db.refresh(row)
+    return session_view(db, row)
+
+
+def log_assistant_turn(
+    db: Session,
+    row: SessionRow,
+    content: str,
+    *,
+    stage: str | None = None,
+) -> dict[str, Any]:
+    """
+    Persist a Realtime-spoken interviewer line into the timeline.
+
+    Duplex invents questions client-side; without this the recruiter report only
+    shows student answers.
+    """
+    if row.status != "active":
+        return session_view(db, row)
+    text = " ".join((content or "").split()).strip()
+    if not text or len(text) < 8:
+        return session_view(db, row)
+    if re.search(r"(?i)^\s*hidden\s+coach\b", text):
+        return session_view(db, row)
+    # Dedup against the last assistant turn.
+    last = (
+        db.query(TurnRow)
+        .filter(TurnRow.session_id == row.id, TurnRow.role == "assistant")
+        .order_by(TurnRow.seq.desc())
+        .first()
+    )
+    if last and " ".join((last.content or "").split()).lower() == text.lower():
+        return session_view(db, row)
+    use_stage = (stage or row.stage or "qa").strip() or "qa"
+    _add_turn(db, row.id, use_stage, "assistant", text[:1200], {"realtime": True})
+    state = _state(row)
+    # Keep last spoken question for the scorer.
+    if "?" in text:
+        state["last_realtime_question"] = text[:280]
+    _save_state(row, state)
     db.commit()
     db.refresh(row)
     return session_view(db, row)
@@ -923,6 +971,11 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
             db.commit()
             db.refresh(row)
             return session_view(db, row)
+    if state.get("coding_just_passed"):
+        state["coding_just_passed"] = False
+        _save_state(row, state)
+        db.commit()
+        db.refresh(row)
     if _expire_if_needed(db, row):
         db.refresh(row)
         return session_view(db, row)
@@ -1741,6 +1794,8 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         last_q = prev[0] if prev else ""
     except Exception:
         last_q = ""
+    if not last_q:
+        last_q = str(state.get("last_realtime_question") or "")
 
     llm_result = llm_client.score_turn(
         stage="qa",
@@ -2135,9 +2190,9 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
         },
     )
     if llm_result:
-        state["score_idea"] = max(float(state.get("score_idea", 0)), float(llm_result["score"]))
+        score_now = max(float(llm_result["score"]), duplex_score.heuristic_idea_score(answer))
+        state["score_idea"] = max(float(state.get("score_idea", 0)), score_now)
         action = llm_result["next_action"]
-        score_now = float(llm_result["score"])
         unlock = action == "unlock_editor" and score_now >= 50.0 and (
             _looks_like_coding_approach(answer) or attempts >= 2
         )
@@ -2298,13 +2353,22 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
         },
     )
     if llm_result and llm_result.get("reply"):
+        state["realtime_cue"] = (
+            "Ask about THIS code excerpt only (do not invent a different question): "
+            + excerpt.replace("\n", " ")[:220]
+        )
         return llm_result["reply"]
 
-    return (
+    cue = (
         "Quick pause — I can see this in your editor: "
         f"{excerpt.replace(chr(10), ' ')}. "
         "Why did you write it this way, and what happens on a duplicate or empty input?"
     )
+    state["realtime_cue"] = (
+        "Ask about THIS code excerpt only (do not invent a different question): "
+        + excerpt.replace("\n", " ")[:220]
+    )
+    return cue
 
 
 def _handle_explain(db: Session, row: SessionRow, state: dict[str, Any], answer: str) -> str:
@@ -2403,23 +2467,34 @@ def handle_message(
 
     state = _state(row)
 
+    # Wrap-up confirm — duplex "yes" is short and must never be treated as weak filler.
     if state.get("awaiting_end_confirm"):
         _note_voice_and_claims(state, text, duration_sec)
-        _add_turn(db, row.id, row.stage, "student", text)
+        _add_turn(db, row.id, row.stage, "student", text, {"end_confirm": True})
         if _is_yes(text) and not _is_no(text):
             state["awaiting_end_confirm"] = False
+            duplex_score.clear_utterance_buffer(state)
             _save_state(row, state)
             return finish_session(db, row, reason="student_ended")
         if _is_no(text):
             state["awaiting_end_confirm"] = False
+            state["end_confirm_asks"] = 0
             reply = "Alright — we'll continue."
-            _add_turn(db, row.id, row.stage, "assistant", reply)
+            _add_turn(db, row.id, row.stage, "assistant", reply, {"end_confirm": True})
             _save_state(row, state)
             db.commit()
             db.refresh(row)
             return session_view(db, row)
+        # Second unclear reply after wrap request → end anyway (student already asked to finish).
+        asks = int(state.get("end_confirm_asks", 0) or 0) + 1
+        state["end_confirm_asks"] = asks
+        if asks >= 2 or _is_end_intent(text):
+            state["awaiting_end_confirm"] = False
+            duplex_score.clear_utterance_buffer(state)
+            _save_state(row, state)
+            return finish_session(db, row, reason="student_ended")
         reply = "Say yes to end the interview now, or no to keep going."
-        _add_turn(db, row.id, row.stage, "assistant", reply)
+        _add_turn(db, row.id, row.stage, "assistant", reply, {"end_confirm": True})
         _save_state(row, state)
         db.commit()
         db.refresh(row)
@@ -2427,14 +2502,26 @@ def handle_message(
 
     if _is_end_intent(text):
         _note_voice_and_claims(state, text, duration_sec)
-        _add_turn(db, row.id, row.stage, "student", text)
+        _add_turn(db, row.id, row.stage, "student", text, {"end_intent": True})
         state["awaiting_end_confirm"] = True
+        state["end_confirm_asks"] = 0
+        duplex_score.clear_utterance_buffer(state)
         reply = "Do you want to end the interview now? Say yes to wrap up, or no to continue."
-        _add_turn(db, row.id, row.stage, "assistant", reply)
+        _add_turn(db, row.id, row.stage, "assistant", reply, {"end_confirm": True})
         _save_state(row, state)
         db.commit()
         db.refresh(row)
         return session_view(db, row)
+
+    # Duplex: buffer short STT chips until the utterance is scoreable.
+    score_text = duplex_score.take_scoreable_text(state, text, stage=row.stage or "qa")
+    if score_text is None:
+        # Keep buffer only — avoid flooding the timeline with mid-phrase chips.
+        _save_state(row, state)
+        db.commit()
+        db.refresh(row)
+        return session_view(db, row)
+    text = score_text
 
     # Filler during Q&A / idea: rephrase the same question instead of advancing.
     if row.stage in {"qa", "idea"} and llm_client.is_weak_answer(text):
@@ -2444,6 +2531,20 @@ def handle_message(
         if row.stage == "qa":
             reply = ""
         else:
+            floor = duplex_score.heuristic_idea_score(text)
+            state["score_idea"] = max(float(state.get("score_idea", 0) or 0), floor * 0.5)
+            evidence_ledger.record(
+                state,
+                stage="idea",
+                dimension="problem_solving",
+                score=floor * 0.5,
+                skill="coding.approach",
+                question_id=str(state.get("current_problem_id") or state.get("moodle_problem_id") or "idea"),
+                hint_level=int(state.get("idea_hint_level", 0) or 0),
+                note=(text or "")[:160],
+                source="duplex_weak",
+                elapsed=_elapsed(row),
+            )
             reply = (
                 "That came through incomplete. "
                 "Outline the data structure, main steps, and time complexity again."
@@ -2503,6 +2604,7 @@ def handle_message(
         if llm_result:
             if llm_result["next_action"] == "wrap_up":
                 state["awaiting_end_confirm"] = True
+                state["end_confirm_asks"] = 0
                 reply = (
                     llm_result["reply"]
                     if "?" in llm_result["reply"]
@@ -2694,24 +2796,14 @@ def handle_coding_result(
     ratio = passed / max(1, total)
     pid = int(problem_id or state.get("moodle_problem_id") or 0)
 
-    if all_passed and total > 0 and state.get("explain_pending") and row.stage != "explain":
+    # Duplex: never park a green submit behind explain_pending — credit the pass,
+    # soft-resolve the explain debt, then continue. Realtime can still ask about code.
+    if all_passed and total > 0 and state.get("explain_pending"):
         _resolve_pending_explain(state, row)
         state.pop("explain_submit_nudge", None)
-
-    if all_passed and total > 0 and state.get("explain_pending") and row.stage == "explain":
-        if not state.get("explain_submit_nudge"):
-            state["explain_submit_nudge"] = True
-            _save_state(row, state)
-            spoken = (
-                "Before we continue — please answer my last question about your code out loud. "
-                "Say skip if you want to move on."
-            )
-            _add_turn(db, row.id, "explain", "assistant", spoken, {"explain_nudge": True})
-            db.commit()
-            db.refresh(row)
-            return session_view(db, row)
-        _resolve_pending_explain(state, row)
-        state.pop("explain_submit_nudge", None)
+        if row.stage == "explain":
+            row.stage = "code"
+            state["awaiting"] = "code"
 
     if all_passed and total > 0:
         state["score_coding"] = max(float(state.get("score_coding", 0) or 0), 85.0 + min(15.0, ratio * 15))
@@ -2728,6 +2820,11 @@ def handle_coding_result(
             source="nexpractice",
             elapsed=_elapsed(row),
         )
+        state["realtime_cue"] = (
+            f"All {passed}/{total} tests just passed. Congratulate briefly, then ask ONE short "
+            "question about a non-trivial line in their solution — or wrap up if time is low."
+        )
+        state["coding_just_passed"] = True
         solved_n = int(state["problems_solved_count"])
         max_n = int(state.get("max_coding_problems", 2) or 2)
         # Enough time for another round? (~3+ minutes beyond wrap buffer)

@@ -13,6 +13,7 @@ from app.schemas import (
     CodingResultRequest,
     EndSessionRequest,
     GladiaLiveRequest,
+    LogTurnRequest,
     MessageRequest,
     RealtimeTokenRequest,
     RunCodeRequest,
@@ -200,6 +201,18 @@ def message(body: MessageRequest, db: Session = Depends(get_db)) -> SessionState
     if not row:
         raise HTTPException(status_code=404, detail="Session not found")
     return SessionStateOut(**orch.handle_message(db, row, body.message, duration_sec=float(body.duration_sec or 0)))
+
+
+@router.post("/sessions/log_turn", response_model=SessionStateOut)
+def log_turn(body: LogTurnRequest, db: Session = Depends(get_db)) -> SessionStateOut:
+    """Persist a Realtime-spoken interviewer line into the timeline (duplex)."""
+    verify_signature(["log_turn", body.session_id], body.signature, body.timestamp)
+    row = orch.get_session(db, body.session_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return SessionStateOut(
+        **orch.log_assistant_turn(db, row, body.content, stage=body.stage or None)
+    )
 
 
 @router.post("/sessions/snapshot", response_model=SessionStateOut)

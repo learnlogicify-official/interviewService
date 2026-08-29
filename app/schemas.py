@@ -90,9 +90,22 @@ class SessionStateOut(BaseModel):
     ui: dict[str, Any] = Field(default_factory=dict)
     scores: dict[str, Any] = Field(default_factory=dict)
     skill_graph: dict[str, Any] = Field(default_factory=dict)
+    qa_topic: str = ""
+    realtime_cue: str = ""
+    awaiting_end_confirm: bool = False
+    coding_just_passed: bool = False
+    explain_excerpt: str = ""
     voice_metrics: dict[str, Any] = Field(default_factory=dict)
     turns: list[TurnOut] = Field(default_factory=list)
     report: dict[str, Any] | None = None
+
+
+class LogTurnRequest(BaseModel):
+    session_id: str
+    content: str
+    stage: str = ""
+    timestamp: int
+    signature: str
 
 
 class RunResultOut(BaseModel):

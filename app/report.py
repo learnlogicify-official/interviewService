@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app import duplex_score
 from app import evidence as evidence_ledger
 from app import skills as skill_graph
 
@@ -30,16 +31,7 @@ def idea_approach_explain_proxy(state: dict[str, Any]) -> float:
     Pre-coding approach narrations (idea stage) partially reflect explanation ability.
     Uses evidence rows rather than the peak score_idea alone.
     """
-    rows = [
-        float(e.get("score", 0) or 0)
-        for e in (state.get("evidence") or [])
-        if e.get("stage") == "idea" and e.get("dimension") == "problem_solving"
-    ]
-    if not rows:
-        return 0.0
-    best = max(rows)
-    avg = sum(rows) / len(rows)
-    return best * 0.6 + avg * 0.4
+    return duplex_score.evidence_dimension_score(state, "problem_solving")
 
 
 def blend_explanation_score(state: dict[str, Any]) -> float:
@@ -47,7 +39,10 @@ def blend_explanation_score(state: dict[str, Any]) -> float:
     Combine live code walkthrough (explain stage) with pre-coding approach narration.
     Avoids a harsh zero when the candidate explained clearly before coding.
     """
-    explicit = float(state.get("score_explain", 0) or 0)
+    explicit = max(
+        float(state.get("score_explain", 0) or 0),
+        duplex_score.evidence_dimension_score(state, "explanation"),
+    )
     idea_proxy = idea_approach_explain_proxy(state)
     if explicit > 0 and idea_proxy > 0:
         return round(explicit * 0.55 + idea_proxy * 0.45, 1)
@@ -59,6 +54,9 @@ def blend_explanation_score(state: dict[str, Any]) -> float:
 
 
 def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str, Any]:
+    # Duplex-native: rebuild dimension scores from evidence before weighting.
+    duplex_score.recompute_scores(state)
+
     conceptual = float(state.get("score_conceptual", 0))
     problem_solving = float(state.get("score_idea", 0))
     coding = float(state.get("score_coding", 0))
@@ -69,13 +67,20 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
     independence = float(hint_meta["independence_score"])
     depth = evidence_ledger.depth_metrics(state)
 
-    answered = bool(state.get("qa_scores")) or int(state.get("problems_solved_count", 0) or 0) > 0
+    evidence_n = len(state.get("evidence") or [])
+    student_n = sum(1 for t in turns if t.get("role") == "student")
+    answered = (
+        bool(state.get("qa_scores"))
+        or int(state.get("problems_solved_count", 0) or 0) > 0
+        or evidence_n > 0
+        or student_n >= 3
+    )
     no_knowledge = int(state.get("no_knowledge_count", 0) or 0)
     qa_n = len(state.get("qa_scores") or [])
     substantive = answered and not (qa_n > 0 and no_knowledge >= max(1, int(qa_n * 0.7)))
 
     # Don't-know-heavy sessions must read as zeros, not soft partial credit.
-    if not substantive:
+    if not substantive and no_knowledge >= max(2, qa_n):
         conceptual = 0.0 if no_knowledge >= qa_n and qa_n > 0 else min(conceptual, 5.0)
         communication = 0.0 if no_knowledge >= qa_n and qa_n > 0 else min(communication, 5.0)
         independence = 0.0
@@ -91,6 +96,17 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
         "communication": 0.10,
         "independence": 0.10,
     }
+    # If coding was never reached, redistribute coding weight into conceptual + idea.
+    if coding <= 0 and int(state.get("problems_solved_count", 0) or 0) == 0:
+        weights = {
+            "conceptual": 0.30,
+            "problem_solving": 0.28,
+            "coding": 0.0,
+            "explanation": 0.16,
+            "communication": 0.14,
+            "independence": 0.12,
+        }
+
     overall = (
         conceptual * weights["conceptual"]
         + problem_solving * weights["problem_solving"]
