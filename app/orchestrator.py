@@ -880,7 +880,10 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
         return finish_session(db, row, reason="time_up")
     state = _state(row)
     if row.stage == "qa" and _elapsed(row) >= _qa_budget_seconds(row, state):
-        if _awaiting_student_reply(db, row):
+        qa_secs = _qa_budget_seconds(row, state)
+        # If STT/scoring never delivered a student turn, do not block coding forever.
+        # Grace: 90s past the Q&A budget, then force the coding handoff.
+        if _awaiting_student_reply(db, row) and _elapsed(row) < qa_secs + 90:
             if not state.get("coding_after_answer"):
                 state["coding_after_answer"] = True
                 _save_state(row, state)

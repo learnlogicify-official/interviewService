@@ -23,8 +23,9 @@ class Settings(BaseSettings):
     # Mini Realtime ~3x cheaper on audio than full gpt-realtime / gpt-realtime-2.1.
     openai_realtime_model: str = "gpt-realtime-2.1-mini"
     openai_realtime_voice: str = "coral"
-    # Billed separately from speech2speech — keep off; score via Whisper /stt instead.
-    openai_realtime_transcribe: bool = False
+    # Keep ON by default — duplex scoring, chat bubbles, and coding handoff depend on it.
+    # Set false only if you accept Whisper-clip fallback (less reliable).
+    openai_realtime_transcribe: bool = True
     # Truncation keeps late-session turns from exploding input token cost.
     openai_realtime_post_instructions_tokens: int = 4000
     openai_realtime_retention_ratio: float = 0.8
