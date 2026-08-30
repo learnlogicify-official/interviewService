@@ -57,7 +57,12 @@ def test_flow_idea_and_code():
         )
         assert view["stage"] in {"idea", "code"}
         spoken = " ".join(t["content"] for t in view["turns"] if t["role"] == "assistant")
-        assert "wraps the technical" in spoken.lower() or "move to coding" in spoken.lower()
+        assert (
+            "wraps the technical" in spoken.lower()
+            or "closes the spoken technical" in spoken.lower()
+            or "moving on to coding" in spoken.lower()
+            or "move to coding" in spoken.lower()
+        )
         row = orch.get_session(db, sid)
         view = orch.handle_message(
             db,
@@ -122,7 +127,12 @@ def test_nexai_timed_flow_and_editor_lock():
         assert view["ui"]["show_editor"] is True
         assert view["ui"]["editor_locked"] is True
         joined = " ".join(t["content"] for t in view["turns"]).lower()
-        assert "wraps the technical" in joined
+        assert (
+            "wraps the technical" in joined
+            or "closes the spoken technical" in joined
+            or "moving on to coding" in joined
+            or "move to coding" in joined
+        )
         assert "valid parentheses" in joined
 
         row = orch.get_session(db, sid)
@@ -181,7 +191,12 @@ def test_coding_handoff_not_replaced_on_java_topics():
         assert view["ui"]["show_editor"] is True
         last = [t for t in view["turns"] if t["role"] == "assistant"][-1]
         spoken = last["content"].lower()
-        assert "wraps the technical" in spoken or "move to coding" in spoken
+        assert (
+            "wraps the technical" in spoken
+            or "closes the spoken technical" in spoken
+            or "moving on to coding" in spoken
+            or "move to coding" in spoken
+        )
         assert last.get("meta", {}).get("coding_handoff") is True
         assert "next question" not in spoken
     finally:
@@ -323,6 +338,30 @@ def test_let_me_code_does_not_unlock_without_approach():
         view = orch.handle_message(db, row, "yeah um I think a loop maybe")
         assert view["stage"] == "idea"
         assert view["ui"]["editor_locked"] is True
+    finally:
+        db.close()
+
+
+def test_short_student_answer_stays_on_timeline():
+    """Answers too short to score must still appear as student turns."""
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=15,
+            moodle_cm_id=0,
+            moodle_instance_id=0,
+            student_name="Sachin",
+            role_track="sde_intern",
+            duration_minutes=30,
+            topics=["java"],
+        )
+        sid = view["session_id"]
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "No, it was just simply a code refactoring.")
+        student = [t["content"] for t in view["turns"] if t["role"] == "student"]
+        assert any("refactoring" in (c or "") for c in student)
     finally:
         db.close()
 

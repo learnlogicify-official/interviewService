@@ -87,10 +87,27 @@ def test_coding_stage_instructions_stop_qa():
         role_track="sde_intern",
         stage="idea",
         topics=["java", "dbms"],
+        problem_title="Kth Largest factor of N",
     )
     assert "PROBLEM SOLVING" in text
     assert "technical Q&A round is OVER" in text
+    assert "Kth Largest factor of N" in text
+    assert "Never invent a different DSA problem" in text
     assert "ArrayList" not in text
+
+
+def test_idk_preface_does_not_zero_real_answer():
+    from app.llm import is_no_knowledge_answer
+
+    assert is_no_knowledge_answer("I don't know.") is True
+    assert is_no_knowledge_answer("I don't know anything about DBMS.") is True
+    assert is_no_knowledge_answer(
+        "I don't know. When a primary key is there it guarantees unique and not null, "
+        "and inserting a duplicate throws an error."
+    ) is False
+    assert is_no_knowledge_answer(
+        "I don't know. I developed an LMS with MCQ and coding execution using PostgreSQL."
+    ) is False
 
 
 def test_scorer_prompt_is_compact():

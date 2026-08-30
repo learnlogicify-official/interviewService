@@ -116,22 +116,39 @@ def coding_round_instructions(
         "supportive": "calm and supportive",
         "panel": "professional hiring-bar, evidence-seeking",
     }.get(style_key, "professional and clear")
-    named = f' The on-screen title is "{problem_title[:80]}".' if problem_title else ""
-    lock_bit = (
-        " The editor is unlocked. Ask about the code they are writing — a bug, edge case, "
-        "or why they chose that approach. Never give the solution."
-        if stage in {"code", "explain"}
-        else " The editor is still locked. Ask them to walk through their approach: "
-        "data structure, steps, complexity, one edge case."
+    title = (problem_title or "").strip()
+    named = f' The on-screen problem is "{title[:80]}".' if title else (
+        " A NexPractice problem is on their screen."
     )
+    stay = (
+        f' Every question MUST be about solving "{title[:80]}" only. '
+        if title
+        else " Every question MUST be about the on-screen NexPractice problem only. "
+    )
+    stay += (
+        "Never invent a different DSA problem. Do not ask about generic duplicates, "
+        "hash maps, indexing, or DBMS unless that is exactly the on-screen problem. "
+    )
+    if stage in {"code", "explain"}:
+        lock_bit = (
+            " The editor is unlocked and they are implementing. Ask ONLY about the code "
+            "they typed — a specific line, bug, edge case, or complexity of THEIR approach. "
+            "Never give the solution. Never ask a new abstract textbook question."
+        )
+    else:
+        lock_bit = (
+            " The editor is still locked. Ask them to walk through THEIR approach for this "
+            "problem: data structure, main steps, time complexity, and one edge case. "
+            "Do not unlock the editor yourself — the system does that."
+        )
     return (
         f"You are NexAI, a live voice interviewer. The candidate's first name is {first}. "
         f"Address them only as {first} — never invent another name. "
         f"Role track: {role_track}. Tone: {tone}. "
         "The conceptual / technical Q&A round is OVER. You are now in PROBLEM SOLVING."
-        f"{named} "
+        f"{named}{stay}"
         "Do NOT ask Java, DBMS, OS, SQL, or textbook CS questions. "
-        "Do NOT read or recite the problem statement. Never give solutions or write their code. "
+        "Do NOT read or recite the full problem statement. Never give solutions or write their code. "
         f"{lock_bit} "
         "SPEECH: English only. One short acknowledgement, then EXACTLY ONE question of "
         "12–28 spoken words. If they interrupt, stop and listen."
@@ -166,6 +183,7 @@ def interviewer_instructions(
     duration_minutes: int = 17,
     resume_dossier: dict[str, Any] | None = None,
     resume_deep: bool = False,
+    problem_title: str = "",
 ) -> str:
     if (stage or "").strip().lower() in {"idea", "code", "explain"}:
         return coding_round_instructions(
@@ -173,6 +191,7 @@ def interviewer_instructions(
             role_track=role_track,
             stage=stage,
             style=style,
+            problem_title=problem_title,
         )
     first = (student_name or "there").split()[0]
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
@@ -304,6 +323,7 @@ def create_client_secret(
     duration_minutes: int = 17,
     resume_dossier: dict[str, Any] | None = None,
     resume_deep: bool = False,
+    problem_title: str = "",
 ) -> dict[str, Any]:
     """
     Mint an ephemeral Realtime client secret for browser WebRTC.
@@ -329,6 +349,7 @@ def create_client_secret(
         duration_minutes=duration_minutes,
         resume_dossier=resume_dossier,
         resume_deep=resume_deep,
+        problem_title=problem_title,
     )
     # Auto-reply is turned on by the browser after Realtime greets.
     # Mint with it off so the session does not speak before the data channel is ready.

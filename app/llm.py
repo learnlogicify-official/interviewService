@@ -411,19 +411,28 @@ def is_no_knowledge_answer(text: str) -> bool:
     """
     True when the candidate explicitly declines / admits they cannot answer.
     These must score exactly 0 — no partial credit.
+
+    Do NOT treat filler prefaces as ignorance. Many students say
+    "I don't know…" and then give a real answer — score the substance.
     """
     if is_unclear_question_response(text):
         return False
     clean = " ".join((text or "").split()).strip()
     if not clean:
         return True
-    if NO_KNOWLEDGE_RE.search(clean):
-        return True
-    # Short shrugs that look like refusal without keywords.
     words = re.findall(r"[A-Za-z0-9_]+", clean.lower())
     if len(words) <= 12 and any(w in {"idk", "dunno"} for w in words):
         return True
-    return False
+    if not NO_KNOWLEDGE_RE.search(clean):
+        return False
+    # Strip IDK / not-sure phrases; if a real answer remains, this is not refusal.
+    stripped = NO_KNOWLEDGE_RE.sub(" ", clean)
+    leftover = re.findall(r"[A-Za-z0-9_]+", stripped.lower())
+    if len(leftover) >= 8 or len(stripped.strip()) >= 40:
+        return False
+    if len(words) >= 18:
+        return False
+    return True
 
 
 def clamp_answer_score(text: str, score: float) -> float:

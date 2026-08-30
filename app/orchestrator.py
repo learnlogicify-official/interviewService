@@ -441,6 +441,20 @@ def _should_enter_coding(row: SessionRow, state: dict[str, Any]) -> bool:
     return _elapsed(row) >= qa_secs or bool(state.get("coding_after_answer"))
 
 
+def _qa_agenda_complete(state: dict[str, Any]) -> bool:
+    """True when configured focus topics have been visited (or there is no agenda)."""
+    topics = _configured_topics(state)
+    if not topics:
+        return True
+    covered = [str(t).strip().lower() for t in (state.get("covered_topics") or []) if str(t).strip()]
+    if len(set(covered)) >= len(topics):
+        return True
+    cursor = int(state.get("topic_cursor", 0) or 0)
+    if cursor >= max(0, len(topics) - 1) and int(state.get("topic_turns", 0) or 0) >= 1:
+        return True
+    return False
+
+
 def _qa_budget_seconds(row: SessionRow, state: dict[str, Any]) -> int:
     """When coding is off, keep Q&A until the wrap window."""
     qa, wrap = _phase_bounds(row, state)
@@ -910,7 +924,8 @@ def mark_voice_duplex(db: Session, row: SessionRow) -> None:
 _LEFTOVER_QA_RE = re.compile(
     r"(?i)\b(java|dbms|sql|loan|banking|validation|blank input|operating system|"
     r"hash ?map|arraylist|normalization|acid|deadlock|semaphore|polymorphism|"
-    r"tcp/ip|innodb|self[- ]intro|programming fundamentals)\b"
+    r"tcp/ip|innodb|self[- ]intro|programming fundamentals|duplicates?|"
+    r"multi[- ]?index|frequency count|primary key|foreign key|cascad)\b"
 )
 _CODING_SPEECH_RE = re.compile(
     r"(?i)\b(approach|editor|complexit|edge case|nexpractice|implement|"
@@ -2079,10 +2094,13 @@ def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     coding = _start_coding_round(db, row, state)
     state["coding_handoff"] = True
     _save_state(row, state)
-    return (
-        "Thanks — that wraps the technical questions. "
-        + coding
+    agenda_done = _qa_agenda_complete(state)
+    lead = (
+        "Thanks — that closes the spoken technical round. "
+        if agenda_done
+        else "Thanks — we are moving on to coding now. "
     )
+    return lead + coding
 
 
 def _begin_wrap_no_coding(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
@@ -2149,7 +2167,8 @@ _APPROACH_HINTS = (
     "array", "index", "loop", "complex", "o(n)", "hash", "edge", "length",
     "mid", "sort", "scan", "pointer", "sum", "prefix",
     "stack", "queue", "tree", "map", "brut", "recurs", "window", "binary",
-    "step", "space",
+    "step", "space", "factor", "divisor", "divis", "kth", "largest",
+    "modulo", "sqrt", "prime", "gcd", "count",
 )
 
 
@@ -2186,6 +2205,8 @@ def _unlock_editor(row: SessionRow, state: dict[str, Any], note: str) -> str:
     row.stage = "code"
     state["awaiting"] = "code"
     state["editor_just_unlocked"] = True
+    # Duplex otherwise strips this line — room.js must speak the unlock.
+    state["editor_unlock_speak"] = True
     _save_state(row, state)
     return note
 
@@ -2247,12 +2268,21 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             "problem": (
                 {"title": problem["title"], "prompt": problem["prompt"]}
                 if problem
-                else {"moodle_problem_id": state.get("moodle_problem_id")}
+                else {
+                    "title": state.get("moodle_problem_title") or "",
+                    "moodle_problem_id": state.get("moodle_problem_id"),
+                    "constraint": (
+                        "Ask ONLY about this on-screen NexPractice problem. "
+                        "Never invent a different DSA question (no generic duplicates/"
+                        "hashmap/indexing unless that is the problem)."
+                    ),
+                }
             ),
             "idea_attempts": state["idea_attempts"],
             "seconds_remaining": _seconds_remaining(row),
             "resume_text": state.get("resume_text") or "",
             "moodle_problem_id": state.get("moodle_problem_id"),
+            "moodle_problem_title": state.get("moodle_problem_title") or "",
         },
     )
     if llm_result:
@@ -2575,7 +2605,17 @@ def handle_message(
     # Duplex: buffer short STT chips until the utterance is scoreable.
     score_text = duplex_score.take_scoreable_text(state, text, stage=row.stage or "qa")
     if score_text is None:
-        # Keep buffer only — avoid flooding the timeline with mid-phrase chips.
+        # Keep scoring paused, but still show the chip on the recruiter timeline.
+        persist = " ".join((text or "").split())
+        if duplex_score.word_count(persist) >= 4 or len(persist) >= 20:
+            _add_turn(
+                db,
+                row.id,
+                row.stage,
+                "student",
+                persist,
+                {"buffered": True},
+            )
         _save_state(row, state)
         db.commit()
         db.refresh(row)
@@ -2699,26 +2739,40 @@ def handle_message(
     if cleaned and re.search(r"(?i)^\s*hidden\s+coach\b", cleaned):
         cleaned = ""
     handoff = bool(state.get("coding_handoff"))
+    unlock_speak = bool(state.get("editor_unlock_speak"))
     if (
         state.get("voice_duplex")
         and cleaned
         and not handoff
+        and not unlock_speak
         and not state.get("awaiting_end_confirm")
         and row.stage in {"qa", "idea", "code"}
     ):
         cleaned = ""
     if cleaned:
         handoff = bool(state.pop("coding_handoff", None))
+        unlock_speak = bool(state.pop("editor_unlock_speak", None))
+        meta: dict[str, Any] | None = None
+        if handoff or unlock_speak:
+            meta = {}
+            if handoff:
+                meta["coding_handoff"] = True
+            if unlock_speak:
+                meta["editor_unlock"] = True
         _add_turn(
             db,
             row.id,
             row.stage,
             "assistant",
             cleaned,
-            {"coding_handoff": True} if handoff else None,
+            meta,
         )
     else:
-        state.pop("coding_handoff", None)
+        # Keep coding_handoff so a later poll can still surface the spoken cutover.
+        if not handoff:
+            state.pop("coding_handoff", None)
+        if not unlock_speak:
+            state.pop("editor_unlock_speak", None)
     _save_state(row, state)
     db.commit()
     db.refresh(row)
