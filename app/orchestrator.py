@@ -902,6 +902,8 @@ def log_assistant_turn(
     _add_turn(db, row.id, use_stage, "assistant", text[:1200], {"realtime": True})
     state = _state(row)
     state["voice_duplex"] = True
+    # A new spoken question closes any sticky student chip buffer.
+    duplex_score.clear_utterance_buffer(state)
     # Keep last spoken question for the scorer.
     if "?" in text:
         state["last_realtime_question"] = text[:280]
@@ -2759,6 +2761,8 @@ def handle_message(
                 meta["coding_handoff"] = True
             if unlock_speak:
                 meta["editor_unlock"] = True
+        # New interviewer turn closes the prior student utterance buffer.
+        duplex_score.clear_utterance_buffer(state)
         _add_turn(
             db,
             row.id,

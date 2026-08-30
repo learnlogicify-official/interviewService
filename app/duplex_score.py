@@ -9,6 +9,7 @@ session that clearly had substance.
 from __future__ import annotations
 
 import re
+import time
 from typing import Any
 
 from app import evidence as evidence_ledger
@@ -159,6 +160,11 @@ def append_utterance_buffer(state: dict[str, Any], text: str, *, max_chars: int 
     piece = " ".join((text or "").split())
     if not piece:
         return prev
+    at = float(state.get("utterance_buffer_at") or 0)
+    # Stale chips must not glue onto the next real answer minutes later.
+    if prev and at and (time.time() - at) > 12.0:
+        clear_utterance_buffer(state)
+        prev = ""
     if not prev:
         combined = piece
     elif piece.lower() in prev.lower():
@@ -168,12 +174,34 @@ def append_utterance_buffer(state: dict[str, Any], text: str, *, max_chars: int 
     else:
         combined = (prev + " " + piece).strip()
     state["utterance_buffer"] = combined[:max_chars]
+    state["utterance_buffer_at"] = time.time()
     return state["utterance_buffer"]
 
 
 def clear_utterance_buffer(state: dict[str, Any]) -> None:
     state.pop("utterance_buffer", None)
     state.pop("utterance_buffer_at", None)
+
+
+def _looks_like_continuation(prev: str, piece: str) -> bool:
+    """True when piece is likely more of the same spoken answer, not a new turn."""
+    a = " ".join((prev or "").lower().split())
+    b = " ".join((piece or "").lower().split())
+    if not a or not b:
+        return False
+    if b.startswith(a) or a.startswith(b):
+        return True
+    if a in b or b in a:
+        return True
+    # Shared tail/head overlap of a few words.
+    a_words = a.split()
+    b_words = b.split()
+    if len(a_words) >= 3 and len(b_words) >= 3:
+        if " ".join(a_words[-3:]) in b:
+            return True
+        if " ".join(b_words[:3]) in a:
+            return True
+    return False
 
 
 def take_scoreable_text(state: dict[str, Any], text: str, *, stage: str) -> str | None:
@@ -188,6 +216,22 @@ def take_scoreable_text(state: dict[str, Any], text: str, *, stage: str) -> str 
     if is_confirm_yes(clean) or is_confirm_no(clean):
         clear_utterance_buffer(state)
         return clean
+
+    prev = str(state.get("utterance_buffer") or "").strip()
+    at = float(state.get("utterance_buffer_at") or 0)
+    if prev and at and (time.time() - at) > 12.0:
+        clear_utterance_buffer(state)
+        prev = ""
+
+    # A fresh, already-complete answer must not inherit a sticky "I don't know" chip.
+    if (
+        prev
+        and is_scoreable_utterance(clean, stage=stage)
+        and not _looks_like_continuation(prev, clean)
+    ):
+        clear_utterance_buffer(state)
+        return clean
+
     combined = append_utterance_buffer(state, clean)
     if is_scoreable_utterance(combined, stage=stage):
         clear_utterance_buffer(state)
