@@ -164,14 +164,14 @@ def _compose_profile_rules(
         depth_rules.get(followup_depth, depth_rules["moderate"]),
         "Coding editor: " + ("ENABLED later in the session." if include_coding else "DISABLED — spoken Q&A only."),
     ]
-    topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()]
+    topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
     if topic_list:
-        parts.append("Focus topics (priority order): " + ", ".join(topic_list[:12]) + ".")
+        numbered = " → ".join(f"{i}. {t}" for i, t in enumerate(topic_list, 1))
+        parts.append("AGENDA (cover in this exact order): " + numbered + ".")
         parts.append(
-            "Coverage rule: work through the focus topics before coding. "
-            "Do not jump to coding while major listed areas (for example project deep-dive, "
-            "Java/OOP, DSA, DBMS/SQL, OS, or networks) are still untouched — ask at least one "
-            "concrete question in each listed area when time allows."
+            "Coverage rule: the FIRST spoken question after the greeting MUST be item 1. "
+            "Do not skip ahead. Work through each listed area before coding. "
+            "Ask at least one concrete question in each item when time allows."
         )
     if avoid_topics:
         parts.append("Do NOT ask about: " + avoid_topics.strip()[:400] + ".")
@@ -528,7 +528,17 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
         "qa_topic": (
             ""
             if row.stage in {"idea", "code", "explain", "wrap"}
-            else str(state.get("current_qa_id") or "")[:80]
+            else str(_focus_topic(state) or state.get("current_qa_id") or "")[:80]
+        ),
+        "qa_agenda": (
+            []
+            if row.stage in {"idea", "code", "explain", "wrap"}
+            else _configured_topics(state)
+        ),
+        "qa_agenda_index": (
+            0
+            if row.stage in {"idea", "code", "explain", "wrap"}
+            else int(state.get("topic_cursor", 0) or 0)
         ),
         "realtime_cue": str(state.get("realtime_cue") or "")[:300],
         "awaiting_end_confirm": bool(state.get("awaiting_end_confirm")),
@@ -792,53 +802,7 @@ def _expire_if_needed(db: Session, row: SessionRow) -> bool:
 
 def _spoken_wrap_text(row: SessionRow, state: dict[str, Any]) -> str:
     first = (row.student_name or "there").split()[0]
-    scores = {
-        "conceptual": state.get("score_conceptual", 0),
-        "idea": state.get("score_idea", 0),
-        "coding": state.get("score_coding", 0),
-        "explain": state.get("score_explain", 0),
-        "communication": state.get("score_communication", 0),
-        "independence": evidence_ledger.independence_score(state),
-        "problems_solved": int(state.get("problems_solved_count", 0) or 0),
-        "qa_answers": len(state.get("qa_scores") or []),
-    }
-    spoken = llm_client.wrap_speech(
-        student_name=row.student_name,
-        scores=scores,
-        flags=list(state.get("flags") or []),
-        evidence_tail=(state.get("evidence") or [])[-8:],
-        problem_titles=list(state.get("moodle_problem_titles") or []),
-    )
-    if spoken:
-        return spoken
-    bits = []
-    if scores["qa_answers"] == 0 and scores["problems_solved"] == 0:
-        return (
-            f"{first}, this is NexAI wrapping up. You didn't submit spoken answers or a passing solution "
-            "this round, so scores stay low. Come back when you can talk through one concept and finish "
-            "one timed problem. Thanks for trying — your report is next."
-        )
-    if scores["conceptual"] >= 70:
-        bits.append("your conceptual answers were solid")
-    elif scores["conceptual"] >= 40:
-        bits.append("your conceptual answers were mixed and need more depth")
-    else:
-        bits.append("conceptual answers were missing or too thin")
-    if scores["idea"] >= 60:
-        bits.append("the coding approach was reasonable")
-    else:
-        bits.append("the approach before coding was thin")
-    if scores["coding"] >= 70:
-        bits.append(f"you cleared {scores['problems_solved'] or 1} coding problem(s)")
-    elif scores["coding"] >= 40:
-        bits.append("coding was partial — keep pushing tests to green")
-    else:
-        bits.append("keep practicing timed coding to a full pass")
-    return (
-        f"{first}, this is NexAI wrapping up. "
-        + ", ".join(bits)
-        + ". Thanks for the session — you'll see a short report next."
-    )
+    return f"Thanks for your time today, {first}. Your report is ready."
 
 
 def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> dict[str, Any]:
@@ -919,8 +883,11 @@ def log_assistant_turn(
     if row.stage in {"idea", "code", "explain"} and _is_leftover_qa_caption(text):
         return session_view(db, row)
     use_stage = (stage or row.stage or "qa").strip() or "qa"
+    if use_stage == "sample":
+        use_stage = "qa"
     _add_turn(db, row.id, use_stage, "assistant", text[:1200], {"realtime": True})
     state = _state(row)
+    state["voice_duplex"] = True
     # Keep last spoken question for the scorer.
     if "?" in text:
         state["last_realtime_question"] = text[:280]
@@ -930,9 +897,20 @@ def log_assistant_turn(
     return session_view(db, row)
 
 
+def mark_voice_duplex(db: Session, row: SessionRow) -> None:
+    """Realtime WebRTC is the mouth — engine Q&A must not persist a second interviewer."""
+    state = _state(row)
+    if state.get("voice_duplex"):
+        return
+    state["voice_duplex"] = True
+    _save_state(row, state)
+    db.commit()
+
+
 _LEFTOVER_QA_RE = re.compile(
-    r"(?i)\b(java|dbms|sql|operating system|hash ?map|arraylist|normalization|"
-    r"acid|deadlock|semaphore|polymorphism|tcp/ip|innodb)\b"
+    r"(?i)\b(java|dbms|sql|loan|banking|validation|blank input|operating system|"
+    r"hash ?map|arraylist|normalization|acid|deadlock|semaphore|polymorphism|"
+    r"tcp/ip|innodb|self[- ]intro|programming fundamentals)\b"
 )
 _CODING_SPEECH_RE = re.compile(
     r"(?i)\b(approach|editor|complexit|edge case|nexpractice|implement|"
@@ -1091,6 +1069,11 @@ def _resume_questions_allowed(row: SessionRow, state: dict[str, Any]) -> bool:
     """Resume-anchored questions when the candidate supplied a CV or faculty asked for them."""
     if _is_resume_track(row.role_track, state):
         return True
+    # Custom topic lists own the run-of-show. Only grill the CV during a
+    # self-introduction / resume agenda item — otherwise Realtime hijacks DBMS/DSA.
+    if _topic_locked(row, state):
+        focus = _focus_topic(state).lower()
+        return any(k in focus for k in ("intro", "self", "resume", "cv"))
     resume = (state.get("resume_text") or "").strip()
     if len(resume) >= 80 or state.get("resume_plan"):
         return True
@@ -1484,6 +1467,21 @@ def _next_topic_turn(
     """
     lead = (bridge or _move_on_bridge(state)).strip()
     focus = _advance_focus_topic(state)
+    state["current_question_id"] = ""
+    state["followup_index"] = 0
+    state["current_hint_level"] = 0
+    state["respecify_count"] = 0
+    _note_topic_turn(state)
+    if focus:
+        state["current_qa_id"] = focus[:80]
+    if state.get("voice_duplex"):
+        state["realtime_cue"] = (
+            f"{lead} Ask ONE concrete question on AGENDA item '{focus or 'the next listed topic'}'. "
+            "Stay inside this topic. Never invent a product they did not mention. "
+            "One question, then wait."
+        )[:300]
+        _save_state(row, state)
+        return ""
     generated = None
     try:
         generated = llm_client.topic_question(
@@ -1501,10 +1499,6 @@ def _next_topic_turn(
     except Exception:
         generated = None
 
-    state["current_question_id"] = ""
-    state["followup_index"] = 0
-    state["current_hint_level"] = 0
-    _note_topic_turn(state)
     resume_only = _is_resume_track(row.role_track, state)
     if generated and generated.get("reply"):
         if generated.get("topic_tag"):
@@ -1657,6 +1651,26 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     skill_tag = _evidence_skill(state, node)
     hint_now = int(state.get("current_hint_level", 0) or 0)
 
+    if llm_client.is_skip_topic_request(answer):
+        evidence_ledger.record(
+            state,
+            stage="qa",
+            dimension="conceptual",
+            score=0.0,
+            skill=skill_tag,
+            question_id=qid,
+            hint_level=hint_now,
+            note="Candidate asked to skip this topic",
+            source="gate",
+            elapsed=_elapsed(row),
+        )
+        return _next_topic_turn(
+            db,
+            row,
+            state,
+            bridge="Sure — next area.",
+        )
+
     # The candidate is objecting to the QUESTION, not declining the topic.
     # Runs before the no-knowledge gate ("I don't know what you mean by that question"
     # used to score 0 and trigger a canned move-on).
@@ -1681,14 +1695,21 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             source="gate",
             elapsed=_elapsed(row),
         )
-        # Two failed attempts at one idea: change topic rather than argue.
-        if repairs >= 2:
+        # One failed rephrase is enough — looping an invented scenario (loans, etc.) is worse.
+        if repairs >= 1:
             return _next_topic_turn(
                 db,
                 row,
                 state,
                 bridge="Fair enough — let me ask something clearer.",
             )
+        if state.get("voice_duplex"):
+            state["realtime_cue"] = (
+                "They did not understand. Rephrase ONCE using nouns THEY said. "
+                "Drop any invented scenario. Then wait. One question only."
+            )[:300]
+            _save_state(row, state)
+            return ""
         fixed = None
         try:
             fixed = llm_client.respecify_question(
@@ -1760,7 +1781,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             topics=topics,
             briefing=state.get("interviewer_briefing") or "",
         )
-        if nxt:
+        if nxt and not state.get("voice_duplex"):
             _activate_question(state, nxt)
             spoken = question_graph.spoken_prompt(nxt, hint_level=0)
             _save_state(row, state)
@@ -1783,6 +1804,13 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             elapsed=_elapsed(row),
         )
         _save_state(row, state)
+        if state.get("voice_duplex"):
+            state["realtime_cue"] = (
+                "Their last answer was thin. Re-ask the SAME AGENDA item once, using their nouns. "
+                "One question, then wait."
+            )[:300]
+            _save_state(row, state)
+            return ""
         return _reask_current_question(state, reason="weak")
 
     # Half-cut / trailing STT — rephrase instead of scoring a partial thought.
@@ -1800,6 +1828,11 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             elapsed=_elapsed(row),
         )
         reply = _reask_current_question(state, reason="unclear")
+        if state.get("voice_duplex"):
+            state["realtime_cue"] = (
+                "That answer was cut off. Re-ask the SAME AGENDA item once. One question, then wait."
+            )[:300]
+            reply = ""
         _save_state(row, state)
         return reply
 
@@ -1946,7 +1979,13 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         # model skip the spoken round early while QA time remains.
         if action == "move_to_coding" and not force_coding:
             qa_budget = _qa_budget_seconds(row, state)
-            if _elapsed(row) < int(0.85 * qa_budget):
+            topics = _configured_topics(state)
+            cursor = int(state.get("topic_cursor", 0) or 0)
+            unfinished = bool(topics) and cursor < max(0, len(topics) - 1)
+            if unfinished and _elapsed(row) < int(0.9 * qa_budget):
+                action = "next_topic"
+                state["force_fresh_question"] = True
+            elif _elapsed(row) < int(0.85 * qa_budget):
                 action = "next_topic"
                 state["force_fresh_question"] = True
         if force_coding or action == "move_to_coding":
@@ -2658,6 +2697,15 @@ def handle_message(
         )
     # Never persist scorer coach notes as spoken interviewer turns.
     if cleaned and re.search(r"(?i)^\s*hidden\s+coach\b", cleaned):
+        cleaned = ""
+    handoff = bool(state.get("coding_handoff"))
+    if (
+        state.get("voice_duplex")
+        and cleaned
+        and not handoff
+        and not state.get("awaiting_end_confirm")
+        and row.stage in {"qa", "idea", "code"}
+    ):
         cleaned = ""
     if cleaned:
         handoff = bool(state.pop("coding_handoff", None))

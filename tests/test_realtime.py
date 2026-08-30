@@ -24,6 +24,28 @@ def test_instructions_include_topics_and_duplex_role():
     assert "English" in text
     assert "invent" in text.lower()
     assert "Do NOT invent" not in text
+    assert "GROUNDING" in text
+    assert "MUST spend at least three questions" not in text
+
+
+def test_instructions_agenda_order_survives_long_briefing():
+    text = interviewer_instructions(
+        student_name="Asha",
+        role_track="sde_intern",
+        stage="qa",
+        topics=["Java/OOP", "DBMS", "OS"],
+        briefing="Faculty wants OS last. " + ("pad " * 800),
+        include_coding=True,
+        style="friendly",
+        duration_minutes=17,
+    )
+    assert "AGENDA" in text
+    assert "item 1 (Java/OOP)" in text
+    assert "1. Java/OOP" in text
+    assert "2. DBMS" in text
+    assert "3. OS" in text
+    assert text.index("AGENDA") < text.index("FACULTY")
+    assert "Do not skip ahead" in text
 
 
 def test_turn_detection_server_vad():

@@ -90,6 +90,7 @@ def realtime_token(body: RealtimeTokenRequest, db: Session = Depends(get_db)) ->
     from app.llm import _compact_dossier
 
     dossier = state.get("resume_dossier") if isinstance(state.get("resume_dossier"), dict) else {}
+    orch.mark_voice_duplex(db, row)
     return realtime_mod.create_client_secret(
         session_id=row.id,
         student_name=row.student_name,
@@ -102,6 +103,7 @@ def realtime_token(body: RealtimeTokenRequest, db: Session = Depends(get_db)) ->
         style=str(state.get("interviewer_style") or "friendly"),
         duration_minutes=int(row.duration_minutes or 17),
         resume_dossier=_compact_dossier(dossier),
+        resume_deep=bool(state.get("resume_only")),
     )
 
 

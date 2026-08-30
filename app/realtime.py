@@ -25,7 +25,7 @@ def _safety_id(session_id: str, moodle_user_id: int = 0) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
-def _resume_context(dossier: dict[str, Any] | None) -> str:
+def _resume_context(dossier: dict[str, Any] | None, *, resume_deep: bool = False) -> str:
     if not dossier or not isinstance(dossier, dict):
         return ""
     bits: list[str] = []
@@ -55,10 +55,17 @@ def _resume_context(dossier: dict[str, Any] | None) -> str:
         bits.append("Skills: " + ", ".join(skills))
     if not bits:
         return ""
+    facts = " ".join(bits)[:900]
+    if resume_deep:
+        return (
+            "CANDIDATE RESUME — spend several questions on these exact items "
+            "(their project, internship, or stack), asking what they built, owned, and what broke: "
+            + facts
+        )
     return (
-        "CANDIDATE RESUME — you MUST spend at least three questions on these exact items "
-        "(their project, internship, or stack), asking what they built, owned, and what broke: "
-        + " ".join(bits)[:900]
+        "CANDIDATE FACTS — use only names they actually said. "
+        "Never invent a different product or domain (no loans, banking, or e-commerce unless they named it). "
+        + facts
     )
 
 
@@ -131,6 +138,22 @@ def coding_round_instructions(
     )
 
 
+def _agenda_block(topics: list[str] | None) -> str:
+    """Numbered run-of-show — placed early so client session.update slices cannot drop it."""
+    topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
+    if not topic_list:
+        return ""
+    numbered = " → ".join(f"{i}. {t}" for i, t in enumerate(topic_list, 1))
+    first_item = topic_list[0]
+    return (
+        "AGENDA — cover in this EXACT order, one competency at a time. "
+        "Do not skip ahead. The FIRST spoken question after the greeting MUST be on "
+        f"item 1 ({first_item}). Only move to the next item after one solid answer "
+        f"or one failed re-ask. Cover every item, including the last, before coding. "
+        f"{numbered}. "
+    )
+
+
 def interviewer_instructions(
     *,
     student_name: str = "candidate",
@@ -142,6 +165,7 @@ def interviewer_instructions(
     style: str = "friendly",
     duration_minutes: int = 17,
     resume_dossier: dict[str, Any] | None = None,
+    resume_deep: bool = False,
 ) -> str:
     if (stage or "").strip().lower() in {"idea", "code", "explain"}:
         return coding_round_instructions(
@@ -152,8 +176,8 @@ def interviewer_instructions(
         )
     first = (student_name or "there").split()[0]
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
-    topic_line = ", ".join(topic_list) if topic_list else "the role-track fundamentals"
-    briefing_line = " ".join((briefing or "").split())[:1800]
+    agenda = _agenda_block(topic_list)
+    briefing_line = " ".join((briefing or "").split())[:3200]
     style_key = (style or "friendly").strip().lower()
     tone = {
         "friendly": "warm and encouraging, still rigorous",
@@ -172,10 +196,12 @@ def interviewer_instructions(
     extra_brief = ""
     if briefing_line:
         extra_brief = (
-            "FACULTY / CUSTOM INTERVIEWER RULES (must follow for topics and emphasis): "
+            "FACULTY / CUSTOM INTERVIEWER BRIEFING — this is the run-of-show. "
+            "If it lists bullets or a sequence, that sequence wins. "
+            "Otherwise follow the AGENDA order above. "
             f"{briefing_line} "
         )
-    resume_line = _resume_context(resume_dossier)
+    resume_line = _resume_context(resume_dossier, resume_deep=bool(resume_deep))
 
     return (
         "You are NexAI, a live voice interviewer — the same feel as ChatGPT Voice: "
@@ -185,8 +211,14 @@ def interviewer_instructions(
         f"Role track: {role_track}. "
         f"Current stage: {stage}. About {max(10, int(duration_minutes or 17))} minutes. "
         f"Tone: {tone}. Hold that tone the whole session. "
-        f"Cover these topics: {topic_line}. {extra_brief}"
+        f"{agenda}"
+        f"{extra_brief}"
         f"{(resume_line + ' ') if resume_line else ''}"
+        "GROUNDING: After they speak, reuse ONLY names and products they said. "
+        "Never invent a different app or domain (loans, banking, e-commerce) they did not name. "
+        "If they say they did not understand, rephrase ONCE with their nouns, then move to the next AGENDA item. "
+        "Ask EXACTLY ONE question, then STOP and wait — never stack a second question before they answer. "
+        "Cover every AGENDA item, including the last, before coding. "
         "YOU invent every spoken question. Hidden coach notes only name a competency — "
         "never read them, never read exam stems, never copy a written paragraph. "
         "SPEECH: talk like a sharp human on a video call. Contractions. "
@@ -271,6 +303,7 @@ def create_client_secret(
     style: str = "friendly",
     duration_minutes: int = 17,
     resume_dossier: dict[str, Any] | None = None,
+    resume_deep: bool = False,
 ) -> dict[str, Any]:
     """
     Mint an ephemeral Realtime client secret for browser WebRTC.
@@ -295,6 +328,7 @@ def create_client_secret(
         style=style,
         duration_minutes=duration_minutes,
         resume_dossier=resume_dossier,
+        resume_deep=resume_deep,
     )
     # Auto-reply is turned on by the browser after Realtime greets.
     # Mint with it off so the session does not speak before the data channel is ready.

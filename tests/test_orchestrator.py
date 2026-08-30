@@ -99,6 +99,8 @@ def test_nexai_timed_flow_and_editor_lock():
         )
         assert view["duration_minutes"] == 30
         assert view["stage"] == "qa"
+        assert view["qa_agenda"] == ["arrays", "hashmap"]
+        assert view["qa_agenda_index"] == 0
         spoken = " ".join(t["content"] for t in view["turns"] if t["role"] == "assistant")
         assert "nexai" in spoken.lower().replace(" ", "")
         assert view["ui"]["editor_locked"] is False

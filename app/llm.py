@@ -195,6 +195,10 @@ UNCLEAR_QUESTION_RE = re.compile(
     r"(?:did\s*n[o']?t|didn'?t|not)\s+(?:really\s+|quite\s+|fully\s+)?"
     r"(?:get|catch|follow|understand|understood)\s+(?:your|the|that|this)\s*(?:question|point|ask)|"
     r"i\s+(?:really\s+)?(?:didn'?t|did\s+not)\s+get\s+(?:your|the)?\s*question|"
+    r"i\s+didn'?t\s+get\s+you|"
+    r"didn'?t\s+get\s+you|"
+    r"didn'?t\s+get\s+(?:that|this|it)\b|"
+    r"what\s+is\s+meant\s+by|"
     r"(?:i\s+)?don'?t\s+(?:really\s+|quite\s+)?understand(?:\s+really)?(?:\s+(?:your|the|that|this|by))|"
     r"(?:i\s+)?don'?t\s+understand\s+really|"
     r"(?:your|that|the|this)\s+question\s+(?:itself\s+)?(?:is|was|sounds|seems|makes)"
@@ -207,6 +211,16 @@ UNCLEAR_QUESTION_RE = re.compile(
     r"(?:could|can)\s+you\s+repeat\s+(?:the|that)\s+question|"
     r"didn'?t\s+get\s+(?:your|the)\s+question"
     r")"
+)
+
+SKIP_TOPIC_RE = re.compile(
+    r"(?i)\b("
+    r"(?:can we |let'?s |please )?(?:go to |move (?:on )?to |skip (?:to )?)(?:the )?next"
+    r"(?: topic| one| question)?"
+    r"|next\s+(?:topic|one|question|stop)"
+    r"|skip this(?: one| question| topic)?"
+    r"|move on"
+    r")\b"
 )
 
 # Question shapes that are too generic to speak in a real interview.
@@ -281,6 +295,14 @@ def is_unclear_question_response(text: str) -> bool:
     if not clean:
         return False
     return bool(UNCLEAR_QUESTION_RE.search(clean))
+
+
+def is_skip_topic_request(text: str) -> bool:
+    """True when the candidate asks to leave this topic and go to the next one."""
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return False
+    return bool(SKIP_TOPIC_RE.search(clean))
 
 
 def is_vague_question(text: str, *, min_words: int = 0) -> bool:
@@ -1424,14 +1446,15 @@ def first_question(
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
     focus_topic = str(focus_topic or "").strip() or (topic_list[0] if topic_list else "")
     if topic_list and not resume_only:
+        numbered = " → ".join(f"{i}. {t}" for i, t in enumerate(topic_list, 1))
         system += (
-            "\n\nTOPIC LOCK (HARD CONSTRAINT): the opening question must sit inside this list — "
-            + ", ".join(topic_list)
-            + ". Do NOT ask about time/space complexity, Big-O, hash maps, or other DSA topics "
-            "unless they appear in the list."
+            "\n\nTOPIC LOCK (HARD CONSTRAINT): cover this AGENDA in order — "
+            + numbered
+            + ". The opening question MUST be item 1"
+            + (f" ({focus_topic})" if focus_topic else "")
+            + ". Do NOT skip ahead. Do NOT ask about time/space complexity, Big-O, hash maps, "
+            "or other DSA topics unless they appear in the list."
         )
-        if focus_topic:
-            system += f" Open on this topic: {focus_topic}. Name it in the question."
     if not resume_questions_allowed and not resume_only:
         system += (
             " RESUME IS OFF-LIMITS: do not ask about their resume, CV, listed projects, internships, "

@@ -4,6 +4,7 @@ from app.llm import (
     default_ack,
     is_no_knowledge_answer,
     is_off_lock_dsa,
+    is_skip_topic_request,
     is_unclear_question_response,
     is_vague_question,
     strip_spoken_meta,
@@ -20,6 +21,9 @@ def test_unclear_does_not_score_as_no_knowledge():
     for text in samples:
         assert is_unclear_question_response(text), text
         assert not is_no_knowledge_answer(text), text
+    assert is_unclear_question_response("I didn't get you. What is meant by loan request?")
+    assert is_skip_topic_request("I didn't get you. I don't know. Can we go to the next topic?")
+    assert is_skip_topic_request("Next stop to the world.")
 
 
 def test_plain_idk_is_still_no_knowledge():
