@@ -2208,9 +2208,9 @@ def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     _save_state(row, state)
     agenda_done = _qa_agenda_complete(state)
     lead = (
-        "Thanks — that closes the spoken technical round. "
+        "Alright — let's park the spoken technical questions and switch to coding. "
         if agenda_done
-        else "Thanks — we are moving on to coding now. "
+        else "Alright — wrapping that topic. Let's move into coding. "
     )
     return lead + coding
 
