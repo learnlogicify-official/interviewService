@@ -557,6 +557,7 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
         "realtime_cue": str(state.get("realtime_cue") or "")[:300],
         "awaiting_end_confirm": bool(state.get("awaiting_end_confirm")),
         "coding_just_passed": bool(state.get("coding_just_passed")),
+        "awaiting_coding_clarify": bool(state.get("awaiting_coding_clarify")),
         "explain_excerpt": str(state.get("explain_excerpt") or "")[:400],
         "voice_metrics": state.get("voice_metrics") or {},
         "turns": [
@@ -819,6 +820,110 @@ def _spoken_wrap_text(row: SessionRow, state: dict[str, Any]) -> str:
     return f"Thanks for your time today, {first}. Your report is ready."
 
 
+def _wants_no_more_clarify(text: str) -> bool:
+    """True when the candidate declines further questions after a green coding submit."""
+    t = " ".join((text or "").lower().split())
+    if not t:
+        return False
+    if duplex_score.is_confirm_no(t):
+        return True
+    if duplex_score.is_confirm_yes(t) and re.search(
+        r"\b(done|finish|end|wrap|close|that'?s all|all good)\b", t
+    ):
+        return True
+    if re.search(
+        r"\b(no (more )?questions?|nothing else|i'?m good|im good|all good|"
+        r"that'?s (all|it|fine)|no thanks|no thank you|we can (end|wrap|finish)|"
+        r"let'?s (end|wrap|finish)|i'?m done|ready to (end|finish|wrap))\b",
+        t,
+    ):
+        return True
+    if _is_end_intent(t):
+        return True
+    return False
+
+
+def _begin_post_coding_clarify(
+    db: Session,
+    row: SessionRow,
+    state: dict[str, Any],
+    *,
+    passed: int,
+    total: int,
+) -> dict[str, Any]:
+    """After a green submit: congratulate, offer clarifications, then wrap later."""
+    state["awaiting_coding_clarify"] = True
+    state["coding_clarify_asks"] = 0
+    state["coding_just_passed"] = True
+    state["need_next_problem"] = False
+    state["realtime_cue"] = (
+        f"All {passed}/{total} tests passed. Congratulate in one short sentence, then ask whether "
+        "they have any clarifying questions about the problem, their solution, or the interview. "
+        "Do not start a new coding problem. Do not invent a wrap-up yet."
+    )[:300]
+    row.stage = "wrap"
+    state["awaiting"] = "clarify"
+    spoken = (
+        f"All {passed} tests passed — nice work on that. "
+        "Before we close, do you have any clarifying questions about the problem or your approach?"
+    )
+    _add_turn(
+        db,
+        row.id,
+        "wrap",
+        "assistant",
+        spoken,
+        {"coding_passed": True, "coding_clarify": True},
+    )
+    _save_state(row, state)
+    db.commit()
+    db.refresh(row)
+    return session_view(db, row)
+
+
+def _handle_coding_clarify(
+    db: Session,
+    row: SessionRow,
+    state: dict[str, Any],
+    text: str,
+    duration_sec: float,
+) -> dict[str, Any]:
+    """Post-pass clarification beat: answer briefly, then close when they are done."""
+    _note_voice_and_claims(state, text, duration_sec)
+    _add_turn(db, row.id, "wrap", "student", text, {"coding_clarify": True})
+    asks = int(state.get("coding_clarify_asks", 0) or 0)
+    remaining = _seconds_remaining(row)
+
+    if _wants_no_more_clarify(text) or asks >= 2 or remaining <= 35:
+        state["awaiting_coding_clarify"] = False
+        state.pop("realtime_cue", None)
+        _save_state(row, state)
+        db.commit()
+        return finish_session(db, row, reason="coding_complete")
+
+    state["coding_clarify_asks"] = asks + 1
+    if state.get("voice_duplex"):
+        state["realtime_cue"] = (
+            "Answer their clarification in at most two short sentences. Then ask if they have "
+            "anything else before you wrap up. Do not start a new problem."
+        )[:300]
+        duplex_score.clear_utterance_buffer(state)
+        _save_state(row, state)
+        db.commit()
+        db.refresh(row)
+        return session_view(db, row)
+
+    reply = (
+        "Good question — keep that trade-off in mind. "
+        "Anything else before we wrap up?"
+    )
+    _add_turn(db, row.id, "wrap", "assistant", reply, {"coding_clarify": True})
+    _save_state(row, state)
+    db.commit()
+    db.refresh(row)
+    return session_view(db, row)
+
+
 def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> dict[str, Any]:
     state = _state(row)
     if reason == "time_up" and "time_up" not in state.get("flags", []):
@@ -846,6 +951,7 @@ def finish_session(db: Session, row: SessionRow, reason: str = "completed") -> d
     duplex_score.recompute_scores(state)
     duplex_score.clear_utterance_buffer(state)
     state["awaiting_end_confirm"] = False
+    state["awaiting_coding_clarify"] = False
 
     report = build_report(state, turns)
     row.status = "completed"
@@ -947,6 +1053,10 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
     if row.status != "active":
         return session_view(db, row)
     if _should_wrap(row):
+        state = _state(row)
+        # Let a green-submit clarification beat finish cleanly on the next message if possible.
+        if state.get("awaiting_coding_clarify") and _seconds_remaining(row) > 15:
+            return session_view(db, row)
         return finish_session(db, row, reason="time_up")
     state = _state(row)
     if row.stage == "qa" and _elapsed(row) >= _qa_budget_seconds(row, state):
@@ -2535,7 +2645,11 @@ def handle_message(
 ) -> dict[str, Any]:
     if row.status != "active":
         return session_view(db, row)
-    if _should_wrap(row):
+    state = _state(row)
+    # Clarification after a green submit should not be cut by the wrap timer mid-sentence.
+    if _should_wrap(row) and not state.get("awaiting_coding_clarify"):
+        return finish_session(db, row, reason="time_up")
+    if state.get("awaiting_coding_clarify") and _seconds_remaining(row) <= 15:
         return finish_session(db, row, reason="time_up")
     if _expire_if_needed(db, row):
         db.refresh(row)
@@ -2546,6 +2660,19 @@ def handle_message(
         return session_view(db, row)
     if not text:
         state = _state(row)
+        if state.get("awaiting_coding_clarify"):
+            reply = "Any clarifying questions before we wrap up, or shall we close?"
+            if state.get("voice_duplex"):
+                state["realtime_cue"] = reply[:300]
+                _save_state(row, state)
+                db.commit()
+                db.refresh(row)
+                return session_view(db, row)
+            _add_turn(db, row.id, "wrap", "assistant", reply, {"coding_clarify": True})
+            _save_state(row, state)
+            db.commit()
+            db.refresh(row)
+            return session_view(db, row)
         if row.stage in {"qa", "idea"}:
             reply = _reask_current_question(state, reason="empty")
         else:
@@ -2557,6 +2684,9 @@ def handle_message(
         return session_view(db, row)
 
     state = _state(row)
+
+    if state.get("awaiting_coding_clarify"):
+        return _handle_coding_clarify(db, row, state, text, duration_sec)
 
     # Wrap-up confirm — duplex "yes" is short and must never be treated as weak filler.
     if state.get("awaiting_end_confirm"):
@@ -2978,6 +3108,12 @@ def handle_coding_result(
             db.commit()
             db.refresh(row)
             return session_view(db, row)
+
+        # Time left: congratulate + invite clarifications instead of ending abruptly.
+        if _seconds_remaining(row) > 40:
+            return _begin_post_coding_clarify(
+                db, row, state, passed=passed, total=total
+            )
 
         _save_state(row, state)
         spoken = (

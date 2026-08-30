@@ -407,6 +407,53 @@ def test_log_turn_skips_leftover_qa_during_coding():
         db.close()
 
 
+def test_green_submit_offers_clarify_before_finish():
+    """A green submit with time left must not end the session immediately."""
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=21,
+            moodle_cm_id=0,
+            moodle_instance_id=0,
+            student_name="Sachin",
+            role_track="sde_intern",
+            duration_minutes=30,
+            topics=["arrays"],
+            moodle_problem_id=42,
+            moodle_problem_title="Valid Parentheses",
+        )
+        sid = view["session_id"]
+        row = orch.get_session(db, sid)
+        state = orch._state(row)
+        row.stage = "code"
+        state["awaiting"] = "code"
+        state["moodle_problem_id"] = 42
+        state["max_coding_problems"] = 1
+        orch._save_state(row, state)
+        db.commit()
+
+        view = orch.handle_coding_result(
+            db, row, passed=3, total=3, all_passed=True, problem_id=42
+        )
+        assert view["status"] == "active"
+        assert view.get("awaiting_coding_clarify") is True
+        assert any(
+            (t.get("meta") or {}).get("coding_clarify")
+            for t in view["turns"]
+            if t.get("role") == "assistant"
+        )
+
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "No, I'm good — we can wrap up.")
+        assert view["status"] == "completed"
+        last = view["turns"][-1]
+        assert last.get("meta", {}).get("spoken_wrap") or "report is ready" in last["content"].lower()
+    finally:
+        db.close()
+
+
 def test_sign():
     ts = int(time.time())
     sig = sign_payload(["start", 1, 2, 3, "sde_intern", 30, ts], secret="test-secret")
