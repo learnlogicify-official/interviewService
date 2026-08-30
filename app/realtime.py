@@ -238,12 +238,15 @@ def _audio_input(*, create_response: bool, semantic: bool = False) -> dict[str, 
 
 
 def _turn_detection(*, create_response: bool, semantic: bool = False) -> dict[str, Any]:
+    # interrupt off until the browser enables duplex — mint-time True was cutting
+    # the greeting when speaker echo arrived before the client's session.update.
+    interrupt = bool(create_response)
     if semantic:
         return {
             "type": "semantic_vad",
             "eagerness": "medium",
             "create_response": bool(create_response),
-            "interrupt_response": True,
+            "interrupt_response": interrupt,
         }
     return {
         "type": "server_vad",
@@ -251,7 +254,7 @@ def _turn_detection(*, create_response: bool, semantic: bool = False) -> dict[st
         "prefix_padding_ms": 300,
         "silence_duration_ms": 700,
         "create_response": bool(create_response),
-        "interrupt_response": True,
+        "interrupt_response": interrupt,
     }
 
 

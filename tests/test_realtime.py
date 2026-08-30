@@ -31,10 +31,13 @@ def test_turn_detection_server_vad():
     assert td["type"] == "server_vad"
     assert td["silence_duration_ms"] == 700
     assert td["create_response"] is False
-    assert td["interrupt_response"] is True
+    assert td["interrupt_response"] is False
     semantic = _turn_detection(create_response=True, semantic=True)
     assert semantic["type"] == "semantic_vad"
     assert semantic["create_response"] is True
+    assert semantic["interrupt_response"] is True
+    live = _turn_detection(create_response=True)
+    assert live["interrupt_response"] is True
 
 
 def test_coach_note_is_not_a_script():

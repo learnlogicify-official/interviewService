@@ -46,10 +46,10 @@ def test_flow_idea_and_code():
             "Hash maps give average O(1) lookups. Sorted arrays are O(log n) with binary search but use less overhead and keep order. Collisions and extra memory are the main hash trade-offs.",
         )
         assert view["stage"] == "qa"
-        row = _rewind(db, orch.get_session(db, sid), 320)
+        row = _rewind(db, orch.get_session(db, sid), 400)
         view = orch.tick_session(db, row)
         assert view["stage"] == "qa"
-        row = orch.get_session(db, sid)
+        row = _rewind(db, orch.get_session(db, sid), 920)
         view = orch.handle_message(
             db,
             row,
@@ -97,14 +97,14 @@ def test_nexai_timed_flow_and_editor_lock():
             moodle_problem_id=42,
             moodle_problem_title="Valid Parentheses",
         )
-        assert view["duration_minutes"] == 17
+        assert view["duration_minutes"] == 30
         assert view["stage"] == "qa"
         spoken = " ".join(t["content"] for t in view["turns"] if t["role"] == "assistant")
         assert "nexai" in spoken.lower().replace(" ", "")
         assert view["ui"]["editor_locked"] is False
 
         sid = view["session_id"]
-        row = _rewind(db, orch.get_session(db, sid), 320)
+        row = _rewind(db, orch.get_session(db, sid), 920)
         view = orch.tick_session(db, row)
         # Open technical question must be answered before the IDE appears.
         assert view["stage"] == "qa"
@@ -136,7 +136,7 @@ def test_nexai_timed_flow_and_editor_lock():
             assert view["stage"] in {"code", "explain"}
             assert view["ui"]["editor_locked"] is False
 
-        row = _rewind(db, orch.get_session(db, sid), 1000)
+        row = _rewind(db, orch.get_session(db, sid), 1750)
         view = orch.tick_session(db, row)
         assert view["status"] == "completed"
         last = view["turns"][-1]
@@ -214,6 +214,154 @@ def test_end_asks_permission():
         row = orch.get_session(db, sid)
         view = orch.handle_message(db, row, "yes")
         assert view["status"] == "completed"
+    finally:
+        db.close()
+
+
+def test_coding_just_passed_survives_tick():
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=11,
+            moodle_cm_id=0,
+            moodle_instance_id=0,
+            student_name="Pat",
+            role_track="sde_intern",
+            duration_minutes=17,
+            topics=["arrays"],
+            moodle_problem_id=42,
+            moodle_problem_title="Valid Parentheses",
+        )
+        row = orch.get_session(db, view["session_id"])
+        state = orch._state(row)
+        state["coding_just_passed"] = True
+        orch._save_state(row, state)
+        db.commit()
+        first = orch.tick_session(db, row)
+        assert first["coding_just_passed"] is True
+        row = orch.get_session(db, view["session_id"])
+        second = orch.tick_session(db, row)
+        assert second["coding_just_passed"] is False
+    finally:
+        db.close()
+
+
+def test_repeat_pass_same_problem_does_not_end():
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=12,
+            moodle_cm_id=0,
+            moodle_instance_id=0,
+            student_name="Sam",
+            role_track="sde_intern",
+            duration_minutes=30,
+            topics=["arrays"],
+            moodle_problem_id=42,
+            moodle_problem_title="Valid Parentheses",
+        )
+        sid = view["session_id"]
+        row = orch.get_session(db, sid)
+        state = orch._state(row)
+        row.stage = "code"
+        state["awaiting"] = "code"
+        state["moodle_problem_id"] = 42
+        orch._save_state(row, state)
+        db.commit()
+        first = orch.handle_coding_result(
+            db, row, passed=3, total=3, all_passed=True, problem_id=42
+        )
+        assert first["status"] == "active"
+        row = orch.get_session(db, sid)
+        second = orch.handle_coding_result(
+            db, row, passed=3, total=3, all_passed=True, problem_id=42
+        )
+        assert second["status"] == "active"
+        row = orch.get_session(db, sid)
+        state = orch._state(row)
+        assert int(state.get("problems_solved_count") or 0) == 1
+    finally:
+        db.close()
+
+
+def test_let_me_code_does_not_unlock_without_approach():
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=13,
+            moodle_cm_id=0,
+            moodle_instance_id=0,
+            student_name="Alex",
+            role_track="sde_intern",
+            duration_minutes=30,
+            topics=["arrays"],
+            moodle_problem_id=42,
+            moodle_problem_title="Valid Parentheses",
+        )
+        sid = view["session_id"]
+        row = _rewind(db, orch.get_session(db, sid), 920)
+        view = orch.handle_message(
+            db,
+            row,
+            "Hash maps give average O(1) lookups. Sorted arrays are O(log n) with binary search but use less memory.",
+        )
+        assert view["stage"] == "idea"
+        assert view["ui"]["editor_locked"] is True
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "ok let me start coding now please")
+        assert view["stage"] == "idea"
+        assert view["ui"]["editor_locked"] is True
+        row = orch.get_session(db, sid)
+        view = orch.handle_message(db, row, "yeah um I think a loop maybe")
+        assert view["stage"] == "idea"
+        assert view["ui"]["editor_locked"] is True
+    finally:
+        db.close()
+
+
+def test_log_turn_skips_leftover_qa_during_coding():
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=14,
+            moodle_cm_id=0,
+            moodle_instance_id=0,
+            student_name="Kim",
+            role_track="sde_intern",
+            duration_minutes=30,
+            topics=["java"],
+            moodle_problem_id=7,
+            moodle_problem_title="Two Sum",
+        )
+        sid = view["session_id"]
+        row = _rewind(db, orch.get_session(db, sid), 1000)
+        view = orch.handle_message(
+            db,
+            row,
+            "In Java, ArrayList remove during a for-each throws ConcurrentModificationException. "
+            "Use an Iterator.remove or collect indices and delete after the loop. "
+            "DBMS transactions need isolation so dirty reads do not leak uncommitted rows.",
+        )
+        assert view["stage"] == "idea"
+        before = len([t for t in view["turns"] if t["role"] == "assistant"])
+        row = orch.get_session(db, sid)
+        view = orch.log_assistant_turn(
+            db,
+            row,
+            "In Java, what is the difference between an ArrayList and a LinkedList?",
+        )
+        after = [t for t in view["turns"] if t["role"] == "assistant"]
+        assert len(after) == before
+        last = after[-1]
+        assert last.get("meta", {}).get("coding_handoff") is True
     finally:
         db.close()
 

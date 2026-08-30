@@ -914,6 +914,10 @@ def log_assistant_turn(
     )
     if last and " ".join((last.content or "").split()).lower() == text.lower():
         return session_view(db, row)
+    # After the coding cutover, ignore leftover Q&A captions so they cannot become
+    # the latest turn and hide the coding_handoff from the room.
+    if row.stage in {"idea", "code", "explain"} and _is_leftover_qa_caption(text):
+        return session_view(db, row)
     use_stage = (stage or row.stage or "qa").strip() or "qa"
     _add_turn(db, row.id, use_stage, "assistant", text[:1200], {"realtime": True})
     state = _state(row)
@@ -924,6 +928,23 @@ def log_assistant_turn(
     db.commit()
     db.refresh(row)
     return session_view(db, row)
+
+
+_LEFTOVER_QA_RE = re.compile(
+    r"(?i)\b(java|dbms|sql|operating system|hash ?map|arraylist|normalization|"
+    r"acid|deadlock|semaphore|polymorphism|tcp/ip|innodb)\b"
+)
+_CODING_SPEECH_RE = re.compile(
+    r"(?i)\b(approach|editor|complexit|edge case|nexpractice|implement|"
+    r"data structure|unlock|your code|this line)\b"
+)
+
+
+def _is_leftover_qa_caption(text: str) -> bool:
+    blob = text or ""
+    if _CODING_SPEECH_RE.search(blob):
+        return False
+    return bool(_LEFTOVER_QA_RE.search(blob))
 
 
 def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
@@ -971,15 +992,18 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
             db.commit()
             db.refresh(row)
             return session_view(db, row)
+    if _expire_if_needed(db, row):
+        db.refresh(row)
+        return session_view(db, row)
+    # Snapshot the one-shot BEFORE clearing so GET/poll still sees it. Clearing first
+    # made the client miss the green-submit celebration unless coding_result won a race.
+    view = session_view(db, row)
+    state = _state(row)
     if state.get("coding_just_passed"):
         state["coding_just_passed"] = False
         _save_state(row, state)
         db.commit()
-        db.refresh(row)
-    if _expire_if_needed(db, row):
-        db.refresh(row)
-        return session_view(db, row)
-    return session_view(db, row)
+    return view
 
 
 def _recent_transcript(db: Session, session_id: str, limit: int = 8) -> list[dict[str, str]]:
@@ -2085,6 +2109,8 @@ _SOLUTION_ASK_RE = re.compile(
 _APPROACH_HINTS = (
     "array", "index", "loop", "complex", "o(n)", "hash", "edge", "length",
     "mid", "sort", "scan", "pointer", "sum", "prefix",
+    "stack", "queue", "tree", "map", "brut", "recurs", "window", "binary",
+    "step", "space",
 )
 
 
@@ -2134,8 +2160,8 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             "Walk me through your approach: data structure, main steps, time complexity, and one edge case."
         )
     if llm_client.is_weak_answer(answer, min_words=8):
-        # Never loop forever on the approach — open the editor and judge the code instead.
-        if idea_secs >= IDEA_STAGE_MAX_SECONDS or attempts >= 2:
+        # Weak/filler never unlocks early — only the 210s timeout does.
+        if idea_secs >= IDEA_STAGE_MAX_SECONDS:
             state["score_idea"] = max(float(state.get("score_idea", 0)), 45.0)
             state["idea_hint_level"] = 3
             return _unlock_editor(
@@ -2154,7 +2180,8 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
         problem = get_problem(state["current_problem_id"])
     if _substantive_idea_answer(answer):
         state["idea_attempts"] = attempts = attempts + 1
-    if _READY_TO_CODE_RE.search(answer or "") and (attempts >= 1 or idea_secs >= 60):
+    # "Let me code" is not a plan. Unlock only when they actually described the approach.
+    if _READY_TO_CODE_RE.search(answer or "") and _looks_like_coding_approach(answer):
         state["score_idea"] = max(float(state.get("score_idea", 0)), 50.0)
         return _unlock_editor(
             row,
@@ -2193,9 +2220,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
         score_now = max(float(llm_result["score"]), duplex_score.heuristic_idea_score(answer))
         state["score_idea"] = max(float(state.get("score_idea", 0)), score_now)
         action = llm_result["next_action"]
-        unlock = action == "unlock_editor" and score_now >= 50.0 and (
-            _looks_like_coding_approach(answer) or attempts >= 2
-        )
+        unlock = action == "unlock_editor" and score_now >= 50.0 and _looks_like_coding_approach(answer)
         if not unlock and _looks_like_coding_approach(answer) and score_now >= 60.0:
             unlock = True
         idea_hint = evidence_ledger.bump_hint(
@@ -2217,12 +2242,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             elapsed=_elapsed(row),
         )
         # Hard stops so the approach probe can never become an endless loop.
-        if not unlock and attempts >= 2 and _seconds_remaining(row) <= (
-            int(get_settings().wrap_seconds or 120) + 120
-        ):
-            unlock = True
-            state["idea_hint_level"] = 3
-        if not unlock and attempts >= 3:
+        if not unlock and attempts >= 3 and idea_secs >= 90:
             unlock = True
             state["idea_hint_level"] = 3
         if unlock:
@@ -2806,6 +2826,15 @@ def handle_coding_result(
             state["awaiting"] = "code"
 
     if all_passed and total > 0:
+        pid_key = str(pid or state.get("current_problem_id") or "moodle")
+        solved_ids = [str(x) for x in (state.get("solved_problem_ids") or [])]
+        if pid_key in solved_ids:
+            _save_state(row, state)
+            db.commit()
+            db.refresh(row)
+            return session_view(db, row)
+        solved_ids.append(pid_key)
+        state["solved_problem_ids"] = solved_ids
         state["score_coding"] = max(float(state.get("score_coding", 0) or 0), 85.0 + min(15.0, ratio * 15))
         state["problems_solved_count"] = int(state.get("problems_solved_count", 0) or 0) + 1
         evidence_ledger.record(
