@@ -2518,7 +2518,10 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
         return None
     if _should_wrap(row):
         return None
-    if int(state.get("explain_count", 0)) >= 5:
+    duplex = bool(state.get("voice_duplex"))
+    max_explains = 2 if duplex else 5
+    cooldown = 90 if duplex else 40
+    if int(state.get("explain_count", 0)) >= max_explains:
         return None
     nontrivial = sum(1 for ln in code.splitlines() if ln.strip() and "pass" not in ln)
     if nontrivial < 3:
@@ -2527,16 +2530,25 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
     if last_len and abs(len(code) - last_len) < 24:
         return None
     last_at = float(state.get("last_interrupt_elapsed", 0) or 0)
-    if last_at and (_elapsed(row) - last_at) < 40:
+    if last_at and (_elapsed(row) - last_at) < cooldown:
         return None
     excerpt = evaluator.pick_code_excerpt(code)
     if not excerpt:
         return None
-    state["explain_excerpt"] = excerpt
     state["explain_count"] = int(state.get("explain_count", 0)) + 1
-    state["explain_pending"] = True
     state["interrupt_code_len"] = len(code)
     state["last_interrupt_elapsed"] = _elapsed(row)
+    state["realtime_cue"] = (
+        "Ask ONE short question about THIS code excerpt only (do not invent a different question): "
+        + excerpt.replace("\n", " ")[:220]
+    )[:300]
+    # Duplex: cue Realtime only — an assistant interrupt turn fights the live mouth.
+    if duplex:
+        _save_state(row, state)
+        return None
+
+    state["explain_excerpt"] = excerpt
+    state["explain_pending"] = True
     state["awaiting"] = "explain"
     row.stage = "explain"
     _save_state(row, state)
@@ -2554,10 +2566,6 @@ def maybe_interrupt(db: Session, row: SessionRow, state: dict[str, Any], code: s
         },
     )
     if llm_result and llm_result.get("reply"):
-        state["realtime_cue"] = (
-            "Ask about THIS code excerpt only (do not invent a different question): "
-            + excerpt.replace("\n", " ")[:220]
-        )
         return llm_result["reply"]
 
     cue = (
