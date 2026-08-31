@@ -436,7 +436,7 @@ def is_no_knowledge_answer(text: str) -> bool:
 
 
 def clamp_answer_score(text: str, score: float) -> float:
-    """Cap scores so 'I don't know' cannot become 40–70."""
+    """Cap scores so 'I don't know' / nonsense cannot become 40–70."""
     try:
         s = float(score)
     except Exception:
@@ -445,6 +445,23 @@ def clamp_answer_score(text: str, score: float) -> float:
         return 0.0
     if is_weak_answer(text):
         return min(s, 20.0)
+    words = re.findall(r"[A-Za-z0-9_]+", (text or "").lower())
+    # Gibberish / cut STT that somehow passed weak-gate.
+    if words and len(words) <= 14:
+        content = " ".join(words)
+        if re.search(
+            r"(?i)(detect every object|your double one|out of the british|i will bug)",
+            content,
+        ):
+            return min(s, 15.0)
+        tech = re.search(
+            r"(?i)\\b(array|list|hash|map|stack|queue|tree|graph|db|sql|api|class|object|"
+            r"function|loop|complex|o\\(|cpu|memory|cache|index|thread|lock|test|"
+            r"bug|error|status|http|json|react|node|java|python|rails)\\b",
+            content,
+        )
+        if not tech and len(words) <= 8:
+            return min(s, 35.0)
     return max(0.0, min(100.0, s))
 
 

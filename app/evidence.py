@@ -74,8 +74,8 @@ def record(
 
 def independence_score(state: dict[str, Any]) -> float:
     """
-    100 = answered everything at H0; lower as hints escalate.
-    Weighted by evidence rows when present.
+    100 = answered everything at H0 with real substance; lower as hints escalate
+    or answers stay empty / no-knowledge.
     """
     evidence = state.get("evidence") or []
     if evidence:
@@ -83,16 +83,32 @@ def independence_score(state: dict[str, Any]) -> float:
         for e in evidence:
             h = clamp_hint(int(e.get("hint_level", 0) or 0))
             # H0=0, H1=12, H2=28, H3=48, H4=75 penalty points
-            penalties.append({0: 0, 1: 12, 2: 28, 3: 48, 4: 75}.get(h, 20))
+            pen = {0: 0, 1: 12, 2: 28, 3: 48, 4: 75}.get(h, 20)
+            score = float(e.get("score", 0) or 0)
+            src = str(e.get("source") or "")
+            # Thin / IDK answers must not look "high independence".
+            if src == "no_knowledge" or score <= 5:
+                pen = max(pen, 55)
+            elif score < 30:
+                pen = max(pen, 28)
+            penalties.append(pen)
         avg_pen = sum(penalties) / len(penalties)
-        return max(0.0, min(100.0, 100.0 - avg_pen))
+        indep = max(0.0, min(100.0, 100.0 - avg_pen))
+        no_k = int(state.get("no_knowledge_count", 0) or 0)
+        if no_k >= 2:
+            indep = min(indep, max(15.0, 70.0 - no_k * 12.0))
+        return indep
 
     deps = state.get("hint_dependency") or {}
     if not deps:
         return 0.0  # no answers / no evidence → no independence credit
     levels = [clamp_hint(int(v)) for v in deps.values()]
     avg = sum(levels) / len(levels)
-    return max(0.0, min(100.0, 100.0 - avg * 22.0))
+    indep = max(0.0, min(100.0, 100.0 - avg * 22.0))
+    no_k = int(state.get("no_knowledge_count", 0) or 0)
+    if no_k >= 2:
+        indep = min(indep, max(15.0, 70.0 - no_k * 12.0))
+    return indep
 
 
 def hint_summary(state: dict[str, Any]) -> dict[str, Any]:

@@ -1879,7 +1879,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
         _apply_score_communication(state, answer, score)
         state["qa_index"] = idx + 1
-        state["current_hint_level"] = evidence_ledger.bump_hint(hint_now, reason="followup")
+        state["current_hint_level"] = max(
+            2, evidence_ledger.bump_hint(hint_now, reason="followup")
+        )
         state["skill_graph"] = skill_graph.update_skill(
             graph,
             topic_tag=skill_tag or state.get("current_qa_id") or "",

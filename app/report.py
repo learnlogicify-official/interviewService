@@ -87,6 +87,13 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
         hint_meta = dict(hint_meta)
         hint_meta["independence_score"] = 0.0
         hint_meta["independence_band"] = "hint_dependent"
+    elif no_knowledge >= 2:
+        # Partial IDK sessions: keep conceptual from scored turns, but independence cannot look "high".
+        independence = min(independence, max(20.0, 65.0 - no_knowledge * 10.0))
+        hint_meta = dict(hint_meta)
+        hint_meta["independence_score"] = round(independence, 1)
+        if independence < 55:
+            hint_meta["independence_band"] = "hint_dependent" if independence < 40 else "mixed_independence"
 
     weights = {
         "conceptual": 0.18,
