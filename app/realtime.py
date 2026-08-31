@@ -33,11 +33,21 @@ def _resume_context(dossier: dict[str, Any] | None, *, resume_deep: bool = False
     if summary:
         bits.append(summary)
     projects = []
-    for p in (dossier.get("projects") or [])[:5]:
+    for p in (dossier.get("projects") or [])[:6]:
         if isinstance(p, dict) and p.get("name"):
-            projects.append(str(p.get("name"))[:60])
+            name = str(p.get("name"))[:60]
+            stack = ", ".join(str(x)[:30] for x in (p.get("stack") or [])[:4] if str(x).strip())
+            claim = " ".join(str(p.get("claim") or "").split())[:90]
+            bit = name
+            if stack:
+                bit += f" ({stack})"
+            if claim:
+                bit += f" — {claim}"
+            projects.append(bit[:140])
+        elif isinstance(p, str) and p.strip():
+            projects.append(p.strip()[:80])
     if projects:
-        bits.append("Projects: " + ", ".join(projects))
+        bits.append("Projects on their resume: " + "; ".join(projects))
     internships = []
     for p in (dossier.get("internships") or [])[:4]:
         if isinstance(p, dict) and (p.get("company") or p.get("role")):
@@ -45,26 +55,53 @@ def _resume_context(dossier: dict[str, Any] | None, *, resume_deep: bool = False
                 ((str(p.get("company") or "") + " " + str(p.get("role") or "")).strip())[:70]
             )
     if internships:
-        bits.append("Internships: " + ", ".join(internships))
+        bits.append("Internships / roles: " + ", ".join(internships))
+    certs = []
+    for c in (dossier.get("certifications") or [])[:5]:
+        if isinstance(c, dict) and (c.get("name") or c.get("title")):
+            certs.append(str(c.get("name") or c.get("title"))[:70])
+        elif isinstance(c, str) and c.strip():
+            certs.append(c.strip()[:70])
+    if certs:
+        bits.append("Certifications: " + ", ".join(certs))
     skills = []
-    for s in (dossier.get("skills") or [])[:8]:
-        name = str(s).strip()[:40]
+    for s in (dossier.get("skills") or [])[:10]:
+        if isinstance(s, dict) and s.get("name"):
+            name = str(s.get("name")).strip()[:40]
+        else:
+            name = str(s).strip()[:40]
         if name:
             skills.append(name)
     if skills:
-        bits.append("Skills: " + ", ".join(skills))
+        bits.append("Skills listed: " + ", ".join(skills))
+    plan_hints = []
+    for item in (dossier.get("question_plan") or [])[:4]:
+        if isinstance(item, dict) and item.get("anchor"):
+            plan_hints.append(str(item.get("anchor"))[:50])
+    if plan_hints:
+        bits.append("Priority anchors to probe: " + ", ".join(plan_hints))
     if not bits:
         return ""
-    facts = " ".join(bits)[:900]
+    facts = " ".join(bits)[:1200]
+    rules = (
+        "RESUME IS ALREADY UPLOADED — you have read it. Speak with certainty. "
+        "Name exact projects, certifications, employers, and skills from the facts below. "
+        "GOOD: 'You listed the Foo project with React — what did you personally own, and what broke in prod?' "
+        "GOOD: 'Your resume mentions the AWS Solutions Architect cert — which service did you actually use on a project?' "
+        "BAD: 'Let's assume you have a project…', 'Imagine you built…', 'Pick one project from your resume…', "
+        "'If your resume has X…'. Never pretend you have not seen the resume. "
+    )
     if resume_deep:
         return (
-            "CANDIDATE RESUME — spend several questions on these exact items "
-            "(their project, internship, or stack), asking what they built, owned, and what broke: "
+            "CANDIDATE RESUME (deep-dive) — every spoken question must name an item below "
+            "and probe ownership, architecture, failure modes, or metrics: "
+            + rules
             + facts
         )
     return (
-        "CANDIDATE FACTS — use only names they actually said. "
-        "Never invent a different product or domain (no loans, banking, or e-commerce unless they named it). "
+        "CANDIDATE RESUME FACTS — weave these into the agenda when relevant; "
+        "never invent a different product or domain: "
+        + rules
         + facts
     )
 
@@ -243,12 +280,15 @@ def interviewer_instructions(
         "SPEECH: talk like a sharp human on a video call. Contractions. "
         "Vary bridges (Got it / Okay / Makes sense / Alright). "
         "One short acknowledgement, then EXACTLY ONE question of 12–28 spoken words. "
-        "Ask as if you just thought of the scenario: 'Say you're…', 'Quick one —', 'Imagine…'. "
+        "Ask as if you just thought of the scenario: 'Quick one —', 'Say you…' for technical topics. "
+        "When probing THEIR resume, open with confidence: 'You mentioned…', 'On your resume you listed…', "
+        "'For the X project you wrote about…' — never 'assume', 'imagine you have', or 'if your resume has'. "
         "Anchor every question in a concrete situation, number, named alternative, or failure. "
         "Never ask 'tell me about X', 'how would you use X', 'explain the difference', "
         "or any textbook definition. "
-        "GOOD: 'Say you remove() from an ArrayList while you're looping it — what blows up, and how do you actually delete those rows?' "
-        "BAD: 'How would you use Java in a small project?' "
+        "GOOD (tech): 'Say you remove() from an ArrayList while you're looping it — what blows up, and how do you actually delete those rows?' "
+        "GOOD (resume): 'You listed the Inventory Sync project with Kafka — what failed first under load, and how did you fix it?' "
+        "BAD: 'How would you use Java in a small project?' / 'Let's assume you built a payment app…' "
         "When they finish speaking, reply immediately. If they interrupt, stop and listen. "
         "If a hidden coach note names a topic, use it on your NEXT turn in your own words. "
         "Do not lecture, stack questions, or say 'that's a great question' on repeat. "

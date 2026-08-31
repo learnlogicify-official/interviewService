@@ -1061,14 +1061,20 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
     state = _state(row)
     if row.stage == "qa" and _elapsed(row) >= _qa_budget_seconds(row, state):
         qa_secs = _qa_budget_seconds(row, state)
-        # If STT/scoring never delivered a student turn, do not block coding forever.
-        # Grace: 90s past the Q&A budget, then force the coding handoff.
-        if _awaiting_student_reply(db, row) and _elapsed(row) < qa_secs + 90:
-            if not state.get("coding_after_answer"):
-                state["coding_after_answer"] = True
-                _save_state(row, state)
-                db.commit()
-                db.refresh(row)
+        # Always finish the live spoken question first. Realtime may still be mid-ask
+        # even when the last logged turn is "student" (caption not flushed yet) — forcing
+        # coding here is what makes the IDE slam in while a Q&A question is being asked.
+        if not state.get("coding_after_answer"):
+            state["coding_after_answer"] = True
+            _save_state(row, state)
+            db.commit()
+            db.refresh(row)
+        # Wait for the next scoreable student answer (handle_message → _close_qa_then_code).
+        # Only force after a long grace if STT never arrives.
+        grace = 120
+        if _awaiting_student_reply(db, row):
+            grace = 180
+        if _elapsed(row) < qa_secs + grace:
             return session_view(db, row)
         spoken = _close_qa_then_code(db, row, state)
         state.pop("coding_handoff", None)
@@ -2135,13 +2141,13 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             if _resume_questions_allowed(row, state) and not _is_resume_track(row.role_track, state):
                 planned = _take_planned_resume_question(state)
                 if planned:
-                    cue = "Ask about their resume next, in your own words: " + planned
+                    cue = "Resume is uploaded — ask confidently naming the anchor (You mentioned…), never assume: " + planned
             elif _is_resume_track(row.role_track, state):
                 plan = list(state.get("resume_plan") or [])
                 idx = int(state.get("resume_plan_index") or 0)
                 planned = str(plan[idx].get("question") or "").strip() if 0 <= idx < len(plan) else ""
                 if planned:
-                    cue = "Ask about their resume next, in your own words: " + planned
+                    cue = "Resume is uploaded — ask confidently naming the anchor (You mentioned…), never assume: " + planned
             if cue:
                 state["realtime_cue"] = cue[:300]
         _save_state(row, state)

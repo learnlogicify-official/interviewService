@@ -516,6 +516,7 @@ def _compact_dossier(dossier: dict[str, Any] | None) -> dict[str, Any] | None:
             projects.append({
                 "name": str(p.get("name") or "")[:80],
                 "stack": [str(x)[:40] for x in (p.get("stack") or [])[:6]],
+                "claim": str(p.get("claim") or "")[:160],
             })
     internships = []
     for p in (dossier.get("internships") or [])[:6]:
@@ -523,7 +524,17 @@ def _compact_dossier(dossier: dict[str, Any] | None) -> dict[str, Any] | None:
             internships.append({
                 "company": str(p.get("company") or "")[:80],
                 "role": str(p.get("role") or "")[:80],
+                "claim": str(p.get("claim") or "")[:120],
             })
+    certifications = []
+    for c in (dossier.get("certifications") or [])[:6]:
+        if isinstance(c, dict) and (c.get("name") or c.get("title")):
+            certifications.append({
+                "name": str(c.get("name") or c.get("title") or "")[:80],
+                "issuer": str(c.get("issuer") or "")[:60],
+            })
+        elif isinstance(c, str) and c.strip():
+            certifications.append({"name": c.strip()[:80], "issuer": ""})
     skills = []
     for s in (dossier.get("skills") or [])[:12]:
         if isinstance(s, dict) and s.get("name"):
@@ -541,6 +552,7 @@ def _compact_dossier(dossier: dict[str, Any] | None) -> dict[str, Any] | None:
         "summary": str(dossier.get("summary") or "")[:280],
         "projects": projects,
         "internships": internships,
+        "certifications": certifications,
         "skills": skills,
         "question_plan": plan,
     }
@@ -628,13 +640,18 @@ Return JSON only with this shape:
   "summary": "one sentence about the candidate from the resume",
   "projects": [{"name": "", "stack": [""], "claim": "", "hard_questions": [""]}],
   "internships": [{"company": "", "role": "", "claim": "", "hard_questions": [""]}],
+  "certifications": [{"name": "", "issuer": ""}],
   "skills": [{"name": "", "evidence": "where it appears on the resume"}],
-  "question_plan": [{"anchor": "exact project/company/skill from resume", "question": "one spoken interview question"}]
+  "question_plan": [{"anchor": "exact project/company/skill/cert from resume", "question": "one spoken interview question"}]
 }
 Rules for question_plan:
 - 8 to 12 questions.
 - Every question MUST name an anchor that appears in the resume text.
+- Speak with certainty — the resume is already uploaded. Prefer
+  "You mentioned X…", "On your Y project…", "Your resume lists the Z certification…".
+- NEVER write "let's assume", "imagine you have", "if your resume has", or "pick one project from your resume".
 - Probe ownership, architecture, trade-offs, failure modes, metrics, and debugging.
+- Cover projects, certifications, and skill claims when present.
 - No generic DSA / hash-map / Big-O unless that topic is explicitly on the resume.
 """
 
@@ -717,7 +734,7 @@ def _repair_resume_question(question: str, anchor: str = "") -> str:
         name = anchor_title or _project_title_from_line(raw_name)
         if name.lower() in {"developed", "built", "your project"} or len(name.split()) == 1 and len(name) < 6:
             return (
-                "Pick one project from your resume. What did you personally own end to end, "
+                "You listed a hands-on project on your resume — what did you personally own end to end, "
                 "and what broke or nearly broke when real users or real data hit it?"
             )
         rest = rest[0].lower() + rest[1:] if rest else rest
@@ -734,8 +751,8 @@ def _repair_resume_question(question: str, anchor: str = "") -> str:
                 "the decision you made, and what nearly went wrong."
             )
         return (
-            "Pick one skill or project from your resume. Give a concrete situation where you used it, "
-            "the decision you made, and what nearly went wrong."
+            "Looking at the skills and projects on your resume, give one concrete situation where you "
+            "used a listed skill, the decision you made, and what nearly went wrong."
         )
 
     # "Staying on self-introduction: … used it" style mashups
@@ -744,6 +761,29 @@ def _repair_resume_question(question: str, anchor: str = "") -> str:
             "Introduce yourself briefly, then describe one specific situation from your resume: "
             "the decision you had to make, and what nearly went wrong."
         )
+
+    # Strip hedge / pretend-ignorance openers so the AI sounds like it read the CV.
+    q2 = re.sub(
+        r"(?i)^(let'?s\s+assume|assuming|imagine(?:\s+that)?|if\s+your\s+resume\s+has|"
+        r"suppose(?:\s+that)?|say\s+your\s+resume\s+has)\b[,:\s]*",
+        "",
+        q,
+    ).strip()
+    if q2 and q2 != q:
+        q = q2[0].upper() + q2[1:] if q2 else q
+        if anchor_title and not re.search(re.escape(anchor_title), q, re.I):
+            q = f"You mentioned {anchor_title} on your resume. {q}"
+    if re.search(r"(?i)\bpick one (project|skill|item) from your resume\b", q):
+        if anchor_title:
+            q = (
+                f"You listed {anchor_title} on your resume. What did you personally own end to end, "
+                "and what nearly broke under real users or real data?"
+            )
+        else:
+            q = (
+                "You listed a hands-on project on your resume — what did you personally own end to end, "
+                "and what nearly broke under real users or real data?"
+            )
     return q
 
 
@@ -762,6 +802,16 @@ def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
             name = re.sub(r"\s+", " ", part).strip(" .;")
             if 2 <= len(name) <= 40:
                 skills.append({"name": name, "evidence": "skills section"})
+    certifications: list[dict[str, Any]] = []
+    cert_blob = re.search(
+        r"(?is)(?:certifications?|certificates?|licenses?)[:\n](.+?)(?:\n\n|\n[A-Z][A-Za-z ]{3,}:|$)",
+        resume_text or "",
+    )
+    if cert_blob:
+        for part in re.split(r"[\n,|/]", cert_blob.group(1)):
+            name = re.sub(r"\s+", " ", part).strip(" .;-")
+            if 3 <= len(name) <= 80:
+                certifications.append({"name": name, "issuer": ""})
     for ln in lines:
         if re.search(
             r"(?i)\b(project|intern|developed|built|engineer|implemented|led|designed|application|platform)\b",
@@ -824,6 +874,7 @@ def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
         "summary": (lines[0][:180] if lines else "Resume on file."),
         "projects": projects,
         "internships": [],
+        "certifications": certifications,
         "skills": skills,
         "question_plan": cleaned_plan[:12],
         "source": "heuristic",
@@ -901,6 +952,11 @@ def analyze_resume(resume_text: str) -> dict[str, Any]:
         "summary": str(data.get("summary") or fallback.get("summary") or "")[:400],
         "projects": data.get("projects") if isinstance(data.get("projects"), list) else fallback["projects"],
         "internships": data.get("internships") if isinstance(data.get("internships"), list) else [],
+        "certifications": (
+            data.get("certifications")
+            if isinstance(data.get("certifications"), list)
+            else fallback.get("certifications") or []
+        ),
         "skills": data.get("skills") if isinstance(data.get("skills"), list) else fallback["skills"],
         "question_plan": data.get("question_plan") if isinstance(data.get("question_plan"), list) else [],
         "source": "llm",
@@ -1177,8 +1233,10 @@ def interviewer_turn(
         )
     if resume_only:
         extras.append(
-            "RESUME DEEP-DIVE MODE: You already analyzed the resume. Ask from resume_dossier / must_ask_next. "
-            "Name the project, company, or skill in the question. Do not ask generic DSA unless it is on the resume. "
+            "RESUME DEEP-DIVE MODE: You already analyzed the uploaded resume. Ask from resume_dossier / must_ask_next. "
+            "Name the exact project, company, certification, or skill. Speak with certainty "
+            "('You mentioned…', 'On your X project…'). Never say assume/imagine/if your resume has/pick one project. "
+            "Do not ask generic DSA unless it is on the resume. "
             "Do not use code-snippet predict-output formats."
         )
         summary = str((dossier or {}).get("summary") or "").strip()
@@ -1312,7 +1370,8 @@ def interviewer_turn(
         "stage_instructions": {
             "intro": "Greet in ONE short spoken sentence then ask the first conceptual question. next_action=next_topic",
             "qa": (
-                "RESUME MODE: next question must be grounded in resume_excerpt (a named project or skill). "
+                "RESUME MODE: next question must confidently name a project, certification, or skill from "
+                "resume_excerpt / resume_dossier ('You mentioned…'). Never assume or invent. "
                 "If candidate_answer_looks_weak OR candidate_answer_looks_incomplete, "
                 "or the answer is off-topic: followup — say so briefly and rephrase the SAME resume question. "
                 "Otherwise next_topic from another resume bullet. Do not move_to_coding."
@@ -1471,8 +1530,9 @@ def first_question(
         )
     if resume_only:
         system += (
-            " RESUME MODE: You already analyzed their resume. The first question MUST name "
-            "a project, internship, or skill from resume_dossier / must_ask_next."
+            " RESUME MODE: You already read their uploaded resume. The first question MUST confidently name "
+            "a project, internship, certification, or skill from resume_dossier / must_ask_next "
+            "('You mentioned…' / 'Your resume lists…'). Never assume or invent missing items."
         )
 
     if resume_only and must_ask_next and must_ask_next.get("question"):
