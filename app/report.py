@@ -44,16 +44,26 @@ def blend_explanation_score(state: dict[str, Any]) -> float:
         duplex_score.evidence_dimension_score(state, "explanation"),
     )
     idea_proxy = idea_approach_explain_proxy(state)
+    coding = float(state.get("score_coding", 0) or 0)
+    idea_peak = float(state.get("score_idea", 0) or 0)
     if explicit > 0 and idea_proxy > 0:
         return round(explicit * 0.55 + idea_proxy * 0.45, 1)
     if explicit > 0:
         return round(explicit, 1)
     if idea_proxy > 0:
-        return round(min(80.0, idea_proxy * 0.88), 1)
+        return round(min(85.0, idea_proxy * 0.88), 1)
+    # Passing tests + a credited approach implies they explained their logic.
+    if coding >= 55:
+        basis = max(idea_peak, idea_proxy)
+        inferred = round(min(90.0, coding * 0.62 + basis * 0.28 + 6.0), 1)
+        if inferred >= 50:
+            return inferred
     return 0.0
 
 
 def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str, Any]:
+    # Backfill harsh-zero evidence before recomputing dimension scores.
+    duplex_score.reconcile_evidence_scores(state)
     # Duplex-native: rebuild dimension scores from evidence before weighting.
     duplex_score.recompute_scores(state)
 

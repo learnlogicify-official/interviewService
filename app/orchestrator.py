@@ -520,6 +520,7 @@ def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
         "need_next_problem": bool(state.get("need_next_problem")),
         "used_moodle_problems": list(state.get("used_moodle_problems") or []),
         "problems_solved_count": int(state.get("problems_solved_count", 0) or 0),
+        "coding_wrap_silence": bool(state.get("coding_wrap_silence")),
     }
 
 
@@ -881,6 +882,35 @@ def _wants_no_more_clarify(text: str) -> bool:
     return False
 
 
+def _record_explanation_from_coding_success(
+    state: dict[str, Any],
+    row: SessionRow,
+    *,
+    passed: int,
+    total: int,
+) -> None:
+    """Credit explanation when tests pass — they demonstrated understanding in code."""
+    coding = float(state.get("score_coding", 0) or 0)
+    idea = float(state.get("score_idea", 0) or 0)
+    ratio = passed / max(1, total)
+    explain = round(min(92.0, coding * 0.56 + idea * 0.30 + ratio * 10.0 + 6.0), 1)
+    if explain < 50:
+        return
+    state["score_explain"] = max(float(state.get("score_explain", 0) or 0), explain)
+    evidence_ledger.record(
+        state,
+        stage="code",
+        dimension="explanation",
+        score=explain,
+        skill="coding.explanation",
+        question_id=str(state.get("moodle_problem_id") or state.get("current_problem_id") or "code"),
+        hint_level=0,
+        note=f"Solution validated ({passed}/{total} tests)",
+        source="nexpractice",
+        elapsed=_elapsed(row),
+    )
+
+
 def _begin_post_coding_clarify(
     db: Session,
     row: SessionRow,
@@ -894,10 +924,12 @@ def _begin_post_coding_clarify(
     state["coding_clarify_asks"] = 0
     state["coding_just_passed"] = True
     state["need_next_problem"] = False
+    state["coding_wrap_silence"] = True
     state["realtime_cue"] = (
         f"All {passed}/{total} tests passed. Congratulate in one short sentence, then ask whether "
         "they have any clarifying questions about the problem, their solution, or the interview. "
-        "Do not start a new coding problem. Do not invent a wrap-up yet."
+        "Do NOT ask new coding questions, probe their code, or discuss output format. "
+        "Stay silent if they have no questions. Do not invent a wrap-up yet."
     )[:300]
     row.stage = "wrap"
     state["awaiting"] = "clarify"
@@ -1036,6 +1068,7 @@ def log_assistant_turn(
     )
     if last and " ".join((last.content or "").split()).lower() == text.lower():
         return session_view(db, row)
+    state = _state(row)
     # After the coding cutover, ignore leftover Q&A captions so they cannot become
     # the latest turn and hide the coding_handoff from the room.
     if row.stage in {"idea", "code", "explain"} and _is_leftover_qa_caption(text):
@@ -1045,8 +1078,12 @@ def log_assistant_turn(
         use_stage = "qa"
     if row.stage in {"idea", "code", "explain"} and use_stage == "qa":
         return session_view(db, row)
+    if row.stage == "wrap" and state.get("awaiting_coding_clarify"):
+        if _CODING_SPEECH_RE.search(text) and not re.search(
+            r"(?i)\b(clarif|question|anything else|wrap|close)\b", text
+        ):
+            return session_view(db, row)
     _add_turn(db, row.id, use_stage, "assistant", text[:1200], {"realtime": True})
-    state = _state(row)
     state["voice_duplex"] = True
     # A new spoken question closes any sticky student chip buffer.
     duplex_score.clear_utterance_buffer(state)
@@ -2238,9 +2275,9 @@ def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> 
     _save_state(row, state)
     agenda_done = _qa_agenda_complete(state)
     lead = (
-        "Alright — let's park the spoken technical questions and switch to coding. "
+        "Alright — that wraps the spoken technical questions. "
         if agenda_done
-        else "Alright — wrapping that topic. Let's move into coding. "
+        else "Alright — good. "
     )
     return lead + coding
 
@@ -2343,12 +2380,47 @@ def _substantive_idea_answer(text: str) -> bool:
     return len(re.findall(r"[a-z0-9]+", (text or "").lower())) >= 10
 
 
-def _unlock_editor(row: SessionRow, state: dict[str, Any], note: str) -> str:
+def _unlock_editor(
+    row: SessionRow,
+    state: dict[str, Any],
+    note: str,
+    *,
+    answer: str = "",
+) -> str:
     row.stage = "code"
     state["awaiting"] = "code"
     state["editor_just_unlocked"] = True
     # Duplex otherwise strips this line — room.js must speak the unlock.
     state["editor_unlock_speak"] = True
+    peak = max(float(state.get("score_idea", 0) or 0), 55.0)
+    state["score_idea"] = peak
+    qid = str(state.get("current_problem_id") or state.get("moodle_problem_id") or "idea")
+    evidence_ledger.record(
+        state,
+        stage="idea",
+        dimension="problem_solving",
+        score=peak,
+        skill="coding.approach",
+        question_id=qid,
+        hint_level=0,
+        note=(answer or "Approach accepted — editor unlocked")[:160],
+        source="unlock",
+        elapsed=_elapsed(row),
+    )
+    explain = round(min(85.0, peak * 0.80 + 10.0), 1)
+    state["score_explain"] = max(float(state.get("score_explain", 0) or 0), explain)
+    evidence_ledger.record(
+        state,
+        stage="idea",
+        dimension="explanation",
+        score=explain,
+        skill="coding.explanation",
+        question_id=qid,
+        hint_level=0,
+        note="Pre-coding approach walkthrough",
+        source="unlock",
+        elapsed=_elapsed(row),
+    )
     _save_state(row, state)
     return note
 
@@ -2445,7 +2517,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             state,
             stage="idea",
             dimension="problem_solving",
-            score=float(llm_result["score"]),
+            score=score_now,
             skill="coding.approach",
             question_id=str(state.get("current_problem_id") or state.get("moodle_problem_id") or "idea"),
             hint_level=0 if unlock else idea_hint,
@@ -2453,6 +2525,21 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
             source="llm",
             elapsed=_elapsed(row),
         )
+        if unlock and _substantive_idea_answer(answer):
+            explain_seed = round(min(82.0, score_now * 0.78 + 12.0), 1)
+            state["score_explain"] = max(float(state.get("score_explain", 0) or 0), explain_seed)
+            evidence_ledger.record(
+                state,
+                stage="idea",
+                dimension="explanation",
+                score=explain_seed,
+                skill="coding.explanation",
+                question_id=str(state.get("current_problem_id") or state.get("moodle_problem_id") or "idea"),
+                hint_level=0,
+                note=(answer or "")[:160],
+                source="idea_narration",
+                elapsed=_elapsed(row),
+            )
         # Hard stops so the approach probe can never become an endless loop.
         if not unlock and attempts >= 3 and idea_secs >= 90:
             unlock = True
@@ -2464,6 +2551,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
                 "Your plan is good enough to start — the editor is unlocked. "
                 "Implement in the NexPractice IDE and run tests when ready. "
                 "I can see your editor and may ask about your logic — I will not give the solution.",
+                answer=answer,
             )
         _save_state(row, state)
         # Realtime owns the spoken probe during duplex; keep a short engine note for the report only
@@ -3124,17 +3212,18 @@ def handle_coding_result(
             source="nexpractice",
             elapsed=_elapsed(row),
         )
-        state["realtime_cue"] = (
-            f"All {passed}/{total} tests just passed. Congratulate briefly, then ask ONE short "
-            "question about a non-trivial line in their solution — or wrap up if time is low."
-        )
-        state["coding_just_passed"] = True
+        _record_explanation_from_coding_success(state, row, passed=passed, total=total)
         solved_n = int(state["problems_solved_count"])
         max_n = int(state.get("max_coding_problems", 2) or 2)
         # Enough time for another round? (~3+ minutes beyond wrap buffer)
         time_ok = _seconds_remaining(row) > (int(get_settings().wrap_seconds or 120) + 180)
         if solved_n < max_n and time_ok:
             state["need_next_problem"] = True
+            state["coding_just_passed"] = True
+            state["realtime_cue"] = (
+                f"All {passed}/{total} tests just passed. Congratulate briefly, then ask ONE short "
+                "question about a non-trivial line in their solution — or wrap up if time is low."
+            )
             _save_state(row, state)
             _add_turn(
                 db,

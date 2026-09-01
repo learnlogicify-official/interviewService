@@ -82,6 +82,8 @@ def heuristic_idea_score(text: str) -> float:
         "bfs", "dfs", "queue", "stack", "hash", "array", "graph", "dp",
         "dynamic", "complexity", "o(n)", "edge", "state", "energy",
         "shortest", "path", "loop", "sort", "pointer", "binary",
+        "even", "odd", "divide", "multiply", "step", "peak", "iterate",
+        "modulo", "remainder", "counter", "while", "until",
     ):
         if k in blob:
             hits += 1
@@ -102,6 +104,61 @@ def evidence_dimension_score(state: dict[str, Any], dimension: str) -> float:
     avg = sum(rows) / len(rows)
     # Prefer peak so one strong answer isn't drowned by early weak fragments.
     return round(best * 0.55 + avg * 0.45, 1)
+
+
+def reconcile_evidence_scores(state: dict[str, Any]) -> None:
+    """
+    Backfill harsh-zero idea rows and add explanation credit when coding proves
+    the candidate understood and implemented the problem.
+    """
+    from app import evidence as evidence_ledger
+
+    evidence = state.setdefault("evidence", [])
+    idea_peak = float(state.get("score_idea") or 0)
+    coding = float(state.get("score_coding") or 0)
+
+    for entry in evidence:
+        if str(entry.get("stage") or "") != "idea":
+            continue
+        if str(entry.get("dimension") or "") != "problem_solving":
+            continue
+        sc = float(entry.get("score") or 0)
+        note = str(entry.get("note") or "")
+        if sc > 0:
+            continue
+        if idea_peak < 40 and word_count(note) < 10:
+            continue
+        heuristic = heuristic_idea_score(note)
+        floor = heuristic
+        if idea_peak > 0:
+            floor = max(heuristic, idea_peak * 0.68)
+        entry["score"] = round(min(88.0, floor), 1)
+
+    has_explain = any(
+        float(e.get("score") or 0) > 0
+        for e in evidence
+        if str(e.get("dimension") or "") == "explanation"
+    )
+    if coding >= 55 and not has_explain:
+        idea_ev = evidence_dimension_score(state, "problem_solving")
+        basis = max(idea_ev, idea_peak)
+        explain_score = round(min(92.0, coding * 0.58 + basis * 0.30 + 8.0), 1)
+        if explain_score >= 45:
+            evidence_ledger.record(
+                state,
+                stage="code",
+                dimension="explanation",
+                score=explain_score,
+                skill="coding.explanation",
+                question_id=str(
+                    state.get("moodle_problem_id") or state.get("current_problem_id") or "code"
+                ),
+                hint_level=0,
+                note="Approach and implementation validated by passing tests",
+                source="reconcile",
+                elapsed=0,
+            )
+            state["score_explain"] = max(float(state.get("score_explain") or 0), explain_score)
 
 
 def recompute_scores(state: dict[str, Any]) -> dict[str, float]:
