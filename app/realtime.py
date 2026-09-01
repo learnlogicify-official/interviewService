@@ -142,6 +142,7 @@ def coding_round_instructions(
     stage: str = "idea",
     style: str = "friendly",
     problem_title: str = "",
+    problem_statement: str = "",
 ) -> str:
     first = (student_name or "there").split()[0]
     style_key = (style or "friendly").strip().lower()
@@ -166,6 +167,15 @@ def coding_round_instructions(
         "Never invent a different DSA problem. Do not ask about generic duplicates, "
         "hash maps, indexing, or DBMS unless that is exactly the on-screen problem. "
     )
+    brief = " ".join((problem_statement or "").split())[:2400]
+    brief_block = (
+        " INTERNAL PROBLEM BRIEF (for your understanding only — never read aloud, "
+        "never quote verbatim): "
+        + brief
+        + " Use this to judge their approach and ask relevant probes only."
+        if brief
+        else ""
+    )
     if stage in {"code", "explain"}:
         lock_bit = (
             " The editor is unlocked and they are implementing. Ask ONLY about the code "
@@ -183,7 +193,7 @@ def coding_round_instructions(
         f"Address them only as {first} — never invent another name. "
         f"Role track: {role_track}. Tone: {tone}. "
         "The conceptual / technical Q&A round is OVER. You are now in PROBLEM SOLVING."
-        f"{named}{stay}"
+        f"{named}{stay}{brief_block} "
         "Do NOT ask Java, DBMS, OS, SQL, or textbook CS questions. "
         "Do NOT read or recite the full problem statement. Never give solutions or write their code. "
         f"{lock_bit} "
@@ -221,6 +231,7 @@ def interviewer_instructions(
     resume_dossier: dict[str, Any] | None = None,
     resume_deep: bool = False,
     problem_title: str = "",
+    problem_statement: str = "",
 ) -> str:
     if (stage or "").strip().lower() in {"idea", "code", "explain"}:
         return coding_round_instructions(
@@ -229,6 +240,7 @@ def interviewer_instructions(
             stage=stage,
             style=style,
             problem_title=problem_title,
+            problem_statement=problem_statement,
         )
     first = (student_name or "there").split()[0]
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
@@ -364,6 +376,7 @@ def create_client_secret(
     resume_dossier: dict[str, Any] | None = None,
     resume_deep: bool = False,
     problem_title: str = "",
+    problem_statement: str = "",
 ) -> dict[str, Any]:
     """
     Mint an ephemeral Realtime client secret for browser WebRTC.
@@ -390,6 +403,7 @@ def create_client_secret(
         resume_dossier=resume_dossier,
         resume_deep=resume_deep,
         problem_title=problem_title,
+        problem_statement=problem_statement,
     )
     # Auto-reply is turned on by the browser after Realtime greets.
     # Mint with it off so the session does not speak before the data channel is ready.

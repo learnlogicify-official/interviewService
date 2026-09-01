@@ -105,6 +105,7 @@ def realtime_token(body: RealtimeTokenRequest, db: Session = Depends(get_db)) ->
         resume_dossier=_compact_dossier(dossier),
         resume_deep=bool(state.get("resume_only")),
         problem_title=str(state.get("moodle_problem_title") or "")[:120],
+        problem_statement=str(state.get("moodle_problem_statement") or "")[:2400],
     )
 
 
@@ -178,6 +179,7 @@ def start(body: StartSessionRequest, db: Session = Depends(get_db)) -> SessionSt
             resume_text=body.resume_text or "",
             moodle_problem_id=int(body.moodle_problem_id or 0),
             moodle_problem_title=str(getattr(body, "moodle_problem_title", "") or ""),
+            moodle_problem_statement=str(getattr(body, "moodle_problem_statement", "") or ""),
             interviewer_name=str(getattr(body, "interviewer_name", "") or "NexAI"),
             interviewer_style=str(getattr(body, "interviewer_style", "") or "friendly"),
             interviewer_briefing=str(getattr(body, "interviewer_briefing", "") or ""),
@@ -275,6 +277,7 @@ def assign_problem(body: AssignProblemRequest, db: Session = Depends(get_db)) ->
             row,
             problem_id=int(body.problem_id),
             problem_title=body.problem_title or "",
+            problem_statement=body.problem_statement or "",
         )
     )
 

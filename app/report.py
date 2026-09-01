@@ -58,7 +58,25 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
     duplex_score.recompute_scores(state)
 
     conceptual = float(state.get("score_conceptual", 0))
-    problem_solving = float(state.get("score_idea", 0))
+    idea_peak = float(state.get("score_idea", 0))
+    idea_evidence = idea_approach_explain_proxy(state)
+    if idea_evidence > 0:
+        problem_solving = idea_evidence
+    elif idea_peak > 0:
+        coding_score = float(state.get("score_coding", 0))
+        idea_rows = [
+            e for e in (state.get("evidence") or [])
+            if str(e.get("stage") or "") == "idea"
+            and str(e.get("dimension") or "") == "problem_solving"
+        ]
+        if idea_rows:
+            problem_solving = idea_peak
+        elif coding_score >= 55:
+            problem_solving = round(min(idea_peak, coding_score * 0.78 + 12.0), 1)
+        else:
+            problem_solving = round(min(idea_peak, 42.0), 1)
+    else:
+        problem_solving = 0.0
     coding = float(state.get("score_coding", 0))
     explanation = blend_explanation_score(state)
     communication = float(state.get("score_communication", 0))

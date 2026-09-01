@@ -479,6 +479,26 @@ def _should_wrap(row: SessionRow, state: dict[str, Any] | None = None) -> bool:
     return _seconds_remaining(row) <= wrap
 
 
+_LEFTOVER_QA_RE = re.compile(
+    r"(?i)\b(java|dbms|sql|loan|banking|validation|blank input|operating system|"
+    r"hash ?map|arraylist|normalization|acid|deadlock|semaphore|polymorphism|"
+    r"tcp/ip|innodb|self[- ]intro|programming fundamentals|duplicates?|"
+    r"multi[- ]?index|frequency count|primary key|foreign key|cascad|"
+    r"relational|transaction|joins?|indexing|b[- ]?tree)\b"
+)
+_CODING_SPEECH_RE = re.compile(
+    r"(?i)\b(approach|editor|complexit|edge case|nexpractice|implement|"
+    r"data structure|unlock|your code|this line|tests? passed|clarifying)\b"
+)
+
+
+def _is_leftover_qa_caption(text: str) -> bool:
+    blob = text or ""
+    if _CODING_SPEECH_RE.search(blob):
+        return False
+    return bool(_LEFTOVER_QA_RE.search(blob))
+
+
 def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
     # Show NexPractice once coding round begins so they can read the prompt.
     # Keep the editor locked until the approach is accepted (stage == code/explain).
@@ -495,6 +515,7 @@ def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
         "interrupt_active": row.stage == "explain",
         "moodle_problem_id": int(state.get("moodle_problem_id") or 0),
         "problem_title": state.get("moodle_problem_title") or "",
+        "problem_statement": (state.get("moodle_problem_statement") or "").strip()[:2800],
         "remount_ide": bool(state.get("_remount_ide")),
         "need_next_problem": bool(state.get("need_next_problem")),
         "used_moodle_problems": list(state.get("used_moodle_problems") or []),
@@ -508,6 +529,20 @@ def _current_problem(state: dict[str, Any]) -> dict[str, Any] | None:
         return None
     p = get_problem(pid)
     return public_problem(p) if p else None
+
+
+def _realtime_cue_for_view(row: SessionRow, state: dict[str, Any]) -> str:
+    """Suppress stale Q&A coach cues once coding has started."""
+    cue = str(state.get("realtime_cue") or "").strip()
+    if not cue:
+        return ""
+    if row.stage in {"idea", "code", "explain"}:
+        if _CODING_SPEECH_RE.search(cue):
+            return cue[:300]
+        return ""
+    if row.stage == "wrap" and state.get("awaiting_coding_clarify"):
+        return cue[:300]
+    return cue[:300]
 
 
 def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
@@ -554,7 +589,7 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
             if row.stage in {"idea", "code", "explain", "wrap"}
             else int(state.get("topic_cursor", 0) or 0)
         ),
-        "realtime_cue": str(state.get("realtime_cue") or "")[:300],
+        "realtime_cue": _realtime_cue_for_view(row, state),
         "awaiting_end_confirm": bool(state.get("awaiting_end_confirm")),
         "coding_just_passed": bool(state.get("coding_just_passed")),
         "awaiting_coding_clarify": bool(state.get("awaiting_coding_clarify")),
@@ -587,6 +622,7 @@ def start_session(
     resume_text: str = "",
     moodle_problem_id: int = 0,
     moodle_problem_title: str = "",
+    moodle_problem_statement: str = "",
     interviewer_name: str = "NexAI",
     interviewer_style: str = "friendly",
     interviewer_briefing: str = "",
@@ -666,6 +702,7 @@ def start_session(
     if not coding_on:
         moodle_problem_id = 0
         moodle_problem_title = ""
+        moodle_problem_statement = ""
     difficulty_ceiling = {"beginner": 1, "intermediate": 2, "advanced": 3}.get(difficulty, 2)
     max_followups = {"light": 1, "moderate": 2, "deep": 3}.get(followup_depth, 2)
     # Optional explicit Q&A minutes (custom interviewer). 0 = use default share.
@@ -695,6 +732,7 @@ def start_session(
         "resume_plan_index": 0,
         "moodle_problem_id": int(moodle_problem_id or 0),
         "moodle_problem_title": (moodle_problem_title or "").strip()[:180],
+        "moodle_problem_statement": (moodle_problem_statement or "").strip()[:2800],
         "skill_graph": skill_graph.default_graph(role_track),
         "claims": [],
         "voice_metrics": {},
@@ -1005,6 +1043,8 @@ def log_assistant_turn(
     use_stage = (stage or row.stage or "qa").strip() or "qa"
     if use_stage == "sample":
         use_stage = "qa"
+    if row.stage in {"idea", "code", "explain"} and use_stage == "qa":
+        return session_view(db, row)
     _add_turn(db, row.id, use_stage, "assistant", text[:1200], {"realtime": True})
     state = _state(row)
     state["voice_duplex"] = True
@@ -1027,25 +1067,6 @@ def mark_voice_duplex(db: Session, row: SessionRow) -> None:
     state["voice_duplex"] = True
     _save_state(row, state)
     db.commit()
-
-
-_LEFTOVER_QA_RE = re.compile(
-    r"(?i)\b(java|dbms|sql|loan|banking|validation|blank input|operating system|"
-    r"hash ?map|arraylist|normalization|acid|deadlock|semaphore|polymorphism|"
-    r"tcp/ip|innodb|self[- ]intro|programming fundamentals|duplicates?|"
-    r"multi[- ]?index|frequency count|primary key|foreign key|cascad)\b"
-)
-_CODING_SPEECH_RE = re.compile(
-    r"(?i)\b(approach|editor|complexit|edge case|nexpractice|implement|"
-    r"data structure|unlock|your code|this line)\b"
-)
-
-
-def _is_leftover_qa_caption(text: str) -> bool:
-    blob = text or ""
-    if _CODING_SPEECH_RE.search(blob):
-        return False
-    return bool(_LEFTOVER_QA_RE.search(blob))
 
 
 def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
@@ -2209,6 +2230,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
 def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
     """Close conceptual round, then open coding — or wrap when coding is disabled."""
     state["coding_after_answer"] = False
+    state.pop("realtime_cue", None)
     if not _include_coding(state):
         return _begin_wrap_no_coding(db, row, state)
     coding = _start_coding_round(db, row, state)
@@ -2390,6 +2412,7 @@ def _handle_idea(db: Session, row: SessionRow, state: dict[str, Any], answer: st
                 if problem
                 else {
                     "title": state.get("moodle_problem_title") or "",
+                    "prompt": (state.get("moodle_problem_statement") or "").strip()[:2400],
                     "moodle_problem_id": state.get("moodle_problem_id"),
                     "constraint": (
                         "Ask ONLY about this on-screen NexPractice problem. "
@@ -3172,6 +3195,7 @@ def assign_moodle_problem(
     *,
     problem_id: int,
     problem_title: str = "",
+    problem_statement: str = "",
 ) -> dict[str, Any]:
     """Attach the next NexPractice problem and reopen the approach gate."""
     if row.status != "active":
@@ -3193,6 +3217,8 @@ def assign_moodle_problem(
 
     state["moodle_problem_id"] = pid
     state["moodle_problem_title"] = title
+    state["moodle_problem_statement"] = (problem_statement or "").strip()[:2800]
+    state.pop("realtime_cue", None)
     state["need_next_problem"] = False
     state["_remount_ide"] = True
     state["idea_attempts"] = 0

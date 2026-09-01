@@ -454,6 +454,46 @@ def test_green_submit_offers_clarify_before_finish():
         db.close()
 
 
+def test_log_turn_blocks_leftover_qa_during_coding():
+    init_db()
+    db = SessionLocal()
+    try:
+        view = orch.start_session(
+            db,
+            moodle_user_id=1,
+            moodle_cm_id=10,
+            moodle_instance_id=5,
+            student_name="Test Student",
+            role_track="sde_intern",
+            duration_minutes=30,
+            topics=["arrays"],
+            moodle_problem_id=99,
+            moodle_problem_title="Sampling and Grouping",
+            moodle_problem_statement="Count pairs from frequencies.",
+        )
+        sid = view["session_id"]
+        row = orch.get_session(db, sid)
+        row.stage = "idea"
+        state = orch._state(row)
+        state["voice_duplex"] = True
+        orch._save_state(row, state)
+        db.commit()
+
+        before = len(view["turns"])
+        orch.log_assistant_turn(
+            db,
+            row,
+            "In DBMS, what is normalization and when would you use third normal form?",
+            stage="qa",
+        )
+        db.refresh(row)
+        after = orch.session_view(db, row)
+        assert len(after["turns"]) == before
+        assert after["qa_topic"] == ""
+    finally:
+        db.close()
+
+
 def test_sign():
     ts = int(time.time())
     sig = sign_payload(["start", 1, 2, 3, "sde_intern", 30, ts], secret="test-secret")

@@ -18,6 +18,7 @@ class StartSessionRequest(BaseModel):
     resume_text: str = ""
     moodle_problem_id: int = 0
     moodle_problem_title: str = ""
+    moodle_problem_statement: str = ""
     interviewer_name: str = "NexAI"
     interviewer_style: str = "friendly"
     interviewer_briefing: str = ""
@@ -160,6 +161,7 @@ class AssignProblemRequest(BaseModel):
     session_id: str
     problem_id: int
     problem_title: str = ""
+    problem_statement: str = ""
     timestamp: int
     signature: str
 

@@ -96,6 +96,18 @@ def test_coding_stage_instructions_stop_qa():
     assert "ArrayList" not in text
 
 
+def test_coding_stage_includes_internal_problem_brief():
+    from app.realtime import coding_round_instructions
+
+    text = coding_round_instructions(
+        problem_title="Sampling and Grouping",
+        problem_statement="Given counts of each value, return how many pairs you can form.",
+    )
+    assert "INTERNAL PROBLEM BRIEF" in text
+    assert "how many pairs" in text
+    assert "never read aloud" in text.lower()
+
+
 def test_idk_preface_does_not_zero_real_answer():
     from app.llm import is_no_knowledge_answer
 
