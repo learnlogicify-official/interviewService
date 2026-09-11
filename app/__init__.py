@@ -1,3 +1,3 @@
 """Nex Academy AI technical interview service."""
 
-__version__ = "0.6.51"
+__version__ = "0.6.52"

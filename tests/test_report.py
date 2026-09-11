@@ -53,6 +53,48 @@ def test_coding_success_yields_explanation():
     assert any(s > 0 for s in idea_scores)
 
 
+def test_idk_session_does_not_inflate_conceptual():
+    from app.report import build_report
+    from app import duplex_score
+
+    state = {
+        "include_coding": False,
+        "intro_done": True,
+        "score_conceptual": 70,  # leftover soft floor must not win
+        "score_communication": 63,
+        "qa_scores": [0.0],
+        "no_knowledge_count": 1,
+        "evidence": [
+            {
+                "stage": "qa",
+                "dimension": "conceptual",
+                "score": 0,
+                "hint_level": 2,
+                "source": "no_knowledge",
+                "note": "I don't know.",
+            }
+        ],
+        "skill_graph": {"_touched": []},
+    }
+    duplex_score.recompute_scores(state)
+    assert state["score_conceptual"] <= 15
+    assert state["score_communication"] <= 40
+    report = build_report(
+        state,
+        [
+            {"role": "assistant", "stage": "qa", "content": "Introduce yourself."},
+            {"role": "student", "stage": "qa", "content": "I am Sachin, B.Tech IT."},
+            {"role": "assistant", "stage": "qa", "content": "What did you build?"},
+            {"role": "student", "stage": "qa", "content": "I don't know."},
+        ],
+    )
+    assert report["dimensions"]["conceptual"] <= 15
+    assert report["overall_score"] < 40
+    assert report["substantive_answers"] is False
+    strengths = " ".join(report.get("strengths") or []).lower()
+    assert "conceptual knowledge (70)" not in strengths
+
+
 def test_explicit_explain_only():
     state = {"score_explain": 72, "evidence": []}
     assert blend_explanation_score(state) == 72.0

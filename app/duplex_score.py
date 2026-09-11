@@ -165,8 +165,8 @@ def recompute_scores(state: dict[str, Any]) -> dict[str, float]:
     """
     Rebuild canonical score_* floats from the evidence ledger.
 
-    Peak state floats remain as floors (e.g. coding pass wrote 85) so we never
-    discard a hard credit that evidence somehow missed.
+    Peak state floats remain as floors for coding (hard credits). Conceptual
+    must follow the Q&A average — never keep a soft intro floor above IDK zeros.
     """
     conceptual_ev = evidence_dimension_score(state, "conceptual")
     idea_ev = evidence_dimension_score(state, "problem_solving")
@@ -175,31 +175,46 @@ def recompute_scores(state: dict[str, Any]) -> dict[str, float]:
 
     qa_scores = [float(x) for x in (state.get("qa_scores") or []) if x is not None]
     qa_mean = (sum(qa_scores) / len(qa_scores)) if qa_scores else 0.0
+    no_k = int(state.get("no_knowledge_count", 0) or 0)
 
-    conceptual = max(float(state.get("score_conceptual") or 0), conceptual_ev, qa_mean)
+    if qa_scores:
+        # Honest mean of scored technical turns (intro is not included in qa_scores).
+        conceptual = qa_mean
+    else:
+        conceptual = max(float(state.get("score_conceptual") or 0), conceptual_ev)
+
+    # IDK-only / empty technical rounds must not look like a pass.
+    if qa_scores and max(qa_scores) < 25 and no_k >= 1:
+        conceptual = min(conceptual, qa_mean, 15.0)
+    if not qa_scores and no_k >= 1:
+        conceptual = min(conceptual, 10.0)
+
     idea = max(float(state.get("score_idea") or 0), idea_ev)
     coding = max(float(state.get("score_coding") or 0), coding_ev)
     explain = max(float(state.get("score_explain") or 0), explain_ev)
 
-    # Communication: blend voice metrics with answer length evidence.
+    # Communication: blend voice metrics with answer substance — never invent polish
+    # from a leftover conceptual floor when the candidate mostly said "I don't know".
     comm = float(state.get("score_communication") or 0)
-    if conceptual > 0 or idea > 0 or coding > 0:
-        # Floor communication from substance — duplex fragments used to leave this at 0.
+    if no_k >= 1 and (not qa_scores or max(qa_scores) < 40):
+        comm = min(comm, 40.0)
+    elif conceptual >= 40 or idea > 0 or coding > 0:
         substantive_words = sum(
             word_count(str(e.get("note") or ""))
             for e in (state.get("evidence") or [])
             if e.get("dimension") in {"conceptual", "problem_solving", "explanation"}
+            and float(e.get("score") or 0) >= 20
         )
         comm_floor = min(75.0, 30.0 + substantive_words * 0.35)
         comm = max(comm, comm_floor * 0.5 + max(conceptual, idea) * 0.25)
 
     independence = evidence_ledger.independence_score(state)
 
-    state["score_conceptual"] = round(conceptual, 1)
+    state["score_conceptual"] = round(max(0.0, min(100.0, conceptual)), 1)
     state["score_idea"] = round(idea, 1)
     state["score_coding"] = round(coding, 1)
     state["score_explain"] = round(explain, 1)
-    state["score_communication"] = round(min(100.0, comm), 1)
+    state["score_communication"] = round(min(100.0, max(0.0, comm)), 1)
 
     return {
         "conceptual": state["score_conceptual"],

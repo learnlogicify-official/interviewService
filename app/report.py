@@ -97,24 +97,42 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
 
     evidence_n = len(state.get("evidence") or [])
     student_n = sum(1 for t in turns if t.get("role") == "student")
+    no_knowledge = int(state.get("no_knowledge_count", 0) or 0)
+    qa_scores_list = [float(x) for x in (state.get("qa_scores") or []) if x is not None]
+    qa_n = len(qa_scores_list)
+    has_solid_turn = any(s >= 40 for s in qa_scores_list)
     answered = (
-        bool(state.get("qa_scores"))
+        bool(qa_scores_list)
         or int(state.get("problems_solved_count", 0) or 0) > 0
         or evidence_n > 0
         or student_n >= 3
+        or bool(state.get("intro_done"))
     )
-    no_knowledge = int(state.get("no_knowledge_count", 0) or 0)
-    qa_n = len(state.get("qa_scores") or [])
-    substantive = answered and not (qa_n > 0 and no_knowledge >= max(1, int(qa_n * 0.7)))
+    # Intro-only or IDK-only sessions are not "substantive" technical interviews.
+    substantive = bool(
+        answered
+        and has_solid_turn
+        and not (qa_n > 0 and no_knowledge >= max(1, int(qa_n * 0.7)))
+    )
 
-    # Don't-know-heavy sessions must read as zeros, not soft partial credit.
-    if not substantive and no_knowledge >= max(2, qa_n):
-        conceptual = 0.0 if no_knowledge >= qa_n and qa_n > 0 else min(conceptual, 5.0)
-        communication = 0.0 if no_knowledge >= qa_n and qa_n > 0 else min(communication, 5.0)
-        independence = 0.0
-        hint_meta = dict(hint_meta)
-        hint_meta["independence_score"] = 0.0
-        hint_meta["independence_band"] = "hint_dependent"
+    # Don't-know / empty technical sessions must read as weak, not a soft pass.
+    if not substantive:
+        if no_knowledge >= 1 or (qa_n > 0 and max(qa_scores_list) < 25):
+            conceptual = min(conceptual, max(qa_scores_list) if qa_scores_list else 0.0, 15.0)
+            communication = min(communication, 40.0)
+        if no_knowledge >= max(1, qa_n) and qa_n > 0 and not has_solid_turn:
+            conceptual = min(conceptual, 10.0)
+            communication = min(communication, 35.0)
+            independence = 0.0
+            hint_meta = dict(hint_meta)
+            hint_meta["independence_score"] = 0.0
+            hint_meta["independence_band"] = "hint_dependent"
+        elif no_knowledge >= 2:
+            independence = min(independence, max(20.0, 65.0 - no_knowledge * 10.0))
+            hint_meta = dict(hint_meta)
+            hint_meta["independence_score"] = round(independence, 1)
+            if independence < 55:
+                hint_meta["independence_band"] = "hint_dependent" if independence < 40 else "mixed_independence"
     elif no_knowledge >= 2:
         # Partial IDK sessions: keep conceptual from scored turns, but independence cannot look "high".
         independence = min(independence, max(20.0, 65.0 - no_knowledge * 10.0))

@@ -2037,6 +2037,25 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             _save_state(row, state)
             return _close_qa_then_code(db, row, state)
 
+        if state.get("voice_duplex"):
+            state["realtime_cue"] = (
+                "KEEP GOING. They said they don't know — brief ack, then ask ONE new concrete "
+                "question on the next AGENDA item. Do NOT thank them, wrap up, or say the "
+                "report is ready. Do NOT re-introduce yourself."
+            )[:300]
+            # Still advance topic / scores above; duplex invents the spoken ask.
+            focus = _advance_focus_topic(state)
+            if focus:
+                state["current_qa_id"] = str(focus)[:80]
+            if (
+                not _include_coding(state)
+                and _qa_agenda_complete(state)
+                and _time_left_for_spoken_qa(row, state)
+            ):
+                return _continue_spoken_qa(db, row, state, reason="idk_continue")
+            _save_state(row, state)
+            return ""
+
         # Topic-locked custom interviews never fall back to the DSA bank — that is
         # how sessions drifted into Big-O / hash-map stems that were never configured.
         nxt = None if _topic_locked(row, state) else question_graph.pick_next(
@@ -2105,20 +2124,24 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     # Opening beat: self-intro first, then AGENDA item 1 (never vague "agenda today").
     if state.get("awaiting_self_intro"):
         state["awaiting_self_intro"] = False
+        state["intro_done"] = True
         state["followup_index"] = 0
         state["current_hint_level"] = 0
         focus = _focus_topic(state)
         if focus:
             state["current_qa_id"] = str(focus)[:80]
-        state.setdefault("qa_scores", []).append(70.0)
-        state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
-        _apply_score_communication(state, answer, 70.0)
+        # Bio lines are not technical credit — do not inflate conceptual / qa_scores.
+        words = len(re.findall(r"[A-Za-z0-9_]+", answer or ""))
+        comm_nudge = 35.0 if words >= 8 else 20.0
+        prev_comm = float(state.get("score_communication") or 0)
+        state["score_communication"] = round(max(prev_comm, comm_nudge), 1)
         state["qa_index"] = idx + 1
         if state.get("voice_duplex"):
             state["realtime_cue"] = (
-                "MOVE ON. Self-intro is done. Ask ONE concrete technical question on AGENDA item 1 "
+                "KEEP GOING. Self-intro is done. Do NOT greet again and do NOT say "
+                "'I am NexAI' again. Ask ONE concrete technical question on AGENDA item 1 "
                 f"('{focus or 'the first listed topic'}'). "
-                "Do not ask another introduction, goals, or 'agenda today' question."
+                "Do not ask another introduction, resume deep-dive, or agenda/goals question."
             )[:300]
             _save_state(row, state)
             return ""
