@@ -162,16 +162,19 @@ def _compose_profile_rules(
         pace_rules.get(pace, pace_rules["standard"]),
         mix_rules.get(question_mix, mix_rules["conceptual"]),
         depth_rules.get(followup_depth, depth_rules["moderate"]),
-        "Coding editor: " + ("ENABLED later in the session." if include_coding else "DISABLED — spoken Q&A only."),
+        "Coding editor: " + ("ENABLED later in the session." if include_coding else "DISABLED — spoken Technical Q&A only; never mention coding."),
     ]
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
     if topic_list:
         numbered = " → ".join(f"{i}. {t}" for i, t in enumerate(topic_list, 1))
         parts.append("AGENDA (cover in this exact order): " + numbered + ".")
+        close = "before coding" if include_coding else "before wrapping (no coding round)"
         parts.append(
-            "Coverage rule: the FIRST spoken question after the greeting MUST be item 1. "
-            "Do not skip ahead. Work through each listed area before coding. "
-            "Ask at least one concrete question in each item when time allows."
+            "Coverage rule: FIRST spoken ask after the greeting MUST be a brief self-introduction. "
+            "Never ask vague openers like 'what's your agenda today'. "
+            f"Then work through each listed area {close}, starting with item 1. "
+            "After a solid/strong answer on a competency, move on — do not keep probing the same topic. "
+            "Respect Follow-up depth above."
         )
     if avoid_topics:
         parts.append("Do NOT ask about: " + avoid_topics.strip()[:400] + ".")
@@ -502,8 +505,11 @@ def _is_leftover_qa_caption(text: str) -> bool:
 def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
     # Show NexPractice once coding round begins so they can read the prompt.
     # Keep the editor locked until the approach is accepted (stage == code/explain).
-    show_editor = row.stage in {"idea", "code", "explain", "wrap"} and (
-        bool(state.get("moodle_problem_id")) or bool(state.get("current_problem_id"))
+    coding_on = _include_coding(state)
+    show_editor = (
+        coding_on
+        and row.stage in {"idea", "code", "explain", "wrap"}
+        and (bool(state.get("moodle_problem_id")) or bool(state.get("current_problem_id")))
     )
     editor_locked = show_editor and row.stage == "idea"
     return {
@@ -511,16 +517,19 @@ def _ui_for(row: SessionRow, state: dict[str, Any]) -> dict[str, Any]:
         "editor_locked": editor_locked,
         "awaiting": state.get("awaiting", "message"),
         "can_run": show_editor and row.stage in {"code", "explain"},
-        "can_submit_idea": row.stage == "idea",
-        "interrupt_active": row.stage == "explain",
-        "moodle_problem_id": int(state.get("moodle_problem_id") or 0),
-        "problem_title": state.get("moodle_problem_title") or "",
-        "problem_statement": (state.get("moodle_problem_statement") or "").strip()[:2800],
-        "remount_ide": bool(state.get("_remount_ide")),
-        "need_next_problem": bool(state.get("need_next_problem")),
-        "used_moodle_problems": list(state.get("used_moodle_problems") or []),
-        "problems_solved_count": int(state.get("problems_solved_count", 0) or 0),
-        "coding_wrap_silence": bool(state.get("coding_wrap_silence")),
+        "can_submit_idea": coding_on and row.stage == "idea",
+        "interrupt_active": coding_on and row.stage == "explain",
+        "moodle_problem_id": int(state.get("moodle_problem_id") or 0) if coding_on else 0,
+        "problem_title": (state.get("moodle_problem_title") or "") if coding_on else "",
+        "problem_statement": (
+            (state.get("moodle_problem_statement") or "").strip()[:2800] if coding_on else ""
+        ),
+        "remount_ide": bool(state.get("_remount_ide")) if coding_on else False,
+        "need_next_problem": bool(state.get("need_next_problem")) if coding_on else False,
+        "used_moodle_problems": list(state.get("used_moodle_problems") or []) if coding_on else [],
+        "problems_solved_count": int(state.get("problems_solved_count", 0) or 0) if coding_on else 0,
+        "coding_wrap_silence": bool(state.get("coding_wrap_silence")) if coding_on else False,
+        "include_coding": coding_on,
     }
 
 
@@ -590,6 +599,7 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
             if row.stage in {"idea", "code", "explain", "wrap"}
             else int(state.get("topic_cursor", 0) or 0)
         ),
+        "include_coding": _include_coding(state),
         "realtime_cue": _realtime_cue_for_view(row, state),
         "awaiting_end_confirm": bool(state.get("awaiting_end_confirm")),
         "coding_just_passed": bool(state.get("coding_just_passed")),
@@ -746,6 +756,7 @@ def start_session(
         "difficulty_ceiling": difficulty_ceiling,
         "followup_index": 0,
         "max_followups_per_question": max_followups,
+        "awaiting_self_intro": not resume_only,
         "used_moodle_problems": [int(moodle_problem_id)] if int(moodle_problem_id or 0) else [],
         "moodle_problem_titles": [((moodle_problem_title or "").strip()[:180])] if (moodle_problem_title or "").strip() else [],
         "problems_solved_count": 0,
@@ -791,7 +802,13 @@ def start_session(
 
     # Varied intro + first conceptual question. No "say yes" gate.
     first = student_name.split()[0] if student_name else "there"
-    if coding_on:
+    if resume_only:
+        greetings = [
+            f"Hi {first}, I'm {name}. This is a resume deep-dive — no coding editor. I'll grill the work you listed.",
+            f"Hey {first}. {name} here. We'll stay on your resume: projects, internships, and the stack you claim.",
+            f"Welcome {first}. I'm {name}. Spoken interview only — every question comes from your resume.",
+        ]
+    elif coding_on:
         greetings = [
             f"Hi {first}, I'm {name}. We'll do a short technical round, then one coding problem.",
             f"Hey {first}. {name} here — conceptual questions first, then you'll code.",
@@ -801,9 +818,9 @@ def start_session(
         ]
     else:
         greetings = [
-            f"Hi {first}, I'm {name}. This is a resume deep-dive — no coding editor. I'll grill the work you listed.",
-            f"Hey {first}. {name} here. We'll stay on your resume: projects, internships, and the stack you claim.",
-            f"Welcome {first}. I'm {name}. Spoken interview only — every question comes from your resume.",
+            f"Hi {first}, I'm {name}. This is a spoken Technical Q&A interview — no live coding.",
+            f"Hey {first}. {name} here — we'll stay on technical questions only, no coding editor.",
+            f"Welcome {first}. I'm {name}. Spoken technical interview today; no coding round.",
         ]
     greet = greetings[int(uuid.uuid4().int % len(greetings))]
     try:
@@ -2029,6 +2046,30 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         _save_state(row, state)
         return reply
 
+    # Opening beat: self-intro first, then AGENDA item 1 (never vague "agenda today").
+    if state.get("awaiting_self_intro"):
+        state["awaiting_self_intro"] = False
+        state["followup_index"] = 0
+        state["current_hint_level"] = 0
+        focus = _focus_topic(state)
+        if focus:
+            state["current_qa_id"] = str(focus)[:80]
+        state.setdefault("qa_scores", []).append(70.0)
+        state["score_conceptual"] = sum(state["qa_scores"]) / len(state["qa_scores"])
+        _apply_score_communication(state, answer, 70.0)
+        state["qa_index"] = idx + 1
+        if state.get("voice_duplex"):
+            state["realtime_cue"] = (
+                "MOVE ON. Self-intro is done. Ask ONE concrete technical question on AGENDA item 1 "
+                f"('{focus or 'the first listed topic'}'). "
+                "Do not ask another introduction, goals, or 'agenda today' question."
+            )[:300]
+            _save_state(row, state)
+            return ""
+        spoken = _offline_topic_question(state, None)
+        _save_state(row, state)
+        return f"Thanks — let's get into the technical round. {spoken}".strip()
+
     # Time to close Q&A: do not ask another conceptual question, and skip the LLM for speed.
     if _elapsed(row) >= _qa_budget_seconds(row, state) or state.get("coding_after_answer"):
         state["qa_index"] = idx + 1
@@ -2058,6 +2099,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
         current_topic=str(state.get("current_qa_id") or _focus_topic(state) or ""),
         include_coding=_include_coding(state),
         probes_on_topic=int(state.get("followup_index", 0) or 0),
+        max_probes=int(state.get("max_followups_per_question", 2) or 2),
     )
 
     if llm_result:
@@ -2067,17 +2109,23 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             model_score = min(model_score, 45.0)
         score = llm_client.clamp_answer_score(answer, model_score)
         action = llm_result["next_action"]
-        if llm_result.get("depth") in {"superficial", "partial"} and action == "next_topic":
-            max_fu = int(state.get("max_followups_per_question", 2) or 2)
-            if int(state.get("followup_index", 0) or 0) < max_fu:
+        depth = str(llm_result.get("depth") or "partial").strip().lower()
+        max_fu = int(state.get("max_followups_per_question", 2) or 2)
+        fu_count = int(state.get("followup_index", 0) or 0)
+
+        # Hard pacing: solid/strong (or probe budget used) → leave this competency.
+        if depth in {"solid", "strong"} or score >= 72 or fu_count >= max_fu:
+            if action == "followup":
+                action = "next_topic"
+                llm_result["next_action"] = "next_topic"
+        elif depth in {"superficial", "partial"} and action == "next_topic":
+            if fu_count < max_fu:
                 action = "followup"
                 llm_result["next_action"] = "followup"
         reported_hint = int(llm_result.get("hint_level", hint_now) or hint_now)
 
         # Off-topic / very weak: never advance — force a rephrase follow-up
         # (unless follow-up depth budget is exhausted → move on).
-        max_fu = int(state.get("max_followups_per_question", 2) or 2)
-        fu_count = int(state.get("followup_index", 0) or 0)
         if action != "followup" and (
             score < 40
             or llm_client.looks_incomplete_answer(answer)
@@ -2090,10 +2138,9 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                 llm_result["next_action"] = "next_topic"
                 state["force_fresh_question"] = True
 
-        # Never advance on weak LLM scores that re-ask.
-        if action == "followup" and score < 55:
+        # Follow-up path: score lightly, bump probe count, steer Realtime — do not stay forever.
+        if action == "followup":
             if fu_count >= max_fu:
-                # Depth budget used — accept score and move topic instead of looping.
                 action = "next_topic"
                 llm_result["next_action"] = "next_topic"
                 state["force_fresh_question"] = True
@@ -2125,7 +2172,16 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                 )
                 if llm_result.get("topic_tag"):
                     state["current_qa_id"] = str(llm_result["topic_tag"])[:80]
-                # Realtime invents the spoken follow-up — never store coach cues or bank stems.
+                left = max(0, max_fu - int(state["followup_index"]))
+                focus = _focus_topic(state) or str(state.get("current_qa_id") or "")
+                if state.get("voice_duplex"):
+                    cue = str(llm_result.get("cue") or "").strip()
+                    if not cue:
+                        cue = (
+                            f"One deeper probe on '{focus}' "
+                            f"({left} probe(s) left), then MOVE ON if solid."
+                        )
+                    state["realtime_cue"] = cue[:300]
                 _save_state(row, state)
                 return ""
 
@@ -2194,7 +2250,10 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             if tag.lower() not in _GENERIC_SKILL_TAGS:
                 state["current_qa_id"] = tag
         if action == "next_topic":
-            _note_topic_turn(state)
+            # Advance the agenda immediately so Realtime cannot re-drill a strong topic.
+            focus = _advance_focus_topic(state)
+            if focus:
+                state["current_qa_id"] = focus[:80]
             cue = str(llm_result.get("cue") or "").strip()
             # Realtime invents the spoken question, so a resume item only gets asked if it
             # rides along as a cue. Without this the uploaded CV is never touched in duplex.
@@ -2204,12 +2263,19 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                     cue = "Resume is uploaded — ask confidently naming the anchor (You mentioned…), never assume: " + planned
             elif _is_resume_track(row.role_track, state):
                 plan = list(state.get("resume_plan") or [])
-                idx = int(state.get("resume_plan_index") or 0)
-                planned = str(plan[idx].get("question") or "").strip() if 0 <= idx < len(plan) else ""
+                ridx = int(state.get("resume_plan_index") or 0)
+                planned = str(plan[ridx].get("question") or "").strip() if 0 <= ridx < len(plan) else ""
                 if planned:
                     cue = "Resume is uploaded — ask confidently naming the anchor (You mentioned…), never assume: " + planned
-            if cue:
-                state["realtime_cue"] = cue[:300]
+            if not cue:
+                cue = (
+                    f"MOVE ON. Ask ONE new concrete question on AGENDA item "
+                    f"'{focus or 'the next listed topic'}'. "
+                    "Do not re-ask the previous competency."
+                )
+            elif "MOVE ON" not in cue.upper():
+                cue = f"MOVE ON to '{focus or 'next topic'}'. " + cue
+            state["realtime_cue"] = cue[:300]
         _save_state(row, state)
         return ""
 

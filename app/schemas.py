@@ -93,6 +93,7 @@ class SessionStateOut(BaseModel):
     skill_graph: dict[str, Any] = Field(default_factory=dict)
     qa_topic: str = ""
     realtime_cue: str = ""
+    include_coding: bool = True
     awaiting_end_confirm: bool = False
     coding_just_passed: bool = False
     explain_excerpt: str = ""

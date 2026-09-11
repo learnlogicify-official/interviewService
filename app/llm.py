@@ -1013,6 +1013,7 @@ Rules:
   * Never repeat or thinly reword anything in already_asked_questions.
   * If you cannot form a specific probe, return probe="" and next_action_hint="next_topic".
 - After two probes on the same idea, prefer next_action_hint=next_topic instead of drilling further.
+- If probes_already_on_this_idea >= max_probes_allowed, you MUST set next_action_hint=next_topic.
 """
 
 
@@ -1094,10 +1095,12 @@ Return JSON only:
 {"score":0-100,"next_action":"followup|next_topic|move_to_coding","topic_tag":"short topic","depth":"superficial|partial|solid|strong","cue":"hidden coach: stay on X or switch to Y"}
 Rules:
 - score honestly; thin or off-topic answers ≤40.
-- followup if they were shallow and the same topic still has room.
-- next_topic if the answer was solid or two probes already happened.
+- followup ONLY if shallow/partial AND probes_already_on_this_idea < max_probes_allowed.
+- next_topic if depth is solid/strong, OR probes_already_on_this_idea >= max_probes_allowed, OR they clearly mastered this competency.
+- Never keep followup on a strong answer just to dig more — leave that topic.
 - move_to_coding only when coding_enabled is true AND they are clearly ready to leave conceptual Q&A.
 - cue is a coach note for the voice model — never a question to read aloud, never a score.
+- When next_topic, cue should say MOVE ON and name the next faculty topic if known.
 - Stay on faculty_topics. English only. Max 24 words in cue.
 """
 
@@ -1114,11 +1117,14 @@ def score_turn(
     current_topic: str = "",
     include_coding: bool = True,
     probes_on_topic: int = 0,
+    max_probes: int = 2,
 ) -> dict[str, Any] | None:
     """One cheap JSON call: score + next_action + topic cue. Realtime speaks the question."""
     if not llm_configured():
         return None
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:8]
+    max_p = max(0, int(max_probes or 2))
+    probes = max(0, int(probes_on_topic or 0))
     raw = chat(
         [
             {"role": "system", "content": SCORER_SYSTEM},
@@ -1135,7 +1141,8 @@ def score_turn(
                         "last_interviewer_question": (last_question or "")[:280],
                         "candidate_just_said": (student_message or "")[:700],
                         "already_asked": [str(q)[:120] for q in (asked_questions or [])[-6:]],
-                        "probes_already_on_this_idea": int(probes_on_topic or 0),
+                        "probes_already_on_this_idea": probes,
+                        "max_probes_allowed": max_p,
                     }
                 ),
             },
@@ -1153,6 +1160,12 @@ def score_turn(
     depth = str(data.get("depth") or "partial").strip().lower()
     if depth not in {"superficial", "partial", "solid", "strong"}:
         depth = "partial"
+    if not include_coding and action == "move_to_coding":
+        action = "next_topic"
+    if depth in {"solid", "strong"} and action == "followup":
+        action = "next_topic"
+    if probes >= max_p and action == "followup":
+        action = "next_topic"
     try:
         score = float(data.get("score", 50))
     except Exception:
@@ -1160,7 +1173,12 @@ def score_turn(
     topic_tag = str(data.get("topic_tag") or current_topic or (topic_list[0] if topic_list else "")).strip()[:80]
     cue = " ".join(str(data.get("cue") or "").split())[:180]
     if not cue:
-        cue = f"Stay on: {topic_tag}." if topic_tag else "Probe one level deeper, then one short question."
+        if action == "next_topic":
+            cue = f"MOVE ON to the next AGENDA item after {topic_tag}." if topic_tag else "MOVE ON to the next AGENDA item."
+        else:
+            cue = f"Stay on: {topic_tag}." if topic_tag else "Probe one level deeper, then one short question."
+    elif action == "next_topic" and "MOVE ON" not in cue.upper():
+        cue = ("MOVE ON. " + cue)[:180]
     return {
         "reply": "",
         "cue": cue,
@@ -1502,7 +1520,7 @@ def first_question(
         else (
             "mention a short technical screen then one coding problem"
             if include_coding
-            else "mention this is a spoken technical screen without a coding editor"
+            else "mention this is spoken Technical Q&A only — no live coding and no editor"
         )
     )
     format_hint = {
@@ -1535,7 +1553,9 @@ def first_question(
         system += (
             "\n\nTOPIC LOCK (HARD CONSTRAINT): cover this AGENDA in order — "
             + numbered
-            + ". The opening question MUST be item 1"
+            + ". Opening spoken ask MUST be a brief self-introduction (who they are / what they study / one interest). "
+            "Never ask vague openers like agenda/goals for today. "
+            "The FIRST technical question after that MUST be item 1"
             + (f" ({focus_topic})" if focus_topic else "")
             + ". Do NOT skip ahead. Do NOT ask about time/space complexity, Big-O, hash maps, "
             "or other DSA topics unless they appear in the list."
@@ -1565,23 +1585,14 @@ def first_question(
         )
     elif dynamic_ok:
         ask_rule = (
-            "Follow the faculty briefing and custom interviewer rules for topics and emphasis. "
-            f"{format_hint} "
-            + (
-                f"Open on this topic: {focus_topic}. Name it in the question. "
-                if focus_topic
-                else "Pick ONE focus topic from the topics list (or briefing). Name it in the question. "
-            )
-            + "Ask for a concrete example, trade-off, or failure mode matching difficulty="
-            f"{difficulty}. "
-            "Do NOT default to generic hash-map / Big-O / sorted-array unless those topics are listed. "
-            "Do not use bank stems."
+            "First ask for a brief self-introduction only (background + one technical interest). "
+            "Do not ask a technical AGENDA question yet. "
+            "Do not ask what their agenda or goals are for today. "
         )
     else:
         ask_rule = (
-            f"You MUST ask this competency question (paraphrase OK): {stem}"
-            if stem
-            else "Ask one solid opening conceptual question for the role track."
+            "First ask for a brief self-introduction only (background + one technical interest). "
+            "Do not ask a bank technical stem yet."
         )
 
     raw = chat(
@@ -1610,12 +1621,28 @@ def first_question(
                         "followup_depth": followup_depth,
                         "candidate_just_said": "yes I am ready",
                         "stage_instructions": (
-                            "You are NexAI. Give ONE clean spoken intro only once "
-                            f"(greet, say you are NexAI, {coding_line}), then ask ONE specific technical question. "
-                            "Do not stack two greetings. Do not add random filler or a second intro. "
-                            "Never introduce yourself with a custom interviewer profile title. "
-                            f"{ask_rule} "
-                            "next_action=next_topic. hint_level=0."
+                            (
+                                "You are NexAI. Give ONE clean spoken intro only once "
+                                f"(greet, say you are NexAI, {coding_line}), then ask ONE specific "
+                                "resume-anchored question. "
+                                "Do not stack two greetings. Do not add random filler or a second intro. "
+                                "Never introduce yourself with a custom interviewer profile title. "
+                                f"{ask_rule} "
+                                "next_action=next_topic. hint_level=0."
+                            )
+                            if resume_only
+                            else (
+                                "You are NexAI. Give ONE clean spoken intro only once "
+                                f"(greet, say you are NexAI, {coding_line}), then ask the candidate "
+                                "for a brief self-introduction (who they are, what they study or work on, "
+                                "one technical interest). "
+                                "Do NOT ask a technical topic question yet. "
+                                "Do NOT ask about their agenda, goals for today, or what they want to cover. "
+                                "Do not stack two greetings. Do not add random filler or a second intro. "
+                                "Never introduce yourself with a custom interviewer profile title. "
+                                f"{ask_rule} "
+                                "next_action=next_topic. hint_level=0. topic_tag=self-introduction."
+                            )
                         ),
                         "transcript": "(start)",
                     }

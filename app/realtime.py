@@ -106,7 +106,14 @@ def _resume_context(dossier: dict[str, Any] | None, *, resume_deep: bool = False
     )
 
 
-def coach_note(engine_reply: str = "", *, topic: str = "", wrap: bool = False) -> str:
+def coach_note(
+    engine_reply: str = "",
+    *,
+    topic: str = "",
+    wrap: bool = False,
+    advance: bool = False,
+    probes_left: int = 1,
+) -> str:
     """Topic hint for Realtime — never a script to read aloud."""
     text = " ".join((engine_reply or "").split())
     if wrap or _WRAP_RE.search(text):
@@ -126,12 +133,28 @@ def coach_note(engine_reply: str = "", *, topic: str = "", wrap: bool = False) -
             "The problem is on their screen — do not recite it. "
             "Ask about their approach or their code. One short question only."
         )
+    if advance or re.search(r"\b(MOVE ON|switch to|next AGENDA|new AGENDA)\b", text, re.I):
+        stay = f"Ask ONE new question on AGENDA item: {topic_bit}. " if topic_bit else "Ask ONE new AGENDA item. "
+        return (
+            "Hidden coach note — invent the next spoken question yourself; do not read this. "
+            "MOVE ON from the previous competency. Do not re-probe what they already answered well. "
+            f"{stay}"
+            "One short question only."
+        )
     stay = f"Stay on: {topic_bit}. " if topic_bit else ""
+    if int(probes_left or 0) <= 0:
+        return (
+            "Hidden coach note — invent the next spoken question yourself; do not read this. "
+            f"{stay}"
+            "Probe budget exhausted — MOVE ON to the next AGENDA competency with a NEW scenario. "
+            "One short question only."
+        )
     return (
         "Hidden coach note — invent the next spoken question yourself; do not read this. "
         f"{stay}"
-        "If they just answered, probe one level deeper (why, failure mode, or trade-off). "
-        "If moving on, pick a NEW concrete scenario. One short question only."
+        "If their last answer was thin, probe one level deeper once (why, failure mode, or trade-off). "
+        "If it was solid or strong, do NOT drill further — MOVE ON to the next AGENDA item. "
+        "One short question only."
     )
 
 
@@ -202,18 +225,29 @@ def coding_round_instructions(
     )
 
 
-def _agenda_block(topics: list[str] | None) -> str:
+def _agenda_block(topics: list[str] | None, *, include_coding: bool = True) -> str:
     """Numbered run-of-show — placed early so client session.update slices cannot drop it."""
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
+    close = (
+        "before coding."
+        if include_coding
+        else "before you wrap — there is no coding round."
+    )
+    opener = (
+        "OPENING: After greeting, your FIRST spoken ask MUST be a brief self-introduction "
+        "(who they are, what they study or work on, one technical interest). "
+        "Never ask vague openers like 'what's your agenda today' or 'what do you want to cover'. "
+    )
     if not topic_list:
-        return ""
+        return opener
     numbered = " → ".join(f"{i}. {t}" for i, t in enumerate(topic_list, 1))
     first_item = topic_list[0]
     return (
-        "AGENDA — cover in this EXACT order, one competency at a time. "
-        "Do not skip ahead. The FIRST spoken question after the greeting MUST be on "
-        f"item 1 ({first_item}). Only move to the next item after one solid answer "
-        f"or one failed re-ask. Cover every item, including the last, before coding. "
+        f"{opener}"
+        "AGENDA — after the self-intro, cover in this EXACT order, one competency at a time. "
+        "Do not skip ahead. The FIRST technical question MUST be on "
+        f"item 1 ({first_item}). Only move to the next item after one solid/strong answer "
+        f"or when the follow-up probe budget is used. Cover every item, including the last, {close} "
         f"{numbered}. "
     )
 
@@ -244,7 +278,7 @@ def interviewer_instructions(
         )
     first = (student_name or "there").split()[0]
     topic_list = [str(t).strip() for t in (topics or []) if str(t).strip()][:12]
-    agenda = _agenda_block(topic_list)
+    agenda = _agenda_block(topic_list, include_coding=include_coding)
     briefing_line = " ".join((briefing or "").split())[:3200]
     style_key = (style or "friendly").strip().lower()
     tone = {
@@ -259,7 +293,15 @@ def interviewer_instructions(
         "A coding editor may unlock later — never recite a problem statement; "
         "never give solutions. Do not mention the editor until you are told it is unlocked."
         if include_coding
-        else "This screen is spoken only — no coding editor."
+        else (
+            "This entire interview is spoken Technical Q&A only — no live coding, "
+            "no editor, no DSA problem to implement. Never mention coding or an editor."
+        )
+    )
+    cover_close = (
+        "Cover every AGENDA item, including the last, before coding. "
+        if include_coding
+        else "Cover every AGENDA item, including the last, then wrap — there is no coding round. "
     )
     extra_brief = ""
     if briefing_line:
@@ -286,7 +328,9 @@ def interviewer_instructions(
         "Never invent a different app or domain (loans, banking, e-commerce) they did not name. "
         "If they say they did not understand, rephrase ONCE with their nouns, then move to the next AGENDA item. "
         "Ask EXACTLY ONE question, then STOP and wait — never stack a second question before they answer. "
-        "Cover every AGENDA item, including the last, before coding. "
+        f"{cover_close}"
+        "TOPIC PACING: After a solid/strong answer, leave that competency — do not keep asking "
+        "the same topic. Follow hidden coach notes that say MOVE ON. "
         "YOU invent every spoken question. Hidden coach notes only name a competency — "
         "never read them, never read exam stems, never copy a written paragraph. "
         "SPEECH: talk like a sharp human on a video call. Contractions. "
@@ -300,7 +344,8 @@ def interviewer_instructions(
         "or any textbook definition. "
         "GOOD (tech): 'Say you remove() from an ArrayList while you're looping it — what blows up, and how do you actually delete those rows?' "
         "GOOD (resume): 'You listed the Inventory Sync project with Kafka — what failed first under load, and how did you fix it?' "
-        "BAD: 'How would you use Java in a small project?' / 'Let's assume you built a payment app…' "
+        "BAD: 'How would you use Java in a small project?' / 'Let's assume you built a payment app…' / "
+        "'What's your agenda today?' "
         "When they finish speaking, reply immediately. If they interrupt, stop and listen. "
         "If a hidden coach note names a topic, use it on your NEXT turn in your own words. "
         "Do not lecture, stack questions, or say 'that's a great question' on repeat. "

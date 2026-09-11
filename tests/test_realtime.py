@@ -44,8 +44,24 @@ def test_instructions_agenda_order_survives_long_briefing():
     assert "1. Java/OOP" in text
     assert "2. DBMS" in text
     assert "3. OS" in text
+    assert "self-introduction" in text.lower() or "self introduction" in text.lower()
     assert text.index("AGENDA") < text.index("FACULTY")
     assert "Do not skip ahead" in text
+
+
+def test_instructions_no_coding_are_qa_only():
+    text = interviewer_instructions(
+        student_name="Asha",
+        role_track="sde_intern",
+        stage="qa",
+        topics=["Java/OOP", "DBMS"],
+        include_coding=False,
+        style="friendly",
+        duration_minutes=17,
+    )
+    assert "no live coding" in text.lower() or "spoken Technical Q&A" in text or "Technical Q&A" in text
+    assert "before you wrap" in text.lower() or "no coding round" in text.lower()
+    assert "editor may unlock" not in text.lower()
 
 
 def test_turn_detection_server_vad():
@@ -79,6 +95,11 @@ def test_coach_note_is_not_a_script():
     assert "CODING ROUND" in coding
     assert "invent" not in coding.lower()
     assert "Stay on: java" not in coding
+    advance = coach_note("MOVE ON to DBMS.", topic="DBMS", advance=True)
+    assert "MOVE ON" in advance
+    assert "DBMS" in advance
+    exhausted = coach_note("probe", topic="java", probes_left=0)
+    assert "MOVE ON" in exhausted or "exhausted" in exhausted.lower()
 
 
 def test_coding_stage_instructions_stop_qa():
