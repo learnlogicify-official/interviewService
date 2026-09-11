@@ -231,7 +231,7 @@ def _agenda_block(topics: list[str] | None, *, include_coding: bool = True) -> s
     close = (
         "before coding."
         if include_coding
-        else "before you wrap — there is no coding round."
+        else "— then keep going with a deeper second pass until time is up (no early wrap)."
     )
     opener = (
         "OPENING: After greeting, your FIRST spoken ask MUST be a brief self-introduction "
@@ -301,7 +301,14 @@ def interviewer_instructions(
     cover_close = (
         "Cover every AGENDA item, including the last, before coding. "
         if include_coding
-        else "Cover every AGENDA item, including the last, then wrap — there is no coding round. "
+        else "Cover every AGENDA item, including the last. "
+    )
+    time_rule = (
+        "TIME DISCIPLINE: Keep asking until a WRAP coach note or the system ends the session. "
+        "Finishing the AGENDA once early does NOT mean you stop — start a deeper second pass "
+        "with fresh concrete scenarios on the same topics. "
+        "Never give a closing thank-you speech, 'strong foundation', or 'you'll do well' "
+        "while the interview is still running. "
     )
     extra_brief = ""
     if briefing_line:
@@ -329,8 +336,9 @@ def interviewer_instructions(
         "If they say they did not understand, rephrase ONCE with their nouns, then move to the next AGENDA item. "
         "Ask EXACTLY ONE question, then STOP and wait — never stack a second question before they answer. "
         f"{cover_close}"
+        f"{time_rule}"
         "TOPIC PACING: After a solid/strong answer, leave that competency — do not keep asking "
-        "the same topic. Follow hidden coach notes that say MOVE ON. "
+        "the same topic. Follow hidden coach notes that say MOVE ON or KEEP GOING. "
         "YOU invent every spoken question. Hidden coach notes only name a competency — "
         "never read them, never read exam stems, never copy a written paragraph. "
         "SPEECH: talk like a sharp human on a video call. Contractions. "

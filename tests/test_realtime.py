@@ -60,8 +60,45 @@ def test_instructions_no_coding_are_qa_only():
         duration_minutes=17,
     )
     assert "no live coding" in text.lower() or "spoken Technical Q&A" in text or "Technical Q&A" in text
-    assert "before you wrap" in text.lower() or "no coding round" in text.lower()
+    assert "TIME DISCIPLINE" in text or "deeper second pass" in text.lower()
     assert "editor may unlock" not in text.lower()
+    assert "then wrap" not in text.lower() or "do not" in text.lower()
+
+
+def test_spoken_only_continues_after_agenda(monkeypatch):
+    from app import orchestrator as orch
+
+    class FakeRow:
+        id = "s1"
+        stage = "qa"
+        status = "active"
+        duration_minutes = 20
+        student_name = "Sachin"
+        role_track = "sde_intern"
+        started_at = None
+        state_json = "{}"
+        topics_json = '["OOP","DBMS"]'
+
+    state = {
+        "include_coding": False,
+        "topics": ["OOP", "DBMS"],
+        "covered_topics": ["OOP", "DBMS"],
+        "topic_cursor": 2,
+        "topic_turns": 1,
+        "voice_duplex": True,
+        "followup_index": 0,
+    }
+    # ~8 minutes elapsed, 12 minutes left — must NOT wrap.
+    monkeypatch.setattr(orch, "_seconds_remaining", lambda row, state=None: 12 * 60)
+    monkeypatch.setattr(orch, "_elapsed", lambda row: 8 * 60)
+    monkeypatch.setattr(orch, "_save_state", lambda row, st: None)
+    row = FakeRow()
+    out = orch._close_qa_then_code(None, row, state)
+    assert out == ""
+    assert row.stage == "qa"
+    assert state.get("awaiting") == "message"
+    assert "KEEP GOING" in (state.get("realtime_cue") or "")
+    assert state.get("second_pass", 0) >= 1
 
 
 def test_turn_detection_server_vad():

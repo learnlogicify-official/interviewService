@@ -467,6 +467,52 @@ def _qa_budget_seconds(row: SessionRow, state: dict[str, Any]) -> int:
     return qa
 
 
+def _time_left_for_spoken_qa(row: SessionRow, state: dict[str, Any]) -> bool:
+    """True while enough clock remains to keep asking (outside the final wrap window)."""
+    _qa, wrap = _phase_bounds(row, state)
+    return _seconds_remaining(row) > max(90, int(wrap) + 45)
+
+
+def _continue_spoken_qa(
+    db: Session,
+    row: SessionRow,
+    state: dict[str, Any],
+    *,
+    reason: str = "agenda",
+) -> str:
+    """
+    Keep a coding-disabled interview alive after the first AGENDA pass.
+
+    Without this, Realtime (and _close_qa_then_code) thank-and-close as soon as
+    topics are covered once — often around minute 8 of a 20-minute screen.
+    """
+    row.stage = "qa"
+    state["awaiting"] = "message"
+    state["coding_after_answer"] = False
+    state.pop("realtime_cue", None)
+    topics = _configured_topics(state)
+    if topics:
+        state["topic_cursor"] = 0
+        state["topic_turns"] = 0
+        state["followup_index"] = 0
+        state["second_pass"] = int(state.get("second_pass") or 0) + 1
+    focus = _focus_topic(state) or (topics[0] if topics else "the next technical topic")
+    if focus:
+        state["current_qa_id"] = str(focus)[:80]
+    pass_n = max(1, int(state.get("second_pass") or 1))
+    if state.get("voice_duplex"):
+        state["realtime_cue"] = (
+            f"KEEP GOING — clock remains ({reason}). Pass {pass_n}: ask ONE deeper NEW "
+            f"concrete scenario on '{focus}'. "
+            "Do NOT thank them, do NOT wrap up, do NOT say the interview is over."
+        )[:300]
+        _save_state(row, state)
+        return ""
+    spoken = _offline_topic_question(state, None)
+    _save_state(row, state)
+    return f"Good — let's go deeper. {spoken}".strip()
+
+
 def _awaiting_student_reply(db: Session, row: SessionRow) -> bool:
     last = (
         db.query(TurnRow)
@@ -1135,6 +1181,16 @@ def tick_session(db: Session, row: SessionRow) -> dict[str, Any]:
         return finish_session(db, row, reason="time_up")
     state = _state(row)
     if row.stage == "qa" and _elapsed(row) >= _qa_budget_seconds(row, state):
+        # Spoken-only: qa_budget is already near the wrap window. Never force an early
+        # thank-you close while the student still has interview time.
+        if not _include_coding(state) and _time_left_for_spoken_qa(row, state):
+            if not state.get("second_pass"):
+                spoken = _continue_spoken_qa(db, row, state, reason="tick_continue")
+                if spoken:
+                    _add_turn(db, row.id, row.stage, "assistant", spoken)
+                db.commit()
+                db.refresh(row)
+            return session_view(db, row)
         qa_secs = _qa_budget_seconds(row, state)
         # Always finish the live spoken question first. Realtime may still be mid-ask
         # even when the last logged turn is "student" (caption not flushed yet) — forcing
@@ -2254,6 +2310,14 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             focus = _advance_focus_topic(state)
             if focus:
                 state["current_qa_id"] = focus[:80]
+            # Spoken-only: after the first full AGENDA pass, keep going until the clock
+            # hits the wrap window — never invent an early closing speech.
+            if (
+                not _include_coding(state)
+                and _qa_agenda_complete(state)
+                and _time_left_for_spoken_qa(row, state)
+            ):
+                return _continue_spoken_qa(db, row, state, reason="agenda_complete")
             cue = str(llm_result.get("cue") or "").strip()
             # Realtime invents the spoken question, so a resume item only gets asked if it
             # rides along as a cue. Without this the uploaded CV is never touched in duplex.
@@ -2271,10 +2335,12 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
                 cue = (
                     f"MOVE ON. Ask ONE new concrete question on AGENDA item "
                     f"'{focus or 'the next listed topic'}'. "
-                    "Do not re-ask the previous competency."
+                    "Do not re-ask the previous competency. Do not wrap up."
                 )
             elif "MOVE ON" not in cue.upper():
                 cue = f"MOVE ON to '{focus or 'next topic'}'. " + cue
+            if "wrap" not in cue.lower():
+                cue = (cue + " Do not thank-and-close.")[:300]
             state["realtime_cue"] = cue[:300]
         _save_state(row, state)
         return ""
@@ -2331,10 +2397,14 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
 
 
 def _close_qa_then_code(db: Session, row: SessionRow, state: dict[str, Any]) -> str:
-    """Close conceptual round, then open coding — or wrap when coding is disabled."""
+    """Close conceptual round, then open coding — or keep / wrap when coding is disabled."""
     state["coding_after_answer"] = False
     state.pop("realtime_cue", None)
     if not _include_coding(state):
+        # Spoken-only sessions must use the full duration. Closing Q&A early used to
+        # jump straight to a thank-you wrap around minute 8.
+        if _time_left_for_spoken_qa(row, state):
+            return _continue_spoken_qa(db, row, state, reason="no_coding")
         return _begin_wrap_no_coding(db, row, state)
     coding = _start_coding_round(db, row, state)
     state["coding_handoff"] = True
