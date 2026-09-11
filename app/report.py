@@ -123,24 +123,39 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
         if independence < 55:
             hint_meta["independence_band"] = "hint_dependent" if independence < 40 else "mixed_independence"
 
-    weights = {
-        "conceptual": 0.18,
-        "problem_solving": 0.18,
-        "coding": 0.28,
-        "explanation": 0.16,
-        "communication": 0.10,
-        "independence": 0.10,
-    }
-    # If coding was never reached, redistribute coding weight into conceptual + idea.
-    if coding <= 0 and int(state.get("problems_solved_count", 0) or 0) == 0:
+    coding_on = bool(state.get("include_coding", True)) and not bool(state.get("resume_only"))
+    # Spoken-only / coding-disabled interviews must not be dragged by zero coding dims.
+    if not coding_on:
+        problem_solving = 0.0
+        coding = 0.0
+        explanation = 0.0
         weights = {
-            "conceptual": 0.30,
-            "problem_solving": 0.28,
+            "conceptual": 0.55,
+            "problem_solving": 0.0,
             "coding": 0.0,
-            "explanation": 0.16,
-            "communication": 0.14,
-            "independence": 0.12,
+            "explanation": 0.0,
+            "communication": 0.25,
+            "independence": 0.20,
         }
+    else:
+        weights = {
+            "conceptual": 0.18,
+            "problem_solving": 0.18,
+            "coding": 0.28,
+            "explanation": 0.16,
+            "communication": 0.10,
+            "independence": 0.10,
+        }
+        # If coding was never reached, redistribute coding weight into conceptual + idea.
+        if coding <= 0 and int(state.get("problems_solved_count", 0) or 0) == 0:
+            weights = {
+                "conceptual": 0.30,
+                "problem_solving": 0.28,
+                "coding": 0.0,
+                "explanation": 0.16,
+                "communication": 0.14,
+                "independence": 0.12,
+            }
 
     overall = (
         conceptual * weights["conceptual"]
@@ -153,14 +168,21 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
 
     strengths: list[str] = []
     gaps: list[str] = []
-    dims = [
-        ("Conceptual knowledge", conceptual),
-        ("Problem-solving / approach", problem_solving),
-        ("Coding correctness", coding),
-        ("Explaining code under pressure", explanation),
-        ("Communication clarity", communication),
-        ("Independence (low hint reliance)", independence),
-    ]
+    if coding_on:
+        dims = [
+            ("Conceptual knowledge", conceptual),
+            ("Problem-solving / approach", problem_solving),
+            ("Coding correctness", coding),
+            ("Explaining code under pressure", explanation),
+            ("Communication clarity", communication),
+            ("Independence (low hint reliance)", independence),
+        ]
+    else:
+        dims = [
+            ("Conceptual knowledge", conceptual),
+            ("Communication clarity", communication),
+            ("Independence (low hint reliance)", independence),
+        ]
 
     for name, val in sorted(dims, key=lambda x: -x[1]):
         if val >= 70 and len(strengths) < 3:
@@ -215,9 +237,9 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
             "In the next mock, give a real attempt even if unsure — define the term, give one example, then trade-offs."
         )
         next_steps.append("Pick 2–3 weak topics from this session and write 5-sentence answers before your next interview.")
-    if coding < 70:
+    if coding_on and coding < 70:
         next_steps.append("Practice array/hashmap problems on NexPractice with timed runs until all tests pass.")
-    if explanation < 70 and substantive:
+    if coding_on and explanation < 70 and substantive:
         next_steps.append("After each solution, narrate every non-trivial block out loud.")
     if conceptual < 70:
         next_steps.append("Revise complexity, stacks, and database indexes with short written answers.")
@@ -266,18 +288,22 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
             }
         )
 
+    dimensions: dict[str, float] = {
+        "conceptual": round(conceptual, 1),
+        "communication": round(communication, 1),
+        "independence": round(independence, 1),
+    }
+    if coding_on:
+        dimensions["problem_solving"] = round(problem_solving, 1)
+        dimensions["coding"] = round(coding, 1)
+        dimensions["explanation"] = round(explanation, 1)
+
     return {
         "overall_score": round(overall, 1),
         "band": band(overall),
         "recommendation": recommendation_label(overall),
-        "dimensions": {
-            "conceptual": round(conceptual, 1),
-            "problem_solving": round(problem_solving, 1),
-            "coding": round(coding, 1),
-            "explanation": round(explanation, 1),
-            "communication": round(communication, 1),
-            "independence": round(independence, 1),
-        },
+        "include_coding": coding_on,
+        "dimensions": dimensions,
         "independence": hint_meta,
         "depth": depth,
         "skill_graph": skill_confidence,
