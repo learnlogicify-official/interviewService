@@ -305,6 +305,56 @@ def is_skip_topic_request(text: str) -> bool:
     return bool(SKIP_TOPIC_RE.search(clean))
 
 
+# Clear attempts to pull the interviewer off the current question.
+# A technical answer that merely says "something else" must not match.
+TOPIC_DISTRACTION_RE = re.compile(
+    r"(?i)("
+    r"\b(?:change|switch)\s+(?:the\s+|this\s+|that\s+)?(?:topic|subject|question)\b|"
+    r"\b(?:let'?s|lets|can we|could we|please|i want to|i'?d rather)\s+"
+    r"(?:just\s+)?(?:skip|change|switch)\b.{0,30}\b(?:topic|subject|question)\b|"
+    r"\b(?:talk about|ask me about|switch to)\s+"
+    r"(?:something else|anything else|another topic|a different topic)\b|"
+    r"\b(?:let'?s|lets|can we|i want to)\s+(?:just\s+)?(?:talk|chat)\s+about\s+"
+    r"(?:movies?|cricket|football|sports|games?|music|politics|the weather)\b|"
+    r"\b(?:tell me a joke|say a joke)\b|"
+    r"\b(?:ignore (?:all |your |the )?(?:previous |prior )?(?:instructions|rules|prompt)|"
+    r"forget (?:you are|your role|the interview)|jailbreak|developer mode|"
+    r"pretend (?:to be|you are|we are)|stop being an interviewer)\b|"
+    r"^(?:ok(?:ay)?[, ]*)?(?:please |let'?s |lets |can we )?"
+    r"(?:skip(?: this| that)?(?: question| topic)?|next question|move on|"
+    r"change the (?:topic|subject)|talk about something else)[.!? ]*$"
+    r")"
+)
+
+
+def is_topic_distraction(text: str) -> bool:
+    """True when the candidate is trying to leave the current interview question."""
+    clean = " ".join((text or "").split()).strip()
+    if not clean:
+        return False
+    if is_unclear_question_response(clean):
+        return False
+    return bool(TOPIC_DISTRACTION_RE.search(clean))
+
+
+def should_hold_topic(text: str) -> bool:
+    """
+    The service keeps the current question.
+
+    Short skip requests count. A long answer that only mentions "move on" does not,
+    so a real explanation is still scored.
+    """
+    clean = " ".join((text or "").split()).strip()
+    if not clean or is_unclear_question_response(clean):
+        return False
+    if is_topic_distraction(clean):
+        return True
+    if not is_skip_topic_request(clean):
+        return False
+    words = re.findall(r"[A-Za-z0-9_]+", clean)
+    return len(words) <= 24
+
+
 def is_vague_question(text: str, *, min_words: int = 0) -> bool:
     """
     True when a generated interviewer question is too generic to speak.

@@ -312,8 +312,36 @@ def _current_qa_stem(state: dict[str, Any], *, hint_bump: int = 1) -> str:
     nxt = _next_resume_item(state)
     if nxt and nxt.get("question"):
         return str(nxt["question"]).strip()
-    spoken = str(state.get("spoken_now") or state.get("last_question") or "").strip()
+    spoken = str(
+        state.get("spoken_now")
+        or state.get("last_question")
+        or state.get("last_realtime_question")
+        or ""
+    ).strip()
     return spoken
+
+
+def _hold_current_question(state: dict[str, Any]) -> str:
+    """Keep the current question. The voice must speak this line and not follow the student."""
+    asked = " ".join(
+        str(
+            state.get("last_realtime_question")
+            or state.get("last_question")
+            or state.get("spoken_now")
+            or ""
+        ).split()
+    ).strip()
+    if not asked:
+        asked = _current_qa_stem(state, hint_bump=0)
+    state["repeat_question"] = True
+    state["realtime_cue"] = (
+        "STAY. They tried to change the subject or skip. Do not discuss their new topic. "
+        "Do not advance the agenda. Speak only the current question you are given, then wait."
+    )[:300]
+    lead = "Let's stay with the question I asked."
+    if asked:
+        return f"{lead} {asked}".strip()
+    return f"{lead} Please answer that same question."
 
 
 def _reask_current_question(
@@ -1915,7 +1943,7 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
     skill_tag = _evidence_skill(state, node)
     hint_now = int(state.get("current_hint_level", 0) or 0)
 
-    if llm_client.is_skip_topic_request(answer):
+    if llm_client.should_hold_topic(answer):
         evidence_ledger.record(
             state,
             stage="qa",
@@ -1924,16 +1952,13 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             skill=skill_tag,
             question_id=qid,
             hint_level=hint_now,
-            note="Candidate asked to skip this topic",
+            note="Candidate tried to change the subject — same question kept",
             source="gate",
             elapsed=_elapsed(row),
         )
-        return _next_topic_turn(
-            db,
-            row,
-            state,
-            bridge="Sure — next area.",
-        )
+        reply = _hold_current_question(state)
+        _save_state(row, state)
+        return reply
 
     # The candidate is objecting to the QUESTION, not declining the topic.
     # Runs before the no-knowledge gate ("I don't know what you mean by that question"
@@ -3097,7 +3122,17 @@ def handle_message(
         if row.stage == "qa" and "?" in (reply or ""):
             reply = _ensure_specific_question(db, row, state, reply)
     elif row.stage == "idea":
-        reply = _handle_idea(db, row, state, text)
+        if llm_client.is_topic_distraction(text):
+            state["repeat_question"] = True
+            state["realtime_cue"] = (
+                "STAY on the on-screen coding problem. Do not follow a subject change."
+            )[:300]
+            reply = (
+                "Let's stay with the coding problem on your screen. "
+                "Walk me through your approach to that problem."
+            )
+        else:
+            reply = _handle_idea(db, row, state, text)
     elif row.stage == "explain":
         if re.search(r"\b(skip|pass|move on|next)\b", text.lower()):
             _resolve_pending_explain(state, row)
@@ -3105,45 +3140,55 @@ def handle_message(
         else:
             reply = _handle_explain(db, row, state, text)
     elif row.stage == "code":
-        llm_result = llm_client.interviewer_turn(
-            stage="code",
-            role_track=row.role_track,
-            topics=state.get("topics", []),
-            transcript=_recent_transcript(db, row.id),
-            student_message=text,
-            context=_llm_context(
-                row,
-                state,
-                problem=_current_problem(state),
-                code_excerpt=evaluator.pick_code_excerpt(state.get("current_code", "")),
-            ),
-        )
-        if llm_result:
-            if llm_result["next_action"] == "wrap_up":
-                state["awaiting_end_confirm"] = True
-                state["end_confirm_asks"] = 0
-                reply = (
-                    llm_result["reply"]
-                    if "?" in llm_result["reply"]
-                    else "Do you want to end the interview now? Say yes to wrap up, or no to keep coding."
-                )
-            elif any(w in text.lower() for w in ("hint", "give me the answer", "solution")):
-                state.setdefault("flags", []).append("asked_for_help")
-                reply = llm_result["reply"]
-            else:
-                reply = llm_result["reply"]
-        elif any(w in text.lower() for w in ("hint", "stuck", "help me", "give me the answer", "solution")):
+        if llm_client.is_topic_distraction(text):
+            state["repeat_question"] = True
+            state["realtime_cue"] = (
+                "STAY on the on-screen coding problem. Do not follow a subject change."
+            )[:300]
             reply = (
-                "I can't give you the solution or walk you through the fix — this is an interview. "
-                "Tell me what you are trying next, or keep coding and run your tests. "
-                "Say done when you want to wrap up."
+                "Let's stay with the coding problem on your screen. "
+                "Keep working on that, and tell me what you're doing."
             )
-            state.setdefault("flags", []).append("asked_for_help")
         else:
-            reply = (
-                "Understood. Keep working in the editor — I can see your code. "
-                "Run tests when ready, and say done when you want to finish."
+            llm_result = llm_client.interviewer_turn(
+                stage="code",
+                role_track=row.role_track,
+                topics=state.get("topics", []),
+                transcript=_recent_transcript(db, row.id),
+                student_message=text,
+                context=_llm_context(
+                    row,
+                    state,
+                    problem=_current_problem(state),
+                    code_excerpt=evaluator.pick_code_excerpt(state.get("current_code", "")),
+                ),
             )
+            if llm_result:
+                if llm_result["next_action"] == "wrap_up":
+                    state["awaiting_end_confirm"] = True
+                    state["end_confirm_asks"] = 0
+                    reply = (
+                        llm_result["reply"]
+                        if "?" in llm_result["reply"]
+                        else "Do you want to end the interview now? Say yes to wrap up, or no to keep coding."
+                    )
+                elif any(w in text.lower() for w in ("hint", "give me the answer", "solution")):
+                    state.setdefault("flags", []).append("asked_for_help")
+                    reply = llm_result["reply"]
+                else:
+                    reply = llm_result["reply"]
+            elif any(w in text.lower() for w in ("hint", "stuck", "help me", "give me the answer", "solution")):
+                reply = (
+                    "I can't give you the solution or walk you through the fix — this is an interview. "
+                    "Tell me what you are trying next, or keep coding and run your tests. "
+                    "Say done when you want to wrap up."
+                )
+                state.setdefault("flags", []).append("asked_for_help")
+            else:
+                reply = (
+                    "Understood. Keep working in the editor — I can see your code. "
+                    "Run tests when ready, and say done when you want to finish."
+                )
     else:
         reply = "Session is complete. Open your feedback report for details."
 
@@ -3164,6 +3209,7 @@ def handle_message(
         and not handoff
         and not unlock_speak
         and not state.get("awaiting_end_confirm")
+        and not state.get("repeat_question")
         and row.stage in {"qa", "idea", "code"}
     ):
         cleaned = ""
@@ -3171,12 +3217,14 @@ def handle_message(
         handoff = bool(state.pop("coding_handoff", None))
         unlock_speak = bool(state.pop("editor_unlock_speak", None))
         meta: dict[str, Any] | None = None
-        if handoff or unlock_speak:
+        if handoff or unlock_speak or state.get("repeat_question"):
             meta = {}
             if handoff:
                 meta["coding_handoff"] = True
             if unlock_speak:
                 meta["editor_unlock"] = True
+            if state.pop("repeat_question", None):
+                meta["repeat_question"] = True
         # New interviewer turn closes the prior student utterance buffer.
         duplex_score.clear_utterance_buffer(state)
         _add_turn(
@@ -3189,6 +3237,7 @@ def handle_message(
         )
     else:
         # Keep coding_handoff so a later poll can still surface the spoken cutover.
+        state.pop("repeat_question", None)
         if not handoff:
             state.pop("coding_handoff", None)
         if not unlock_speak:
