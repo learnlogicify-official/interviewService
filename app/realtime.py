@@ -74,6 +74,14 @@ def _resume_context(dossier: dict[str, Any] | None, *, resume_deep: bool = False
             skills.append(name)
     if skills:
         bits.append("Skills listed: " + ", ".join(skills))
+    education = []
+    for e in (dossier.get("education") or [])[:3]:
+        if isinstance(e, dict) and e.get("name"):
+            education.append(str(e.get("name"))[:80])
+        elif isinstance(e, str) and e.strip():
+            education.append(e.strip()[:80])
+    if education:
+        bits.append("Education: " + "; ".join(education))
     plan_hints = []
     for item in (dossier.get("question_plan") or [])[:4]:
         if isinstance(item, dict) and item.get("anchor"):

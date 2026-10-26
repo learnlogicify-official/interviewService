@@ -621,6 +621,11 @@ def _compact_dossier(dossier: dict[str, Any] | None) -> dict[str, Any] | None:
         "internships": internships,
         "certifications": certifications,
         "skills": skills,
+        "education": [
+            {"name": str(e.get("name") or "")[:120]}
+            for e in (dossier.get("education") or [])[:4]
+            if isinstance(e, dict) and e.get("name")
+        ],
         "question_plan": plan,
     }
 
@@ -718,7 +723,8 @@ Rules for question_plan:
   "You mentioned X…", "On your Y project…", "Your resume lists the Z certification…".
 - NEVER write "let's assume", "imagine you have", "if your resume has", or "pick one project from your resume".
 - Probe ownership, architecture, trade-offs, failure modes, metrics, and debugging.
-- Cover projects, certifications, and skill claims when present.
+- Cover projects, work experience, certifications, education, and skill claims when they appear under those headers.
+- Do NOT put education, a skills list, or a job title into projects.
 - No generic DSA / hash-map / Big-O unless that topic is explicitly on the resume.
 """
 
@@ -855,97 +861,12 @@ def _repair_resume_question(question: str, anchor: str = "") -> str:
 
 
 def _heuristic_resume_dossier(resume_text: str) -> dict[str, Any]:
-    lines = [re.sub(r"^[\-\*\u2022]+\s*", "", ln).strip() for ln in (resume_text or "").splitlines()]
-    lines = [ln for ln in lines if _is_human_resume_line(ln)]
-    projects: list[dict[str, Any]] = []
-    skills: list[dict[str, Any]] = []
-    plan: list[dict[str, str]] = []
-    skill_blob = re.search(
-        r"(?is)(?:skills?|tech(?:nical)?\s+skills?|technologies)[:\n](.+?)(?:\n\n|\n[A-Z][A-Za-z ]{3,}:|$)",
-        resume_text or "",
-    )
-    if skill_blob:
-        for part in re.split(r"[,|/]| and ", skill_blob.group(1)):
-            name = re.sub(r"\s+", " ", part).strip(" .;")
-            if 2 <= len(name) <= 40:
-                skills.append({"name": name, "evidence": "skills section"})
-    certifications: list[dict[str, Any]] = []
-    cert_blob = re.search(
-        r"(?is)(?:certifications?|certificates?|licenses?)[:\n](.+?)(?:\n\n|\n[A-Z][A-Za-z ]{3,}:|$)",
-        resume_text or "",
-    )
-    if cert_blob:
-        for part in re.split(r"[\n,|/]", cert_blob.group(1)):
-            name = re.sub(r"\s+", " ", part).strip(" .;-")
-            if 3 <= len(name) <= 80:
-                certifications.append({"name": name, "issuer": ""})
-    for ln in lines:
-        if re.search(
-            r"(?i)\b(project|intern|developed|built|engineer|implemented|led|designed|application|platform)\b",
-            ln,
-        ):
-            title = _project_title_from_line(ln)
-            projects.append({
-                "name": title[:90],
-                "stack": [],
-                "claim": ln[:280],
-                "hard_questions": [
-                    _repair_resume_question(
-                        f"On {title[:60]}, what did you personally own versus the team, and what broke in production?",
-                        title,
-                    )
-                ],
-            })
-            if len(projects) >= 6:
-                break
-    for p in projects:
-        plan.append({
-            "anchor": str(p.get("name") or "this project"),
-            "question": (p.get("hard_questions") or [""])[0],
-        })
-    for sk in skills[:6]:
-        sk_name = str(sk.get("name") or "").strip()
-        if len(sk_name) < 2:
-            continue
-        plan.append({
-            "anchor": sk_name,
-            "question": (
-                f"Your resume lists {sk_name}. Give a concrete example from your work where you used it, "
-                "including a trade-off you made."
-            ),
-        })
-    if not plan and lines:
-        title = _project_title_from_line(lines[0])
-        plan.append({
-            "anchor": title[:80],
-            "question": (
-                f"On {title[:70]}, walk me through the hardest technical decision you made, "
-                "what you owned, and how you measured the result."
-            ),
-        })
-    if not plan:
-        plan.append({
-            "anchor": "resume",
-            "question": (
-                "Walk me through the most technically demanding project on your resume — "
-                "your role, the hardest bug, and how you measured success."
-            ),
-        })
-    # Final pass: repair any leftover broken stems.
-    cleaned_plan: list[dict[str, str]] = []
-    for item in plan:
-        q = _repair_resume_question(str(item.get("question") or ""), str(item.get("anchor") or ""))
-        if q:
-            cleaned_plan.append({"anchor": str(item.get("anchor") or "")[:120], "question": q[:400]})
-    return {
-        "summary": (lines[0][:180] if lines else "Resume on file."),
-        "projects": projects,
-        "internships": [],
-        "certifications": certifications,
-        "skills": skills,
-        "question_plan": cleaned_plan[:12],
-        "source": "heuristic",
-    }
+    """Section-header parse. Does not treat every resume line as a project."""
+    from app.resume_parse import parse_resume
+
+    dossier = parse_resume(resume_text or "")
+    dossier["source"] = "sections" if dossier.get("sections_found") else "lines"
+    return dossier
 
 
 def _ensure_question_plan(dossier: dict[str, Any]) -> list[dict[str, str]]:
@@ -1014,6 +935,40 @@ def analyze_resume(resume_text: str) -> dict[str, Any]:
     data = _extract_json(raw or "")
     if not data:
         fallback["source"] = "heuristic_llm_failed"
+        return fallback
+    # Headers already tell us what is a project. Do not let the model fold the
+    # whole resume into the projects list.
+    if fallback.get("sections_found"):
+        if isinstance(data.get("summary"), str) and data.get("summary"):
+            fallback["summary"] = str(data["summary"])[:400]
+        llm_plan = data.get("question_plan") if isinstance(data.get("question_plan"), list) else []
+        known = " ".join(
+            [
+                str(p.get("name") or "")
+                for p in (fallback.get("projects") or [])
+                if isinstance(p, dict)
+            ]
+            + [
+                str(j.get("company") or "") + " " + str(j.get("role") or "")
+                for j in (fallback.get("internships") or [])
+                if isinstance(j, dict)
+            ]
+            + [str(s.get("name") or "") for s in (fallback.get("skills") or []) if isinstance(s, dict)]
+            + [str(c.get("name") or "") for c in (fallback.get("certifications") or []) if isinstance(c, dict)]
+            + [str(e.get("name") or "") for e in (fallback.get("education") or []) if isinstance(e, dict)]
+        ).lower()
+        kept = []
+        for item in llm_plan:
+            if not isinstance(item, dict):
+                continue
+            anchor = str(item.get("anchor") or "")
+            if anchor and anchor.lower()[:40] in known:
+                kept.append(item)
+        if len(kept) >= 3:
+            fallback["question_plan"] = kept
+        fallback["source"] = "sections+llm"
+        plan = _ensure_question_plan(fallback)
+        fallback["question_plan"] = plan
         return fallback
     dossier = {
         "summary": str(data.get("summary") or fallback.get("summary") or "")[:400],
