@@ -78,5 +78,8 @@ def test_topic_distraction_is_specific():
         "I would not skip this question in production because the index scan still has to "
         "visit every leaf when the predicate is not selective and the planner picks a scan."
     )
+
+
+def test_friendly_ack():
     assert default_ack("friendly") == "Thanks —"
     assert default_ack("strict") == "Got it."

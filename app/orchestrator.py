@@ -15,6 +15,7 @@ from app import evaluator
 from app import evidence as evidence_ledger
 from app import llm as llm_client
 from app import question_graph
+from app import resume_parse
 from app import skills as skill_graph
 from app import voice_metrics
 from app.config import get_settings
@@ -207,6 +208,11 @@ def _opening_already_greets(text: str, name: str) -> bool:
 
 def _is_human_resume_line(ln: str) -> bool:
     s = (ln or "").strip()
+    if resume_parse.is_header_line(s):
+        return True
+    # Short real words ("Java", "Git", "SQL") are skill lines, not PDF noise.
+    if 2 <= len(s) < 8:
+        return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9+#.\-/ ]*", s))
     if len(s) < 8:
         return False
     letters = len(re.findall(r"[A-Za-z]", s))
@@ -644,6 +650,11 @@ def session_view(db: Session, row: SessionRow) -> dict[str, Any]:
         "stage": row.stage,
         "duration_minutes": row.duration_minutes,
         "seconds_remaining": _seconds_remaining(row),
+        # Last ~75s before auto-wrap: the voice must not start a question nobody can answer.
+        "closing_soon": bool(
+            row.status == "active"
+            and _seconds_remaining(row) <= _phase_bounds(row, state)[1] + 75
+        ),
         "student_name": row.student_name,
         "role_track": row.role_track,
         "problem": _current_problem(state),
@@ -1485,7 +1496,25 @@ _GENERIC_SKILL_TAGS = {
     "opening",
     "intro",
     "introduction",
+    "resume",
+    "projects",
+    "project",
+    "deep dive into your resume",
+    "resume deep dive",
+    "internships",
+    "experience",
 }
+
+
+def _current_resume_anchor(state: dict[str, Any]) -> str:
+    """Resume item last asked about (plan index already points past it)."""
+    plan = list(state.get("resume_plan") or [])
+    idx = int(state.get("resume_plan_index") or 0) - 1
+    if 0 <= idx < len(plan) and isinstance(plan[idx], dict):
+        anchor = str(plan[idx].get("anchor") or "").strip()
+        if anchor.lower() not in _GENERIC_SKILL_TAGS:
+            return anchor
+    return ""
 
 
 def _evidence_skill(state: dict[str, Any], node: dict[str, Any] | None, extra: str = "") -> str:
@@ -1496,6 +1525,8 @@ def _evidence_skill(state: dict[str, Any], node: dict[str, Any] | None, extra: s
         except Exception:
             pass
     tag = str(extra or state.get("current_qa_id") or _focus_topic(state) or "").strip()
+    if (not tag or tag.lower() in _GENERIC_SKILL_TAGS) and state.get("resume_plan"):
+        tag = _current_resume_anchor(state) or tag
     if tag.lower() in _GENERIC_SKILL_TAGS:
         tag = _focus_topic(state) or tag
     return tag[:80]
@@ -1994,8 +2025,8 @@ def _next_qa_or_coding(db: Session, row: SessionRow, state: dict[str, Any], answ
             )
         if state.get("voice_duplex"):
             state["realtime_cue"] = (
-                "They did not understand. Rephrase ONCE using nouns THEY said. "
-                "Drop any invented scenario. Then wait. One question only."
+                "They did not understand. Restate the SAME question in simpler words, using full "
+                "names. Do not greet again, do not switch to a new item. Then wait."
             )[:300]
             _save_state(row, state)
             return ""

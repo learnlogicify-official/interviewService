@@ -97,6 +97,8 @@ def evidence_dimension_score(state: dict[str, Any], dimension: str) -> float:
         float(e.get("score", 0) or 0)
         for e in (state.get("evidence") or [])
         if str(e.get("dimension") or "") == dimension
+        # Clarification / stay-on-topic rows are procedural, not a knowledge answer.
+        and str(e.get("source") or "") != "gate"
     ]
     if not rows:
         return 0.0

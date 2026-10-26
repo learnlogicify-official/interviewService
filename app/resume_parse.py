@@ -62,6 +62,10 @@ def _header_key(ln: str) -> str | None:
     return _HEADER_TO_KEY.get(label)
 
 
+def is_header_line(ln: str) -> bool:
+    return _header_key(ln) is not None
+
+
 def split_sections(resume_text: str) -> tuple[dict[str, list[str]], list[str]]:
     """
     Group lines under the nearest header.
@@ -202,53 +206,108 @@ def _questions(dossier: dict[str, Any]) -> list[dict[str, str]]:
         if anchor and question:
             plan.append({"anchor": anchor[:120], "question": question[:400]})
 
-    for job in dossier.get("internships") or []:
-        company = str(job.get("company") or "").strip()
-        role = str(job.get("role") or "").strip()
-        who = f"{role} at {company}".strip(" at") if role else company
-        if who:
-            add(
-                who,
-                f"You listed {who} on your resume. What did you personally own there, "
-                "and what broke or nearly broke?",
-            )
-    for project in dossier.get("projects") or []:
-        name = str(project.get("name") or "").strip()
-        if name:
-            add(
-                name,
-                f"On your {name} project, what did you personally own versus the team, "
-                "and what broke when it was used for real?",
-            )
-    for cert in dossier.get("certifications") or []:
-        name = str(cert.get("name") or "").strip()
-        if name:
-            add(
-                name,
-                f"Your resume lists {name}. What did you actually apply from it, "
-                "and where did it not help?",
-            )
-    for skill in (dossier.get("skills") or [])[:4]:
-        name = str(skill.get("name") or skill or "").strip()
-        if len(name) >= 2:
-            add(
-                name,
-                f"Your resume lists {name}. Give one concrete place you used it "
-                "and a trade-off you made.",
-            )
-    for edu in dossier.get("education") or []:
-        name = str(edu.get("name") or "").strip()
-        if name:
-            add(
-                name,
-                f"You listed {name} under education. What from that did you actually use in your work?",
-            )
+    fresher = (dossier.get("career_stage") or career_stage(dossier)) == "fresher"
+
+    def ask_jobs() -> None:
+        for job in dossier.get("internships") or []:
+            company = str(job.get("company") or "").strip()
+            role = str(job.get("role") or "").strip()
+            who = f"{role} at {company}" if role and company else (company or role)
+            if not who:
+                continue
+            if str(job.get("kind") or "") == "internship":
+                add(
+                    who,
+                    f"During your internship as {who}, what was one task you owned end to end, "
+                    "and what did you learn when it did not work the first time?",
+                )
+            else:
+                add(
+                    who,
+                    f"You listed {who} on your resume. What did you personally own there, "
+                    "and what broke or nearly broke?",
+                )
+
+    def ask_projects() -> None:
+        for project in dossier.get("projects") or []:
+            name = str(project.get("name") or "").strip()
+            if not name:
+                continue
+            if fresher:
+                add(
+                    name,
+                    f"Tell me about your {name} project — what problem it solved, which part you "
+                    "built yourself, and the hardest bug you hit.",
+                )
+            else:
+                add(
+                    name,
+                    f"On your {name} project, what did you personally own versus the team, "
+                    "and what broke when it was used for real?",
+                )
+
+    def ask_certs() -> None:
+        for cert in dossier.get("certifications") or []:
+            name = str(cert.get("name") or "").strip()
+            if name:
+                add(
+                    name,
+                    f"Your resume lists {name}. What is one thing from it you have actually built "
+                    "or practised, and where did it fall short?",
+                )
+
+    def ask_skills() -> None:
+        for skill in (dossier.get("skills") or [])[:4]:
+            name = str(skill.get("name") or skill or "").strip()
+            if len(name) >= 2:
+                where = "in a project or assignment" if fresher else "on real work"
+                add(
+                    name,
+                    f"Your resume lists {name}. Give one concrete place you used it {where}, "
+                    "and one trade-off you made.",
+                )
+
+    def ask_education() -> None:
+        for edu in dossier.get("education") or []:
+            name = str(edu.get("name") or "").strip()
+            if not name:
+                continue
+            degree = str(edu.get("degree") or "").strip()
+            course = f" ({degree})" if degree and degree != name else ""
+            if fresher:
+                add(
+                    name,
+                    f"At {name}{course}, which course or college project taught you the most, "
+                    "and what did you build with it?",
+                )
+            else:
+                add(
+                    name,
+                    f"From your studies at {name}{course}, which concept do you still rely on "
+                    "most in your current work, and why?",
+                )
+
+    # Freshers: projects are the strongest evidence; experienced: lead with jobs.
+    order = (
+        (ask_projects, ask_jobs, ask_skills, ask_certs, ask_education)
+        if fresher
+        else (ask_jobs, ask_projects, ask_certs, ask_skills, ask_education)
+    )
+    for step in order:
+        step()
     if not plan:
-        add(
-            "resume",
-            "Walk me through the most technically demanding work on your resume — "
-            "your role, the hardest bug, and how you measured success.",
-        )
+        if fresher:
+            add(
+                "resume",
+                "Walk me through the project on your resume you are most proud of — what it does, "
+                "what you built yourself, and the hardest bug you fixed.",
+            )
+        else:
+            add(
+                "resume",
+                "Walk me through the most technically demanding work on your resume — "
+                "your role, the hardest bug, and how you measured success.",
+            )
     return plan[:12]
 
 
@@ -271,6 +330,7 @@ def parse_resume(resume_text: str) -> dict[str, Any]:
         for entry in _chunks(sections.get(key) or [], key):
             row = _entry(key, entry)
             if row and len(jobs) < 6:
+                row["kind"] = _job_kind(key, row)
                 jobs.append(row)
 
     skill_lines = sections.get("skills") or []
@@ -284,10 +344,9 @@ def parse_resume(resume_text: str) -> dict[str, Any]:
         if 3 <= len(name) <= 80 and len(certifications) < 8:
             certifications.append({"name": name, "issuer": ""})
 
-    for entry in _chunks(sections.get("education") or [], "education"):
-        head = entry[0] if entry else ""
-        if head and len(education) < 4:
-            education.append({"name": head[:120], "detail": " ".join(entry[1:])[:180]})
+    for row in _education_entries(sections.get("education") or []):
+        if len(education) < 4:
+            education.append(row)
 
     preamble = sections.get("preamble") or []
     summary_lines = sections.get("summary") or preamble[:2]
@@ -309,8 +368,88 @@ def parse_resume(resume_text: str) -> dict[str, Any]:
         "sections_found": found,
         "source": "sections" if found else "lines",
     }
+    dossier["career_stage"] = career_stage(dossier)
     dossier["question_plan"] = _questions(dossier)
     return dossier
+
+
+_SCHOOL_RE = re.compile(
+    r"(?i)\b(university|college|institute|institution|school|academy|polytechnic|iit|nit|iiit)\b"
+)
+_DEGREE_RE = re.compile(
+    r"(?i)\b(bachelor|master|b\.?\s?tech|b\.?\s?e\b|m\.?\s?tech|m\.?\s?e\b|b\.?\s?sc|m\.?\s?sc|"
+    r"bca|mca|mba|ph\.?\s?d|diploma|hsc|sslc|higher secondary|secondary|class\s+(x|xii|10|12)|"
+    r"12th|10th|degree)\b"
+)
+_EDU_DETAIL_RE = re.compile(r"(?i)\b(cgpa|gpa|percentage|%|grade|(19|20)\d{2})\b")
+
+
+def _education_entries(lines: list[str]) -> list[dict[str, str]]:
+    """
+    One entry per school. A college name split across lines
+    ("Kalaignarkarunanidhi" / "Institute of Technology, Coimbatore") is joined back.
+    """
+    entries: list[dict[str, Any]] = []
+    cur: dict[str, Any] | None = None
+
+    def new() -> dict[str, Any]:
+        row = {"school": "", "degree": "", "detail": [], "school_done": False}
+        entries.append(row)
+        return row
+
+    for ln in lines:
+        s = _clean_line(ln)
+        if not s:
+            continue
+        is_school = bool(_SCHOOL_RE.search(s))
+        is_degree = bool(_DEGREE_RE.search(s))
+        if is_school:
+            if cur is None or cur["school_done"]:
+                cur = new()
+            cur["school"] = f"{cur['school']} {s}".strip() if cur["school"] else s
+            cur["school_done"] = True
+            if is_degree and not cur["degree"]:
+                cur["degree"] = s
+            continue
+        if is_degree:
+            if cur is None or cur["degree"]:
+                cur = new()
+            cur["degree"] = s
+            continue
+        if _EDU_DETAIL_RE.search(s) or len(s.split()) > 8:
+            if cur is None:
+                cur = new()
+            cur["detail"].append(s)
+            continue
+        # Short line with no school keyword: start of a name that continues on the next line.
+        if cur is None or cur["school_done"]:
+            cur = new()
+        cur["school"] = f"{cur['school']} {s}".strip()
+
+    out: list[dict[str, str]] = []
+    for row in entries:
+        name = row["school"] or row["degree"]
+        if not name or _header_key(name):
+            continue
+        detail = " · ".join(x for x in [row["degree"] if row["school"] else "", *row["detail"]] if x)
+        out.append({"name": name[:140], "degree": row["degree"][:120], "detail": detail[:180]})
+    return out
+
+
+def _job_kind(section: str, row: dict[str, Any]) -> str:
+    blob = f"{row.get('role') or ''} {row.get('company') or ''} {row.get('claim') or ''}"
+    if section == "internships" or re.search(r"(?i)\bintern(ship)?\b", blob):
+        return "internship"
+    return "job"
+
+
+def career_stage(dossier: dict[str, Any]) -> str:
+    """'experienced' only with a real (non-intern) job; otherwise a student / fresher."""
+    for job in dossier.get("internships") or []:
+        kind = str(job.get("kind") or "") or _job_kind("experience", job)
+        if kind == "job":
+            return "experienced"
+    return "fresher"
 
 
 _EDU_RE = re.compile(
@@ -340,9 +479,18 @@ def _parse_without_headers(text: str) -> tuple[
     loose: list[str] = []
     lines = [_clean_line(ln) for ln in text.splitlines()]
     lines = [ln for ln in lines if len(ln) >= 3]
+    edu_lines: list[str] = []
     for ln in lines:
         if _EDU_RE.search(ln):
-            education.append({"name": ln[:120], "detail": ""})
+            # "Kalaignarkarunanidhi" / "Institute of Technology, ..." — rejoin the split name.
+            if (
+                re.match(r"(?i)^(institute|college|university|school|academy)\b", ln)
+                and loose
+                and len(loose[-1].split()) <= 3
+                and not edu_lines
+            ):
+                edu_lines.append(loose.pop())
+            edu_lines.append(ln)
         elif _CERT_RE.search(ln):
             certifications.append({"name": ln[:80], "issuer": ""})
         elif ln.count(",") >= 3 and len(ln) < 200:
@@ -350,7 +498,9 @@ def _parse_without_headers(text: str) -> tuple[
                 skills.append({"name": name, "evidence": "resume line"})
         elif _JOB_RE.search(ln):
             company, role = _role_company(ln)
-            jobs.append({"company": company, "role": role, "claim": ln[:240]})
+            job = {"company": company, "role": role, "claim": ln[:240]}
+            job["kind"] = _job_kind("experience", job)
+            jobs.append(job)
         elif re.match(r"(?i)^project\b", ln):
             projects.append({
                 "name": _project_name(ln),
@@ -359,5 +509,6 @@ def _parse_without_headers(text: str) -> tuple[
             })
         else:
             loose.append(ln)
+    education = _education_entries(edu_lines)
     summary = " ".join(loose[:2])[:180] if loose else "Resume on file."
     return projects[:6], jobs[:6], skills[:16], certifications[:8], education[:4], summary

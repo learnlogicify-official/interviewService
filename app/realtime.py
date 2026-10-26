@@ -25,6 +25,15 @@ def _safety_id(session_id: str, moodle_user_id: int = 0) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
+def _identity_rule(first: str) -> str:
+    return (
+        f"IDENTITY: You are NexAI, the interviewer. {first} is the CANDIDATE, not you. "
+        f"Never say 'I'm {first}', 'my name is {first}', or 'this is {first}'. "
+        f"Address the candidate only as {first} — never invent another name. "
+        "Greet only once, at the very start — never introduce yourself again later. "
+    )
+
+
 def _resume_context(dossier: dict[str, Any] | None, *, resume_deep: bool = False) -> str:
     if not dossier or not isinstance(dossier, dict):
         return ""
@@ -90,7 +99,7 @@ def _resume_context(dossier: dict[str, Any] | None, *, resume_deep: bool = False
         bits.append("Priority anchors to probe: " + ", ".join(plan_hints))
     if not bits:
         return ""
-    facts = " ".join(bits)[:1200]
+    facts = " ".join(bits)[:1400]
     rules = (
         "RESUME IS ALREADY UPLOADED — you have read it. Speak with certainty. "
         "Name exact projects, certifications, employers, and skills from the facts below. "
@@ -98,7 +107,14 @@ def _resume_context(dossier: dict[str, Any] | None, *, resume_deep: bool = False
         "GOOD: 'Your resume mentions the AWS Solutions Architect cert — which service did you actually use on a project?' "
         "BAD: 'Let's assume you have a project…', 'Imagine you built…', 'Pick one project from your resume…', "
         "'If your resume has X…'. Never pretend you have not seen the resume. "
+        "Always use the FULL name of a college, company, or project exactly as written below. "
     )
+    if str(dossier.get("career_stage") or "") == "fresher":
+        rules += (
+            "CAREER STAGE: student / fresher with no full-time job. Never say 'your work', "
+            "'your job', 'at work', or 'your company'. Ask about college projects, coursework, "
+            "internships, and what they built themselves. Pitch questions at a strong-fresher level. "
+        )
     if resume_deep:
         return (
             "CANDIDATE RESUME (deep-dive) — every spoken question must name an item below "
@@ -220,8 +236,8 @@ def coding_round_instructions(
             "Do not unlock the editor yourself — the system does that."
         )
     return (
-        f"You are NexAI, a live voice interviewer. The candidate's first name is {first}. "
-        f"Address them only as {first} — never invent another name. "
+        "You are NexAI, a live voice interviewer. "
+        f"{_identity_rule(first)}"
         f"Role track: {role_track}. Tone: {tone}. "
         "The conceptual / technical Q&A round is OVER. You are now in PROBLEM SOLVING."
         f"{named}{stay}{brief_block} "
@@ -331,8 +347,7 @@ def interviewer_instructions(
     return (
         "You are NexAI, a live voice interviewer — the same feel as ChatGPT Voice: "
         "one continuous conversation, not a quiz reader. "
-        f"The candidate's first name is {first}. Address them only as {first} — "
-        "never invent another name. "
+        f"{_identity_rule(first)}"
         f"Role track: {role_track}. "
         f"Current stage: {stage}. About {max(10, int(duration_minutes or 17))} minutes. "
         f"Tone: {tone}. Hold that tone the whole session. "
@@ -341,8 +356,10 @@ def interviewer_instructions(
         f"{(resume_line + ' ') if resume_line else ''}"
         "GROUNDING: After they speak, reuse ONLY names and products they said. "
         "Never invent a different app or domain (loans, banking, e-commerce) they did not name. "
-        "If they say they did not understand, rephrase ONCE with their nouns, then move to the next AGENDA item. "
+        "If they say they did not understand ('what do you mean?'), restate the SAME question in "
+        "simpler words — same item, full names — then STOP and wait. Do not switch to a new item. "
         "Ask EXACTLY ONE question, then STOP and wait — never stack a second question before they answer. "
+        "Silence is fine: if they are thinking, wait; do not fill it with another question. "
         f"{cover_close}"
         f"{time_rule}"
         "TOPIC PACING: After a solid/strong answer, leave that competency — do not keep asking "
@@ -361,8 +378,10 @@ def interviewer_instructions(
         "When probing THEIR resume, open with confidence: 'You mentioned…', 'On your resume you listed…', "
         "'For the X project you wrote about…' — never 'assume', 'imagine you have', or 'if your resume has'. "
         "Anchor every question in a concrete situation, number, named alternative, or failure. "
-        "Never ask 'tell me about X', 'how would you use X', 'explain the difference', "
+        "Never ask a bare 'tell me about X', 'how would you use X', 'explain the difference', "
         "or any textbook definition. "
+        "Follow-ups must build on the exact detail they just gave (their numbers, their design choice): "
+        "ask how they measured it, what the trade-off was, or what failed — like a senior engineer would. "
         "GOOD (tech): 'Say you remove() from an ArrayList while you're looping it — what blows up, and how do you actually delete those rows?' "
         "GOOD (resume): 'You listed the Inventory Sync project with Kafka — what failed first under load, and how did you fix it?' "
         "BAD: 'How would you use Java in a small project?' / 'Let's assume you built a payment app…' / "

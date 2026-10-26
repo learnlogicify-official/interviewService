@@ -627,6 +627,7 @@ def _compact_dossier(dossier: dict[str, Any] | None) -> dict[str, Any] | None:
             if isinstance(e, dict) and e.get("name")
         ],
         "question_plan": plan,
+        "career_stage": str(dossier.get("career_stage") or ""),
     }
 
 
@@ -726,6 +727,10 @@ Rules for question_plan:
 - Cover projects, work experience, certifications, education, and skill claims when they appear under those headers.
 - Do NOT put education, a skills list, or a job title into projects.
 - No generic DSA / hash-map / Big-O unless that topic is explicitly on the resume.
+- If there is no full-time job on the resume, the candidate is a student / fresher. Never say
+  "your work", "your job", "at work", or "your company". Ask about college projects,
+  coursework, internships, and what they built themselves. Put projects first.
+- Use the full name of a college or company exactly as written, even if it spans two lines.
 """
 
 
@@ -910,6 +915,12 @@ def _ensure_question_plan(dossier: dict[str, Any]) -> list[dict[str, str]]:
     return out[:12]
 
 
+_WORK_PHRASE_RE = re.compile(
+    r"(?i)\b(your (work|job|company|employer|team lead|manager)|at work|on the job|"
+    r"in production at|your current role|professional experience)\b"
+)
+
+
 def analyze_resume(resume_text: str) -> dict[str, Any]:
     """Turn raw resume text into a structured interview dossier + question plan."""
     text = (resume_text or "").strip()
@@ -957,15 +968,26 @@ def analyze_resume(resume_text: str) -> dict[str, Any]:
             + [str(c.get("name") or "") for c in (fallback.get("certifications") or []) if isinstance(c, dict)]
             + [str(e.get("name") or "") for e in (fallback.get("education") or []) if isinstance(e, dict)]
         ).lower()
-        kept = []
+        # Section order (fresher-aware) wins. The model may only reword a question
+        # for the same resume item, and never ask a fresher about "your work".
+        fresher = fallback.get("career_stage") == "fresher"
+        reworded: dict[str, str] = {}
         for item in llm_plan:
             if not isinstance(item, dict):
                 continue
-            anchor = str(item.get("anchor") or "")
-            if anchor and anchor.lower()[:40] in known:
-                kept.append(item)
-        if len(kept) >= 3:
-            fallback["question_plan"] = kept
+            anchor = str(item.get("anchor") or "").strip().lower()
+            question = " ".join(str(item.get("question") or "").split())
+            if not anchor or not question or anchor[:40] not in known:
+                continue
+            if fresher and _WORK_PHRASE_RE.search(question):
+                continue
+            reworded.setdefault(anchor, question)
+        for item in fallback.get("question_plan") or []:
+            key = str(item.get("anchor") or "").strip().lower()
+            for anchor, question in reworded.items():
+                if key and (anchor == key or anchor in key or key in anchor):
+                    item["question"] = question[:400]
+                    break
         fallback["source"] = "sections+llm"
         plan = _ensure_question_plan(fallback)
         fallback["question_plan"] = plan
@@ -987,6 +1009,13 @@ def analyze_resume(resume_text: str) -> dict[str, Any]:
     if len(plan) < 3:
         plan = _ensure_question_plan(fallback) or plan
         dossier["source"] = "llm+heuristic"
+    from app.resume_parse import career_stage
+
+    dossier["education"] = fallback.get("education") or []
+    dossier["career_stage"] = career_stage(dossier)
+    if dossier["career_stage"] == "fresher":
+        student_safe = [p for p in plan if not _WORK_PHRASE_RE.search(str(p.get("question") or ""))]
+        plan = student_safe or plan
     dossier["question_plan"] = plan
     return dossier
 

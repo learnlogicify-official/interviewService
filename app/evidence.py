@@ -18,6 +18,15 @@ HINT_LABELS = {
     4: "H4_near_reveal",
 }
 
+# Report wording for the same levels (students read these, not the codes above).
+HINT_TEXT = {
+    0: "answered on their own",
+    1: "after a rephrase",
+    2: "after a follow-up probe",
+    3: "after a directed nudge",
+    4: "after a near-solution hint",
+}
+
 
 def clamp_hint(level: int) -> int:
     return max(0, min(4, int(level)))
@@ -77,7 +86,7 @@ def independence_score(state: dict[str, Any]) -> float:
     100 = answered everything at H0 with real substance; lower as hints escalate
     or answers stay empty / no-knowledge.
     """
-    evidence = state.get("evidence") or []
+    evidence = [e for e in (state.get("evidence") or []) if str(e.get("source") or "") != "gate"]
     if evidence:
         penalties = []
         for e in evidence:

@@ -26,6 +26,86 @@ def recommendation_label(score: float) -> str:
     return "not_ready"
 
 
+_GENERIC_TOPICS = {
+    "", "resume", "projects", "project", "deep dive into your resume", "resume deep dive",
+    "internships", "experience", "self-introduction", "self introduction", "intro",
+    "introduction", "opening", "qa", "coding", "coding.explanation",
+}
+
+
+def _topic_label(raw: str) -> str:
+    """'java.collections' -> 'Java collections'; resume anchors pass through."""
+    text = " ".join(str(raw or "").split()).strip()
+    if text.lower() in _GENERIC_TOPICS:
+        return ""
+    if re.fullmatch(r"[a-z0-9_]+\.[a-z0-9_]+", text):
+        text = text.replace(".", " ").replace("_", " ")
+        text = text[:1].upper() + text[1:]
+    return text[:80]
+
+
+def _qa_rows(state: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        e for e in (state.get("evidence") or [])
+        if str(e.get("stage") or "") == "qa" and str(e.get("source") or "") != "gate"
+    ]
+
+
+def _unique(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        key = item.lower()
+        if item and key not in seen:
+            seen.add(key)
+            out.append(item)
+    return out
+
+
+def _discussed_topics(state: dict[str, Any]) -> list[str]:
+    """Topics that were actually asked this session, in order."""
+    names = [_topic_label(e.get("skill") or "") for e in _qa_rows(state)]
+    plan = list(state.get("resume_plan") or [])
+    asked = int(state.get("resume_plan_index") or 0)
+    for item in plan[:asked]:
+        if isinstance(item, dict):
+            names.append(_topic_label(item.get("anchor") or ""))
+    return _unique(names)
+
+
+def _weak_topics(state: dict[str, Any]) -> list[str]:
+    """Discussed topics whose best scored answer stayed under 60."""
+    best: dict[str, float] = {}
+    for e in _qa_rows(state):
+        label = _topic_label(e.get("skill") or "")
+        if label:
+            best[label] = max(best.get(label, 0.0), float(e.get("score") or 0))
+    return [k for k, v in best.items() if v < 60]
+
+
+def _evidence_preview(e: dict[str, Any]) -> str:
+    topic = _topic_label(e.get("skill") or "") or _topic_label(e.get("question_id") or "") or "current question"
+    if str(e.get("source") or "") == "gate":
+        return f"{topic} · {e.get('note') or 'procedural turn'} (not scored)"
+    level = evidence_ledger.clamp_hint(int(e.get("hint_level", 0) or 0))
+    hint = evidence_ledger.HINT_TEXT.get(level, "")
+    note = " ".join(str(e.get("note") or "").split())
+    quote = f' — "{note[:110]}{"…" if len(note) > 110 else ""}"' if note else ""
+    return f"{e.get('dimension')} {e.get('score')}/100 · {topic} · {hint}{quote}"
+
+
+def _mark_unanswered_last_question(timeline: list[dict[str, Any]]) -> None:
+    """If the session closed right after a question, say it was not answered (and not scored)."""
+    last_student = max((i for i, t in enumerate(timeline) if t.get("role") == "student"), default=-1)
+    for i in range(len(timeline) - 1, last_student, -1):
+        row = timeline[i]
+        if row.get("role") == "assistant" and "?" in str(row.get("preview") or ""):
+            if i < len(timeline) - 1:
+                row["preview"] = f"{row['preview']} (not answered — time ran out; not scored)"
+                row["unanswered"] = True
+            return
+
+
 def idea_approach_explain_proxy(state: dict[str, Any]) -> float:
     """
     Pre-coding approach narrations (idea stage) partially reflect explanation ability.
@@ -259,8 +339,28 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
         next_steps.append("Practice array/hashmap problems on NexPractice with timed runs until all tests pass.")
     if coding_on and explanation < 70 and substantive:
         next_steps.append("After each solution, narrate every non-trivial block out loud.")
+    discussed = _discussed_topics(state)
+    weak_topics = _weak_topics(state)
     if conceptual < 70:
-        next_steps.append("Revise complexity, stacks, and database indexes with short written answers.")
+        if weak_topics:
+            next_steps.append(
+                "Re-answer these out loud in under two minutes each, with one concrete example "
+                "or number: " + ", ".join(weak_topics[:3]) + "."
+            )
+        elif discussed:
+            next_steps.append(
+                "Go deeper on what you were asked today — " + ", ".join(discussed[:3]) +
+                ": what you built, why you chose it, and what you would change."
+            )
+        else:
+            next_steps.append(
+                "Write short answers to the questions you were asked today, then say them out loud."
+            )
+    if state.get("resume_plan") and discussed:
+        next_steps.append(
+            "For each resume item you discussed, prepare three lines: your own part, one bug or "
+            "trade-off, and how you measured the result (before vs after)."
+        )
     if independence < 60 and substantive:
         next_steps.append("Practice answering first without hints — state approach, then edge cases, then complexity.")
     if weak and touched:
@@ -291,16 +391,14 @@ def build_report(state: dict[str, Any], turns: list[dict[str, Any]]) -> dict[str
                 "preview": preview,
             }
         )
+    _mark_unanswered_last_question(timeline)
     # Enrich timeline tail with scored evidence markers.
     for e in evidence_rows[-12:]:
         timeline.append(
             {
                 "stage": e.get("stage"),
                 "role": "evidence",
-                "preview": (
-                    f"{e.get('dimension')} {e.get('score')}/100 · "
-                    f"{e.get('hint_label')} · {e.get('skill') or e.get('question_id')}"
-                ),
+                "preview": _evidence_preview(e),
                 "score": e.get("score"),
                 "hint_level": e.get("hint_level"),
             }
